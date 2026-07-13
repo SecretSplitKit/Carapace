@@ -156,3 +156,32 @@ therefore rests on randomized per-replica timing and occasional wide-coverage
 rounds, not on range minimality. Production SHOULD narrow this to bao
 verified-range streaming so only the sampled bytes cross the wire; the module
 docs were softened to state the current property rather than the aspirational one.
+
+## Note — selective-disclosure fetch gate residuals (§7.4 / D3, Phase 5 audit)
+
+Phase 5 audit dispositions for the owner-side blob-read gate (`authorize_fetch`).
+
+- **W2 (fixed): superseded-epoch chunks stay owner-gated.** `Shared.owned_chunks`
+  now retains every ChunkID ever published for an owned vault across epoch bumps
+  (the current-epoch `vault_blobs` is overwritten on republish). The gate keys on
+  `owned_chunks`, so a chunk dropped from `vault_blobs` by an edit keeps its §7.4
+  gate: a still-disclosed old chunk is served only to its audience, an undisclosed
+  old chunk to no non-device - it no longer regresses to the residual and is not
+  served to any dialer.
+
+- **W2-gc (accepted, not fixed): old-epoch blobs are not GC'd.** Superseded chunk
+  blobs remain in the in-memory store and their ChunkIDs remain in `owned_chunks`,
+  so both grow with the distinct chunks published over the daemon's life. This is a
+  resource concern, not a confidentiality or gate one (the gate is retained above).
+  Bounded eviction of old-epoch blobs under a retention policy - dropping the blob
+  and its `owned_chunks` entry together - is deferred until the daemon grows a
+  runtime-state/blob store with a GC pass; the two must be evicted in lockstep so
+  the gate never outlives, or is outlived by, the blob.
+
+- **S4 (accepted, not fixed): the manifest envelope digest is outside the gate.**
+  `authorize_fetch` gates chunk ChunkIDs, not the per-vault manifest-envelope blob
+  (`VaultBlobs.digest`), so the envelope is served to any dialer on the inherited
+  residual. It is AEAD-sealed under `K_manifest`, which friends never hold, so only
+  its ciphertext and size leak - acceptable. Folding the envelope digest into
+  `owned_chunks` (gated to own devices + replica set) would tighten it if envelope
+  metadata size/among-friends exposure ever matters.

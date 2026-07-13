@@ -256,10 +256,20 @@ fn build(
         .map(|i| {
             let (id, len) = chunks[i];
             let (offset, rlen) = range_within(&mut r, len);
-            AuditSample { chunk_id: id, offset, len: rlen }
+            AuditSample {
+                chunk_id: id,
+                offset,
+                len: rlen,
+            }
         })
         .collect();
-    Audit { vid, epoch, round, wide, samples }
+    Audit {
+        vid,
+        epoch,
+        round,
+        wide,
+        samples,
+    }
 }
 
 /// Build a per-round spot audit sampling [`DEFAULT_SAMPLES_PER_ROUND`] distinct
@@ -272,7 +282,15 @@ pub fn build_audit(
     round: u64,
     manifest: &Manifest,
 ) -> Audit {
-    build(k_audit, vid, epoch, round, manifest, DEFAULT_SAMPLES_PER_ROUND, false)
+    build(
+        k_audit,
+        vid,
+        epoch,
+        round,
+        manifest,
+        DEFAULT_SAMPLES_PER_ROUND,
+        false,
+    )
 }
 
 /// Build a spot audit sampling exactly `samples` distinct chunks.
@@ -419,8 +437,7 @@ impl AuditTracker {
         if self.interval == 0 {
             return 0;
         }
-        u64::from_le_bytes(replica[..8].try_into().expect("32-byte id has 8 bytes"))
-            % self.interval
+        u64::from_le_bytes(replica[..8].try_into().expect("32-byte id has 8 bytes")) % self.interval
     }
 
     /// Schedule (or reschedule) the replica's next audit relative to `now`:
@@ -473,7 +490,12 @@ impl AuditTracker {
     /// not accumulate PoR failures and be evicted without grace - offline is not
     /// retention loss (§10.1). Only a peer that *answered* with missing or
     /// non-matching bytes advances the streak via [`AuditTracker::record`].
-    pub fn record_unreachable(&mut self, replica: [u8; 32], vid: [u8; 32], now: u64) -> AuditAction {
+    pub fn record_unreachable(
+        &mut self,
+        replica: [u8; 32],
+        vid: [u8; 32],
+        now: u64,
+    ) -> AuditAction {
         self.schedule(replica, vid, now);
         AuditAction::Skipped
     }
@@ -493,7 +515,12 @@ impl Default for AuditTracker {
 /// `code` - e.g. [`AUDIT_CODE_RETENTION_LOST`] when a replica is dropped for
 /// failed retention audits. Signed by the owner node key.
 pub fn signed_audit_notice(owner_node: &SigningKey, vid: [u8; 32], code: u64) -> AuditNotice {
-    let mut n = AuditNotice { vid, code, by: [0; 32], sig: [0; 64] };
+    let mut n = AuditNotice {
+        vid,
+        code,
+        by: [0; 32],
+        sig: [0; 64],
+    };
     n.sign(owner_node);
     n
 }

@@ -122,7 +122,9 @@ pub fn verify_attestation(
     challenge: &ShareAttestChallenge,
 ) -> Result<(), RecoveryError> {
     att.verify()?;
-    if att.subject != challenge.subject || att.rsid != challenge.rsid || att.nonce != challenge.nonce
+    if att.subject != challenge.subject
+        || att.rsid != challenge.rsid
+        || att.nonce != challenge.nonce
     {
         return Err(RecoveryError::ChallengeMismatch);
     }

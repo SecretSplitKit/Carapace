@@ -26,7 +26,9 @@ fn make_tree() -> (tempfile::TempDir, BTreeMap<String, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
     let mut expected = BTreeMap::new();
 
-    let big: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let big: Vec<u8> = (0..(3 * 1024 * 1024u32))
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     let files: Vec<(&str, Vec<u8>)> = vec![
         ("readme.txt", b"hello carapace".to_vec()),
         ("empty.bin", Vec::new()),
@@ -48,7 +50,11 @@ fn make_card(user: &SigningKey, version: u64) -> ContactCard {
         display: "server".into(),
         enc_pub: [0x11; 32],
         nodes: vec![],
-        offers: Offers { storage_bytes: 0, relay: false, trustee: false },
+        offers: Offers {
+            storage_bytes: 0,
+            relay: false,
+            trustee: false,
+        },
         version,
         by: [0; 32],
         sig: [0; 64],
@@ -64,7 +70,14 @@ fn signed_announce(
     digest: [u8; 32],
     replicas: Vec<[u8; 32]>,
 ) -> VaultAnnounce {
-    let mut ann = VaultAnnounce { vid, epoch, replicas, digest, by: [0; 32], sig: [0; 64] };
+    let mut ann = VaultAnnounce {
+        vid,
+        epoch,
+        replicas,
+        digest,
+        by: [0; 32],
+        sig: [0; 64],
+    };
     ann.sign(node);
     ann
 }
@@ -85,13 +98,19 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
     let ingest = ingest_dir(src.path(), &server_node, &vkeys, epoch, &mut mem)?;
 
     let server_ep = CarapaceEndpoint::bind(&server_node).await?;
-    assert_eq!(server_ep.node_id(), server_node.verifying_key().to_bytes(),
-        "iroh EndpointId must equal the carapace node id");
+    assert_eq!(
+        server_ep.node_id(),
+        server_node.verifying_key().to_bytes(),
+        "iroh EndpointId must equal the carapace node id"
+    );
 
     let blobs = IrohBlobStore::new();
     // Manifest envelope: its blob hash must equal the announced digest.
     let env_digest = blobs.add(&ingest.envelope.to_bytes()).await?;
-    assert_eq!(env_digest, ingest.digest, "envelope blob hash == manifestDigest");
+    assert_eq!(
+        env_digest, ingest.digest,
+        "envelope blob hash == manifestDigest"
+    );
     // Every sealed chunk: blob hash == ChunkID by construction.
     for f in &ingest.manifest.files {
         for (id, _len) in &f.chunks {
@@ -101,11 +120,20 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
         }
     }
 
-    let announce =
-        signed_announce(&server_node, vid, epoch, ingest.digest, vec![server_ep.node_id()]);
+    let announce = signed_announce(
+        &server_node,
+        vid,
+        epoch,
+        ingest.digest,
+        vec![server_ep.node_id()],
+    );
     let card = make_card(&user, 1);
     let handler = SyncHandler {
-        hello: Hello { protocol: 1, card_version: 1, roles: 1 },
+        hello: Hello {
+            protocol: 1,
+            card_version: 1,
+            roles: 1,
+        },
         cards: Arc::new(vec![card]),
         announces: Arc::new(vec![announce]),
     };
@@ -123,14 +151,24 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
     let mut docs = DocStore::new();
     let accepted = carapace_net::pull_documents(
         &sync_conn,
-        &Hello { protocol: 1, card_version: 0, roles: 0 },
+        &Hello {
+            protocol: 1,
+            card_version: 0,
+            roles: 0,
+        },
         &mut docs,
     )
     .await?;
-    assert!(accepted >= 2, "expected to accept the card and the announce, got {accepted}");
+    assert!(
+        accepted >= 2,
+        "expected to accept the card and the announce, got {accepted}"
+    );
     drop(sync_conn);
 
-    let got = docs.announce_for_vid(&vid).context("no announce for vid")?.clone();
+    let got = docs
+        .announce_for_vid(&vid)
+        .context("no announce for vid")?
+        .clone();
     assert_eq!(got.digest, ingest.digest);
     assert_eq!(got.epoch, epoch);
 
@@ -186,10 +224,16 @@ fn rollback_rule_rejects_stale_and_equal_versions() {
     let a5 = signed_announce(&signer, [1; 32], 5, [2; 32], vec![]);
     assert_eq!(store.offer_announce(&a5), Ok(true));
     // equal epoch is a rollback
-    assert_eq!(store.offer_announce(&a5), Err(Reject::Rollback { seen: 5, got: 5 }));
+    assert_eq!(
+        store.offer_announce(&a5),
+        Err(Reject::Rollback { seen: 5, got: 5 })
+    );
     // lower epoch is a rollback
     let a4 = signed_announce(&signer, [1; 32], 4, [3; 32], vec![]);
-    assert_eq!(store.offer_announce(&a4), Err(Reject::Rollback { seen: 5, got: 4 }));
+    assert_eq!(
+        store.offer_announce(&a4),
+        Err(Reject::Rollback { seen: 5, got: 4 })
+    );
     // higher epoch is accepted
     let a6 = signed_announce(&signer, [1; 32], 6, [4; 32], vec![]);
     assert_eq!(store.offer_announce(&a6), Ok(true));
@@ -206,7 +250,10 @@ fn rollback_rule_rejects_stale_and_equal_versions() {
     let user = SigningKey::from_bytes(&[0x06; 32]);
     let c1 = make_card(&user, 1);
     assert_eq!(store.offer_card(&c1), Ok(true));
-    assert_eq!(store.offer_card(&c1), Err(Reject::Rollback { seen: 1, got: 1 }));
+    assert_eq!(
+        store.offer_card(&c1),
+        Err(Reject::Rollback { seen: 1, got: 1 })
+    );
     let c2 = make_card(&user, 2);
     assert_eq!(store.offer_card(&c2), Ok(true));
 }

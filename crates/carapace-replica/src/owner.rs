@@ -38,7 +38,11 @@ pub struct PlacementCtx<'a, S: ChunkStore> {
 impl<'a, S: ChunkStore> PlacementCtx<'a, S> {
     /// Bundle placement source data.
     pub fn new(store: &'a S, manifest: &'a Manifest, env: &'a ManifestEnvelope) -> Self {
-        Self { store, manifest, env }
+        Self {
+            store,
+            manifest,
+            env,
+        }
     }
 }
 
@@ -150,7 +154,10 @@ impl ReplicaSet {
         let needed = src.env.to_bytes().len() as u64
             + chunks.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
         if needed > accept.quota_bytes {
-            return Err(ReplicaError::QuotaExceeded { quota: accept.quota_bytes, needed });
+            return Err(ReplicaError::QuotaExceeded {
+                quota: accept.quota_bytes,
+                needed,
+            });
         }
         peer.receive(src.env, chunks)?;
         self.members.push(id);
@@ -261,10 +268,7 @@ fn placement_bytes(manifest: &Manifest, env: &ManifestEnvelope) -> u64 {
 
 /// Fetch every unique chunk the manifest references from the owner's store,
 /// erroring if one is missing locally.
-fn gather_chunks(
-    store: &impl ChunkStore,
-    manifest: &Manifest,
-) -> Result<Vec<Chunk>, ReplicaError> {
+fn gather_chunks(store: &impl ChunkStore, manifest: &Manifest) -> Result<Vec<Chunk>, ReplicaError> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for f in &manifest.files {

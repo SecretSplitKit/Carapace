@@ -79,10 +79,22 @@ pub fn seal_at_rest(passphrase: &[u8], secret: &[u8]) -> Result<AtRestBlob, AtRe
     getrandom::getrandom(&mut salt).map_err(|_| AtRestError::Rng)?;
     getrandom::getrandom(&mut nonce).map_err(|_| AtRestError::Rng)?;
 
-    let key = derive_key(passphrase, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST)?;
+    let key = derive_key(
+        passphrase,
+        &salt,
+        ARGON2_M_COST,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+    )?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: secret, aad: b"carapace/v1/at-rest" })
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: secret,
+                aad: b"carapace/v1/at-rest",
+            },
+        )
         .map_err(|_| AtRestError::Seal)?;
     Ok(AtRestBlob {
         salt,
@@ -96,13 +108,25 @@ pub fn seal_at_rest(passphrase: &[u8], secret: &[u8]) -> Result<AtRestBlob, AtRe
 
 /// Open an at-rest blob with the passphrase. Returns the recovered secret,
 /// zeroized on drop. Derives the key with the blob's recorded parameters.
-pub fn open_at_rest(passphrase: &[u8], blob: &AtRestBlob) -> Result<Zeroizing<Vec<u8>>, AtRestError> {
-    let key = derive_key(passphrase, &blob.salt, blob.m_cost, blob.t_cost, blob.p_cost)?;
+pub fn open_at_rest(
+    passphrase: &[u8],
+    blob: &AtRestBlob,
+) -> Result<Zeroizing<Vec<u8>>, AtRestError> {
+    let key = derive_key(
+        passphrase,
+        &blob.salt,
+        blob.m_cost,
+        blob.t_cost,
+        blob.p_cost,
+    )?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
     cipher
         .decrypt(
             XNonce::from_slice(&blob.nonce),
-            Payload { msg: &blob.ciphertext, aad: b"carapace/v1/at-rest" },
+            Payload {
+                msg: &blob.ciphertext,
+                aad: b"carapace/v1/at-rest",
+            },
         )
         .map(Zeroizing::new)
         .map_err(|_| AtRestError::Open)

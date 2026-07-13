@@ -358,6 +358,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "carapace-disclose"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "carapace-crypto",
+ "carapace-wire",
+ "ed25519-dalek 2.2.0",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "carapace-friend"
 version = "0.1.0"
 dependencies = [
@@ -443,6 +455,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek 2.2.0",
  "hex",
+ "zeroize",
 ]
 
 [[package]]
@@ -452,6 +465,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "carapace-crypto",
+ "carapace-disclose",
  "carapace-friend",
  "carapace-net",
  "carapace-recovery",

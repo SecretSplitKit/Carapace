@@ -67,7 +67,10 @@ impl DocStore {
         card.verify().map_err(|_| Reject::BadSignature)?;
         if let Some(existing) = self.cards.get(&card.by) {
             if card.version <= existing.version {
-                return Err(Reject::Rollback { seen: existing.version, got: card.version });
+                return Err(Reject::Rollback {
+                    seen: existing.version,
+                    got: card.version,
+                });
             }
         }
         self.cards.insert(card.by, card.clone());
@@ -81,7 +84,10 @@ impl DocStore {
         let key = (ann.by, ann.vid);
         if let Some(existing) = self.announces.get(&key) {
             if ann.epoch <= existing.epoch {
-                return Err(Reject::Rollback { seen: existing.epoch, got: ann.epoch });
+                return Err(Reject::Rollback {
+                    seen: existing.epoch,
+                    got: ann.epoch,
+                });
             }
         }
         self.announces.insert(key, ann.clone());

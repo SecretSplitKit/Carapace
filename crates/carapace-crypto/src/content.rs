@@ -54,18 +54,34 @@ impl std::error::Error for ChunkError {}
 /// Seal one plaintext chunk under vault-scoped convergent encryption (§5):
 /// `pt_hash = BLAKE3(P)`, key/nonce = HKDF(K_content, …‖pt_hash),
 /// `C = XChaCha20-Poly1305(key, nonce, P, aad = vid)`, `ChunkID = BLAKE3(C)`.
-pub fn seal_chunk(k_content: &[u8], vid: &[u8], plaintext: &[u8]) -> Result<SealedChunk, ChunkError> {
+pub fn seal_chunk(
+    k_content: &[u8],
+    vid: &[u8],
+    plaintext: &[u8],
+) -> Result<SealedChunk, ChunkError> {
     let pt_hash: [u8; 32] = *blake3::hash(plaintext).as_bytes();
     let chunk_key = kdf::chunk_key(k_content, &pt_hash);
     let nonce = kdf::chunk_nonce(k_content, &pt_hash);
 
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*chunk_key));
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&*nonce), Payload { msg: plaintext, aad: vid })
+        .encrypt(
+            XNonce::from_slice(&*nonce),
+            Payload {
+                msg: plaintext,
+                aad: vid,
+            },
+        )
         .map_err(|_| ChunkError::Seal)?;
 
     let chunk_id: [u8; 32] = *blake3::hash(&ciphertext).as_bytes();
-    Ok(SealedChunk { chunk_id, ciphertext, pt_hash, chunk_key, nonce })
+    Ok(SealedChunk {
+        chunk_id,
+        ciphertext,
+        pt_hash,
+        chunk_key,
+        nonce,
+    })
 }
 
 /// Recompute the ChunkID (iroh blob hash) of a sealed ciphertext.
@@ -82,7 +98,13 @@ pub fn open_chunk(
 ) -> Result<Vec<u8>, ChunkError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(chunk_key));
     cipher
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad: vid })
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: vid,
+            },
+        )
         .map_err(|_| ChunkError::Open)
 }
 
@@ -98,11 +120,17 @@ mod tests {
             *b = (i.wrapping_mul(2654435761) >> 13) as u8;
         }
         let ranges = chunk_ranges(&data);
-        assert!(ranges.len() > 1, "large input should produce multiple chunks");
+        assert!(
+            ranges.len() > 1,
+            "large input should produce multiple chunks"
+        );
         let mut pos = 0;
         for (off, len) in &ranges {
             assert_eq!(*off, pos, "chunks must be contiguous");
-            assert!(*len >= MIN_SIZE || *off + *len == data.len(), "min-size honored except last");
+            assert!(
+                *len >= MIN_SIZE || *off + *len == data.len(),
+                "min-size honored except last"
+            );
             assert!(*len <= MAX_SIZE, "max-size honored");
             pos += len;
         }
@@ -119,7 +147,8 @@ mod tests {
         // (b) recompute ChunkID from the ciphertext, byte-for-byte.
         assert_eq!(sealed.chunk_id, chunk_id(&sealed.ciphertext));
         // decrypt round-trips
-        let opened = open_chunk(&sealed.chunk_key, &sealed.nonce, &sealed.ciphertext, &vid).unwrap();
+        let opened =
+            open_chunk(&sealed.chunk_key, &sealed.nonce, &sealed.ciphertext, &vid).unwrap();
         assert_eq!(opened, plaintext);
 
         // convergence: same plaintext+vid -> identical ciphertext and ChunkID.
@@ -130,7 +159,12 @@ mod tests {
         // vault scoping: aad=vid is authenticated, so a wrong vid fails to open.
         let wrong_vid = [0xC1u8; 32];
         assert_eq!(
-            open_chunk(&sealed.chunk_key, &sealed.nonce, &sealed.ciphertext, &wrong_vid),
+            open_chunk(
+                &sealed.chunk_key,
+                &sealed.nonce,
+                &sealed.ciphertext,
+                &wrong_vid
+            ),
             Err(ChunkError::Open)
         );
     }

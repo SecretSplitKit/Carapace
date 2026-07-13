@@ -51,7 +51,11 @@ async fn two_device_sync() -> Result<()> {
 
     let daemon_a = Daemon::start(device_a).await?;
     let daemon_b = Daemon::start(device_b).await?;
-    assert_ne!(daemon_a.node_id(), daemon_b.node_id(), "devices must hold distinct node keys");
+    assert_ne!(
+        daemon_a.node_id(),
+        daemon_b.node_id(),
+        "devices must hold distinct node keys"
+    );
 
     // ---- device A: create a vault and announce it ----
     let (src, expected) = make_tree();
@@ -78,7 +82,11 @@ async fn two_device_sync() -> Result<()> {
         assert_eq!(&recovered, bytes, "content mismatch for {rel}");
     }
     // No extra files leaked in.
-    assert_eq!(count_files(&got.out_dir), expected.len(), "unexpected extra files");
+    assert_eq!(
+        count_files(&got.out_dir),
+        expected.len(),
+        "unexpected extra files"
+    );
 
     daemon_a.shutdown().await;
     daemon_b.shutdown().await;
@@ -99,13 +107,23 @@ async fn republish_bumps_epoch_and_syncs_update() -> Result<()> {
 
     // Local change -> republish.
     std::fs::write(src.path().join("f.txt"), b"v2 contents are longer now")?;
-    assert_eq!(daemon_a.publish_vault(src.path(), vid).await?, 2, "republish bumps epoch");
+    assert_eq!(
+        daemon_a.publish_vault(src.path(), vid).await?,
+        2,
+        "republish bumps epoch"
+    );
 
     let out = tempfile::tempdir()?;
     let reconstructed = daemon_b.sync_from(daemon_a.addr()?, out.path()).await?;
-    let got = reconstructed.iter().find(|r| r.vid == vid).context("no reconstruction")?;
+    let got = reconstructed
+        .iter()
+        .find(|r| r.vid == vid)
+        .context("no reconstruction")?;
     assert_eq!(got.epoch, 2, "B must reconstruct the latest epoch");
-    assert_eq!(std::fs::read(got.out_dir.join("f.txt"))?, b"v2 contents are longer now");
+    assert_eq!(
+        std::fs::read(got.out_dir.join("f.txt"))?,
+        b"v2 contents are longer now"
+    );
 
     daemon_a.shutdown().await;
     daemon_b.shutdown().await;
@@ -136,7 +154,10 @@ async fn poison_announce_does_not_abort_sync() -> Result<()> {
         .iter()
         .find(|r| r.vid == vid)
         .context("real vault must survive the poison announce")?;
-    assert_eq!(std::fs::read(got.out_dir.join("real.txt"))?, b"the genuine article");
+    assert_eq!(
+        std::fs::read(got.out_dir.join("real.txt"))?,
+        b"the genuine article"
+    );
     assert!(
         reconstructed.iter().all(|r| r.vid != [0xEE; 32]),
         "the poison vault must not be reconstructed"

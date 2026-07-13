@@ -16,7 +16,9 @@ fn daemon_seeds(node: u8, root: u8) -> State {
 
 fn make_tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let big: Vec<u8> = (0..800_000u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+    let big: Vec<u8> = (0..800_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
     for (rel, bytes) in [("a.txt", b"carapace".to_vec()), ("b.bin", big)] {
         std::fs::write(dir.path().join(rel), &bytes).unwrap();
     }
@@ -58,14 +60,24 @@ async fn unreachable_replica_is_not_evicted_by_por() -> Result<()> {
             .await
             .context("audit round")?;
 
-        assert!(round.lost.is_empty(), "unreachable peer must not be a retention loss");
+        assert!(
+            round.lost.is_empty(),
+            "unreachable peer must not be a retention loss"
+        );
         assert!(!round.repaired, "no repair for a merely-offline peer");
-        assert_eq!(round.unreachable, vec![b_node], "the round records B as unreachable");
+        assert_eq!(
+            round.unreachable,
+            vec![b_node],
+            "the round records B as unreachable"
+        );
         assert!(
             matches!(round.audited.as_slice(), [(n, AuditAction::Skipped)] if *n == b_node),
             "B's round is Skipped, not Failed/Lost"
         );
-        assert!(a.replica_members(&vid).contains(&b_node), "B stays a member");
+        assert!(
+            a.replica_members(&vid).contains(&b_node),
+            "B stays a member"
+        );
         now += 100_000;
     }
 

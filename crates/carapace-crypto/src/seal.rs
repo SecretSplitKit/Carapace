@@ -100,8 +100,8 @@ pub fn open(
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, HpkeError> {
-    let encapped = <Kem as KemTrait>::EncappedKey::from_bytes(encapped_key)
-        .map_err(|_| HpkeError::BadKey)?;
+    let encapped =
+        <Kem as KemTrait>::EncappedKey::from_bytes(encapped_key).map_err(|_| HpkeError::BadKey)?;
     single_shot_open::<Aead, Kdf, Kem>(
         &OpModeR::Base,
         &recipient.0,

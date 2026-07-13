@@ -73,7 +73,12 @@ fn make_vault(owner_seed: u8) -> Vault {
     };
     env.sign(&owner_node);
 
-    Vault { owner_node, store, manifest, env }
+    Vault {
+        owner_node,
+        store,
+        manifest,
+        env,
+    }
 }
 
 fn open_peer(seed: u8) -> ReplicaPeer {
@@ -85,7 +90,8 @@ fn open_peer(seed: u8) -> ReplicaPeer {
 #[test]
 fn places_to_r3_accepting_friends() {
     let v = make_vault(1);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
 
     let mut friends: Vec<ReplicaPeer> = (10..13).map(open_peer).collect();
     for f in &mut friends {
@@ -111,7 +117,8 @@ fn places_to_r3_accepting_friends() {
 #[test]
 fn decline_is_honored() {
     let v = make_vault(2);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
 
     // A friend that will only store 8 bytes declines a placement bigger than that.
     let mut stingy = ReplicaPeer::new(key(20), Policy::with_quota(8));
@@ -128,7 +135,8 @@ fn deny_list_honored_both_directions() {
 
     // Owner-side deny-list: owner refuses to place on peer_a.
     let owner_policy = Policy::open().deny_peer(peer_a.verifying_key().to_bytes());
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), owner_policy, &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), owner_policy, &v.manifest, &v.env);
     let mut a = ReplicaPeer::new(peer_a, Policy::open());
     assert!(!set.add_replica(&mut a, &v.ctx()).unwrap());
     assert!(!a.holds(&v.manifest.vid));
@@ -145,7 +153,8 @@ fn deny_list_honored_both_directions() {
 #[test]
 fn unreachable_within_grace_no_repair() {
     let v = make_vault(4);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
     let mut friends: Vec<ReplicaPeer> = (40..43).map(open_peer).collect();
     for f in &mut friends {
         set.add_replica(f, &v.ctx()).unwrap();
@@ -172,7 +181,8 @@ fn unreachable_within_grace_no_repair() {
 #[test]
 fn past_grace_repairs_to_fresh_friend() {
     let v = make_vault(5);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
     let mut friends: Vec<ReplicaPeer> = (60..63).map(open_peer).collect();
     for f in &mut friends {
         set.add_replica(f, &v.ctx()).unwrap();
@@ -214,7 +224,8 @@ fn past_grace_repairs_to_fresh_friend() {
 #[test]
 fn unfriended_repairs_immediately() {
     let v = make_vault(6);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
     let mut friends: Vec<ReplicaPeer> = (80..83).map(open_peer).collect();
     for f in &mut friends {
         set.add_replica(f, &v.ctx()).unwrap();
@@ -243,7 +254,8 @@ fn repair_skips_deny_listed_and_already_holding_candidates() {
     let v = make_vault(7);
     let denied_id = key(101).verifying_key().to_bytes();
     let owner_policy = Policy::open().deny_peer(denied_id);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), owner_policy, &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), owner_policy, &v.manifest, &v.env);
 
     // Two current members; one (good) will be lost, the other (good2) survives.
     let mut good = open_peer(100);
@@ -256,7 +268,10 @@ fn repair_skips_deny_listed_and_already_holding_candidates() {
 
     let now = 2_000_000;
     let mut healths = HashMap::new();
-    healths.insert(good_id, Health::UnreachableSince(now - DEFAULT_GRACE_SECS - 1));
+    healths.insert(
+        good_id,
+        Health::UnreachableSince(now - DEFAULT_GRACE_SECS - 1),
+    );
 
     // Candidate list, in order: the deny-listed peer (owner skips it), a peer
     // with good2's identity (already a member -> no-op), and a fresh friend
@@ -285,7 +300,8 @@ fn repair_skips_deny_listed_and_already_holding_candidates() {
 #[test]
 fn read_availability_holds_while_one_replica_present() {
     let v = make_vault(8);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
     let mut friends: Vec<ReplicaPeer> = (120..123).map(open_peer).collect();
     for f in &mut friends {
         set.add_replica(f, &v.ctx()).unwrap();
@@ -321,8 +337,8 @@ fn receive_enforces_quota_cumulatively() {
         .flat_map(|f| f.chunks.iter())
         .map(|(id, _)| (*id, v.store.get(id).unwrap().unwrap()))
         .collect();
-    let incoming = v.env.to_bytes().len() as u64
-        + chunks.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
+    let incoming =
+        v.env.to_bytes().len() as u64 + chunks.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
 
     // Grant exactly one push worth of bytes.
     let mut peer = ReplicaPeer::new(key(200), Policy::with_quota(incoming));
@@ -336,13 +352,18 @@ fn receive_enforces_quota_cumulatively() {
         peer.receive(&v.env, chunks.clone()),
         Err(ReplicaError::QuotaExceeded { .. })
     ));
-    assert_eq!(peer.blob_count(), blobs_after_first, "rejected push did not grow the store");
+    assert_eq!(
+        peer.blob_count(),
+        blobs_after_first,
+        "rejected push did not grow the store"
+    );
 }
 
 #[test]
 fn placed_chunks_round_trip_from_the_replica() {
     let v = make_vault(9);
-    let mut set = ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
+    let mut set =
+        ReplicaSet::with_default_r(v.owner_node.clone(), Policy::open(), &v.manifest, &v.env);
     let mut friend = open_peer(130);
     set.add_replica(&mut friend, &v.ctx()).unwrap();
 

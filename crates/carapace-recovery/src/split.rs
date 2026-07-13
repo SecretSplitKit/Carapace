@@ -158,13 +158,24 @@ pub fn extend_split(
     count: u8,
     allow_over_cap: bool,
 ) -> Result<Vec<Share>, RecoveryError> {
-    check_issuance(state.threshold(), state.issued_count(), count, allow_over_cap)?;
+    check_issuance(
+        state.threshold(),
+        state.issued_count(),
+        count,
+        allow_over_cap,
+    )?;
     let mnemonic = key_to_mnemonic(secret_key)?;
     let input = SplitInput::Bip39 {
         mnemonic: &mnemonic,
         passphrase: "",
     };
-    Ok(extend(state, &input, count, allow_over_cap, OutputMode::Bip39Wordlist)?)
+    Ok(extend(
+        state,
+        &input,
+        count,
+        allow_over_cap,
+        OutputMode::Bip39Wordlist,
+    )?)
 }
 
 /// Add a trustee (protocol §8.1): unseal the split-state, issue one new share at a fresh unused

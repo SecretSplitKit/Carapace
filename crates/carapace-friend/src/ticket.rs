@@ -54,12 +54,23 @@ pub fn verify_ticket(ticket: &InviteTicket, now: u64) -> Result<(), FriendError>
 pub fn parse_uri(uri: &str, now: u64) -> Result<InviteTicket, FriendError> {
     let b32 = uri.strip_prefix("carapace:").ok_or(FriendError::BadUri)?;
     let payload = base32_lower_decode(b32).ok_or(FriendError::BadUri)?;
-    let mut arr = decode(&payload).map_err(|_| FriendError::BadUri)?.into_list().map_err(|_| FriendError::BadUri)?;
+    let mut arr = decode(&payload)
+        .map_err(|_| FriendError::BadUri)?
+        .into_list()
+        .map_err(|_| FriendError::BadUri)?;
     if arr.len() != 2 {
         return Err(FriendError::BadUri);
     }
-    let body = arr.pop().unwrap().into_map().map_err(|_| FriendError::BadUri)?;
-    let ty = arr.pop().unwrap().into_uint().map_err(|_| FriendError::BadUri)?;
+    let body = arr
+        .pop()
+        .unwrap()
+        .into_map()
+        .map_err(|_| FriendError::BadUri)?;
+    let ty = arr
+        .pop()
+        .unwrap()
+        .into_uint()
+        .map_err(|_| FriendError::BadUri)?;
     if ty != InviteTicket::TYPE {
         return Err(FriendError::BadUri);
     }
@@ -226,8 +237,14 @@ mod tests {
         book.redeem(&stale.token, NOW).unwrap(); // consumed, then it expires
 
         book.prune(NOW + 100); // past `stale.expires`, before `live.expires`
-        assert!(!book.issued.contains_key(&stale.token), "expired issued record dropped");
-        assert!(!book.consumed.contains(&stale.token), "orphaned consumed marker dropped");
+        assert!(
+            !book.issued.contains_key(&stale.token),
+            "expired issued record dropped"
+        );
+        assert!(
+            !book.consumed.contains(&stale.token),
+            "orphaned consumed marker dropped"
+        );
         // The live ticket is untouched and still redeemable exactly once.
         assert!(book.issued.contains_key(&live.token));
         book.redeem(&live.token, NOW + 100).unwrap();

@@ -20,7 +20,8 @@ pub fn node_entry(
     relay_url: Option<String>,
 ) -> NodeEntry {
     let node_pub = node_key.verifying_key();
-    let deleg = carapace_crypto::identity::sign_delegation(user_key, &node_pub, not_after).to_bytes();
+    let deleg =
+        carapace_crypto::identity::sign_delegation(user_key, &node_pub, not_after).to_bytes();
     NodeEntry {
         node_id: node_pub.to_bytes(),
         deleg,
@@ -182,7 +183,11 @@ mod tests {
         let node = SigningKey::from_bytes(&[2; 32]);
         let card = a_card(&user, &node, 1);
         card.verify().unwrap();
-        assert!(card_delegates_node(&card, &node.verifying_key().to_bytes(), NOW));
+        assert!(card_delegates_node(
+            &card,
+            &node.verifying_key().to_bytes(),
+            NOW
+        ));
         // A node not in the card is not delegated.
         assert!(!card_delegates_node(&card, &[9; 32], NOW));
     }
@@ -193,8 +198,16 @@ mod tests {
         let node = SigningKey::from_bytes(&[2; 32]);
         let ne = node_entry(&user, &node, 100, vec![], None);
         let card = build_card(&user, "me".into(), [7; 32], vec![ne], offers(), 1);
-        assert!(card_delegates_node(&card, &node.verifying_key().to_bytes(), 50));
-        assert!(!card_delegates_node(&card, &node.verifying_key().to_bytes(), 200));
+        assert!(card_delegates_node(
+            &card,
+            &node.verifying_key().to_bytes(),
+            50
+        ));
+        assert!(!card_delegates_node(
+            &card,
+            &node.verifying_key().to_bytes(),
+            200
+        ));
     }
 
     #[test]
@@ -209,7 +222,13 @@ mod tests {
         let v2 = a_card(&friend, &fnode, 2);
 
         assert!(store.offer(&v1).unwrap());
-        assert_eq!(store.friend(&friend.verifying_key().to_bytes()).unwrap().version, 1);
+        assert_eq!(
+            store
+                .friend(&friend.verifying_key().to_bytes())
+                .unwrap()
+                .version,
+            1
+        );
         assert!(store.offer(&v2).unwrap());
         // A replay of v1 (<= seen) is a rollback.
         assert!(matches!(
@@ -217,7 +236,10 @@ mod tests {
             Err(FriendError::Rollback { seen: 2, got: 1 })
         ));
         // Same version is also a rollback.
-        assert!(matches!(store.offer(&v2), Err(FriendError::Rollback { .. })));
+        assert!(matches!(
+            store.offer(&v2),
+            Err(FriendError::Rollback { .. })
+        ));
     }
 
     #[test]

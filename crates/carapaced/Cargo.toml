@@ -20,6 +20,7 @@ carapace-wire = { path = "../carapace-wire" }
 carapace-crypto = { path = "../carapace-crypto" }
 carapace-vault = { path = "../carapace-vault" }
 carapace-net = { path = "../carapace-net" }
+carapace-disclose = { path = "../carapace-disclose" }
 carapace-friend = { path = "../carapace-friend" }
 carapace-replica = { path = "../carapace-replica" }
 carapace-share = { path = "../carapace-share" }

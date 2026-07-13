@@ -134,7 +134,11 @@ impl VaultKeys {
     /// Derive `K_content` and `K_manifest` for `vid` from the user's `K_root`.
     pub fn derive(k_root: &[u8], vid: [u8; 32]) -> Self {
         let vr = kdf::k_vaultroot(k_root, &vid);
-        VaultKeys { vid, k_content: kdf::k_content(&*vr), k_manifest: kdf::k_manifest(&*vr) }
+        VaultKeys {
+            vid,
+            k_content: kdf::k_content(&*vr),
+            k_manifest: kdf::k_manifest(&*vr),
+        }
     }
 }
 
@@ -222,12 +226,22 @@ pub fn ingest_dir<S: ChunkStore>(
         });
     }
 
-    let manifest =
-        Manifest { vid: keys.vid, epoch, authors: vec![node_pub], files, vv };
+    let manifest = Manifest {
+        vid: keys.vid,
+        epoch,
+        authors: vec![node_pub],
+        files,
+        vv,
+    };
     let envelope = seal_manifest(&manifest, keys, node_key)?;
     let digest = *blake3::hash(&envelope.to_bytes()).as_bytes();
 
-    Ok(Ingest { manifest, envelope, digest, keys: key_map })
+    Ok(Ingest {
+        manifest,
+        envelope,
+        digest,
+        keys: key_map,
+    })
 }
 
 /// Additional-data for the manifest AEAD: `vid ‖ epoch.be8` (§7.2).
@@ -254,7 +268,13 @@ pub fn seal_manifest(
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*keys.k_manifest));
     let aad = manifest_aad(&manifest.vid, manifest.epoch);
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: &pt[..], aad: &aad })
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &pt[..],
+                aad: &aad,
+            },
+        )
         .map_err(|_| VaultError::ManifestAead)?;
 
     let mut env = ManifestEnvelope {
@@ -279,7 +299,13 @@ pub fn open_envelope(
     let cipher = XChaCha20Poly1305::new(Key::from_slice(k_manifest));
     let aad = manifest_aad(&env.vid, env.epoch);
     let pt = cipher
-        .decrypt(XNonce::from_slice(&env.nonce), Payload { msg: &env.ct, aad: &aad })
+        .decrypt(
+            XNonce::from_slice(&env.nonce),
+            Payload {
+                msg: &env.ct,
+                aad: &aad,
+            },
+        )
         .map_err(|_| VaultError::ManifestAead)?;
     Ok(Manifest::from_bytes(&pt)?)
 }
@@ -339,7 +365,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
         if ty.is_dir() {
             collect_files(root, &path, out)?;
         } else if ty.is_file() {
-            let rel = path.strip_prefix(root).expect("path is under root").to_path_buf();
+            let rel = path
+                .strip_prefix(root)
+                .expect("path is under root")
+                .to_path_buf();
             out.push(rel);
         }
         // symlinks and other node types are skipped

@@ -94,7 +94,10 @@ where
     book.redeem(&req.token, now)?;
 
     let acceptor_user = acceptor_user_key.verifying_key().to_bytes();
-    let core = friendship_core_bytes(least_and_greatest(acceptor_user, requester_user), established);
+    let core = friendship_core_bytes(
+        least_and_greatest(acceptor_user, requester_user),
+        established,
+    );
 
     let acceptor_sig = acceptor_user_key.sign(&core).to_bytes();
     let requester_sig = requester_countersign(&core);
@@ -236,11 +239,8 @@ mod tests {
             |core| requester.user.sign(core).to_bytes(),
         )?;
         // Requester side: verify the accept and recover the same friendship.
-        let requester_friendship = verify_friend_accept(
-            &accept,
-            now,
-            &requester.user.verifying_key().to_bytes(),
-        )?;
+        let requester_friendship =
+            verify_friend_accept(&accept, now, &requester.user.verifying_key().to_bytes())?;
         assert_eq!(requester_friendship, acceptor_friendship);
         Ok((requester_friendship, accept))
     }

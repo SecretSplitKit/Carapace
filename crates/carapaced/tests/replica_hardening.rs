@@ -18,7 +18,11 @@ fn seeds(node: u8, root: u8) -> State {
 /// A one-file tree, a few dozen bytes (bigger than any tiny quota below).
 fn tiny_tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("note.txt"), b"carapace replica hardening bytes").unwrap();
+    std::fs::write(
+        dir.path().join("note.txt"),
+        b"carapace replica hardening bytes",
+    )
+    .unwrap();
     dir
 }
 
@@ -53,10 +57,17 @@ async fn s4_placement_gates_on_friend_and_deny_list() -> Result<()> {
     let placed = a
         .place_replicas(vid, &[b.addr()?, c.addr()?, stranger.addr()?], 3)
         .await?;
-    assert_eq!(placed, vec![b.node_id()], "only the allowed friend is placed");
+    assert_eq!(
+        placed,
+        vec![b.node_id()],
+        "only the allowed friend is placed"
+    );
     assert!(b.holds_replica(&vid), "friend B stored the replica");
     assert!(!c.holds_replica(&vid), "deny-listed friend C was skipped");
-    assert!(!stranger.holds_replica(&vid), "non-friend stranger was skipped (S4)");
+    assert!(
+        !stranger.holds_replica(&vid),
+        "non-friend stranger was skipped (S4)"
+    );
 
     for d in [a, b, c, stranger] {
         d.shutdown().await;
@@ -73,7 +84,11 @@ async fn w1_quota_and_rate_limit_cut_off_pushes() -> Result<()> {
     // A friend whose rate-limit bucket is empty and never refills.
     let throttled = Daemon::start_with_limits(
         seeds(0x22, 0xC1),
-        ReplicaLimits { rate_capacity: 0, rate_refill_per_sec: 0, ..Default::default() },
+        ReplicaLimits {
+            rate_capacity: 0,
+            rate_refill_per_sec: 0,
+            ..Default::default()
+        },
     )
     .await?;
     // An honest friend granting A the default (1 GiB).
@@ -89,17 +104,33 @@ async fn w1_quota_and_rate_limit_cut_off_pushes() -> Result<()> {
 
     // Over-grant peer declines; nothing is stored past the 10-byte agreed limit.
     let placed = a.place_replicas(vid, &[stingy.addr()?], 1).await?;
-    assert!(placed.is_empty(), "placement over the agreed grant is declined (W1)");
-    assert!(!stingy.holds_replica(&vid), "over-grant peer stored nothing");
+    assert!(
+        placed.is_empty(),
+        "placement over the agreed grant is declined (W1)"
+    );
+    assert!(
+        !stingy.holds_replica(&vid),
+        "over-grant peer stored nothing"
+    );
 
     // Rate-limited peer (empty bucket) is throttled and declines.
     let placed = a.place_replicas(vid, &[throttled.addr()?], 1).await?;
-    assert!(placed.is_empty(), "rate-limited placement is throttled (W1)");
-    assert!(!throttled.holds_replica(&vid), "throttled peer stored nothing");
+    assert!(
+        placed.is_empty(),
+        "rate-limited placement is throttled (W1)"
+    );
+    assert!(
+        !throttled.holds_replica(&vid),
+        "throttled peer stored nothing"
+    );
 
     // Honest within-grant placement still succeeds.
     let placed = a.place_replicas(vid, &[honest.addr()?], 1).await?;
-    assert_eq!(placed, vec![honest.node_id()], "within-grant placement succeeds");
+    assert_eq!(
+        placed,
+        vec![honest.node_id()],
+        "within-grant placement succeeds"
+    );
     assert!(honest.holds_replica(&vid), "honest peer stored the replica");
 
     for d in [a, stingy, throttled, honest] {
@@ -133,14 +164,27 @@ async fn w1_per_friend_grants_enforced_independently() -> Result<()> {
 
     // `small` is over its 10-byte grant on `store`: declined.
     let placed = small.place_replicas(small_vid, &[store.addr()?], 1).await?;
-    assert!(placed.is_empty(), "small friend's over-grant placement is declined");
-    assert!(!store.holds_replica(&small_vid), "store held nothing for the small friend");
+    assert!(
+        placed.is_empty(),
+        "small friend's over-grant placement is declined"
+    );
+    assert!(
+        !store.holds_replica(&small_vid),
+        "store held nothing for the small friend"
+    );
 
     // `big`, placing the SAME-size tree on the SAME node, is within its default
     // grant: accepted. Same store, same bytes, opposite outcome by friend.
     let placed = big.place_replicas(big_vid, &[store.addr()?], 1).await?;
-    assert_eq!(placed, vec![store.node_id()], "big friend's within-grant placement succeeds");
-    assert!(store.holds_replica(&big_vid), "store held the big friend's replica");
+    assert_eq!(
+        placed,
+        vec![store.node_id()],
+        "big friend's within-grant placement succeeds"
+    );
+    assert!(
+        store.holds_replica(&big_vid),
+        "store held the big friend's replica"
+    );
 
     for d in [store, small, big] {
         d.shutdown().await;

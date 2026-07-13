@@ -91,10 +91,16 @@ impl core::fmt::Display for ReplicaError {
             Self::WrongVault => f.write_str("replica accept named a different vault"),
             Self::PeerMismatch => f.write_str("replica accept signer is not this peer"),
             Self::QuotaExceeded { quota, needed } => {
-                write!(f, "placement needs {needed} bytes but peer granted only {quota}")
+                write!(
+                    f,
+                    "placement needs {needed} bytes but peer granted only {quota}"
+                )
             }
             Self::TooManyBlobs { count, max } => {
-                write!(f, "replica push declared {count} blobs, over the cap of {max}")
+                write!(
+                    f,
+                    "replica push declared {count} blobs, over the cap of {max}"
+                )
             }
         }
     }

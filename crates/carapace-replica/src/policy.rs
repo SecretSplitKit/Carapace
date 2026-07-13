@@ -36,7 +36,10 @@ impl Policy {
 
     /// A policy that will store at most `bytes` for any one placement.
     pub fn with_quota(bytes: u64) -> Self {
-        Self { max_store: Some(bytes), ..Self::default() }
+        Self {
+            max_store: Some(bytes),
+            ..Self::default()
+        }
     }
 
     /// Add a node public key to the counterparty deny-list.
@@ -104,7 +107,11 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// A limiter with the given burst `capacity` and `refill_per_sec` (bytes).
     pub fn new(capacity: u64, refill_per_sec: u64) -> Self {
-        Self { capacity, refill_per_sec, buckets: HashMap::new() }
+        Self {
+            capacity,
+            refill_per_sec,
+            buckets: HashMap::new(),
+        }
     }
 
     /// Try to admit `n` bytes for `peer` at wall-clock `now` (unix seconds).
@@ -183,7 +190,11 @@ mod tests {
         let p = Policy::open();
         assert_eq!(p.quota(), DEFAULT_QUOTA_BYTES);
         assert_eq!(p.grant(1), Some(DEFAULT_QUOTA_BYTES));
-        assert_eq!(p.grant(DEFAULT_QUOTA_BYTES + 1), None, "over 1 GiB is declined");
+        assert_eq!(
+            p.grant(DEFAULT_QUOTA_BYTES + 1),
+            None,
+            "over 1 GiB is declined"
+        );
     }
 
     // W1: the token bucket admits within capacity, refuses over it, and refills

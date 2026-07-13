@@ -69,7 +69,8 @@ mod appendix_b_pins {
         let sealed = content::seal_chunk(&k_content, &vid, &plaintext).unwrap();
         assert_eq!(sealed.chunk_id, content::chunk_id(&sealed.ciphertext));
         let opened =
-            content::open_chunk(&sealed.chunk_key, &sealed.nonce, &sealed.ciphertext, &vid).unwrap();
+            content::open_chunk(&sealed.chunk_key, &sealed.nonce, &sealed.ciphertext, &vid)
+                .unwrap();
         assert_eq!(opened, plaintext);
     }
 }

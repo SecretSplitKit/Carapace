@@ -86,13 +86,16 @@ impl ReplicaPeer {
                 max: MAX_REPLICA_BLOBS,
             });
         }
-        let incoming: u64 = env.to_bytes().len() as u64
-            + chunks.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
+        let incoming: u64 =
+            env.to_bytes().len() as u64 + chunks.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
         let quota = self.policy.quota();
         let already = self.received.get(&env.vid).copied().unwrap_or(0);
         let running = already.saturating_add(incoming);
         if running > quota {
-            return Err(ReplicaError::QuotaExceeded { quota, needed: running });
+            return Err(ReplicaError::QuotaExceeded {
+                quota,
+                needed: running,
+            });
         }
         // Only mutate state once the whole push is known to fit.
         for (id, data) in chunks {

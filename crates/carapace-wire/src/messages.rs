@@ -25,7 +25,10 @@ pub const MAX_PAYLOAD: usize = 1 << 20;
 
 /// Encode `det_cbor([type_id, body])` and prepend the 4-byte big-endian length.
 pub fn frame(type_id: u64, body: &Map) -> Vec<u8> {
-    let payload = encode(&Value::Array(vec![Value::Uint(type_id), Value::Map(body.clone())]));
+    let payload = encode(&Value::Array(vec![
+        Value::Uint(type_id),
+        Value::Map(body.clone()),
+    ]));
     let mut out = (payload.len() as u32).to_be_bytes().to_vec();
     out.extend(payload);
     out
@@ -60,7 +63,10 @@ pub fn signing_bytes(type_id: u64, body: &Map) -> Vec<u8> {
     let mut m = body.clone();
     m.remove(23);
     let mut out = DOMAIN.to_vec();
-    out.extend(encode(&Value::Array(vec![Value::Uint(type_id), Value::Map(m)])));
+    out.extend(encode(&Value::Array(vec![
+        Value::Uint(type_id),
+        Value::Map(m),
+    ])));
     out
 }
 
@@ -83,7 +89,10 @@ pub trait Message: Sized {
     fn decode_frame(bytes: &[u8]) -> Result<Self, Error> {
         let (mt, body) = decode_frame(bytes)?;
         if mt != Self::TYPE {
-            return Err(Error::WrongType { expected: Self::TYPE, got: mt });
+            return Err(Error::WrongType {
+                expected: Self::TYPE,
+                got: mt,
+            });
         }
         Self::from_map(body)
     }
@@ -154,7 +163,10 @@ fn pubs(v: &[[u8; 32]]) -> Value {
     Value::Array(v.iter().map(|p| vb(p)).collect())
 }
 fn from_pubs(v: Value) -> Result<Vec<[u8; 32]>, Error> {
-    v.into_list()?.into_iter().map(|x| x.into_array_n()).collect()
+    v.into_list()?
+        .into_iter()
+        .map(|x| x.into_array_n())
+        .collect()
 }
 
 /// A version vector: device pubkey -> counter.
@@ -171,7 +183,10 @@ fn vv_from_value(v: Value) -> Result<Vv, Error> {
     let mut out = Vv::new();
     for (k, val) in v.into_map()?.into_entries() {
         match k {
-            Key::Bytes(b) => out.push((b.try_into().map_err(|_| Error::WrongLength)?, val.into_uint()?)),
+            Key::Bytes(b) => out.push((
+                b.try_into().map_err(|_| Error::WrongLength)?,
+                val.into_uint()?,
+            )),
             Key::Uint(_) => return Err(Error::InvalidMapKey),
         }
     }
@@ -201,11 +216,17 @@ impl NodeEntry {
         m.u(0, vb(&self.node_id));
         m.u(1, vb(&self.deleg));
         m.u(2, Value::Uint(self.not_after));
-        m.u(3, Value::Array(self.addrs.iter().map(|s| Value::Text(s.clone())).collect()));
-        m.u(4, match &self.relay_url {
-            Some(s) => Value::Text(s.clone()),
-            None => Value::Null,
-        });
+        m.u(
+            3,
+            Value::Array(self.addrs.iter().map(|s| Value::Text(s.clone())).collect()),
+        );
+        m.u(
+            4,
+            match &self.relay_url {
+                Some(s) => Value::Text(s.clone()),
+                None => Value::Null,
+            },
+        );
         Value::Map(m)
     }
     fn from_value(v: Value) -> Result<Self, Error> {
@@ -213,10 +234,21 @@ impl NodeEntry {
         let node_id = m.take(0)?.into_array_n()?;
         let deleg = m.take(1)?.into_array_n()?;
         let not_after = m.take(2)?.into_uint()?;
-        let addrs = m.take(3)?.into_list()?.into_iter().map(|x| x.into_text()).collect::<Result<_, _>>()?;
+        let addrs = m
+            .take(3)?
+            .into_list()?
+            .into_iter()
+            .map(|x| x.into_text())
+            .collect::<Result<_, _>>()?;
         let relay_url = m.take(4)?.into_opt_text()?;
         m.finish()?;
-        Ok(NodeEntry { node_id, deleg, not_after, addrs, relay_url })
+        Ok(NodeEntry {
+            node_id,
+            deleg,
+            not_after,
+            addrs,
+            relay_url,
+        })
     }
 }
 
@@ -245,7 +277,11 @@ impl Offers {
         let relay = m.take(1)?.into_bool()?;
         let trustee = m.take(2)?.into_bool()?;
         m.finish()?;
-        Ok(Offers { storage_bytes, relay, trustee })
+        Ok(Offers {
+            storage_bytes,
+            relay,
+            trustee,
+        })
     }
 }
 
@@ -265,10 +301,13 @@ impl CoTrustee {
         let mut m = Map::new();
         m.u(0, vb(&self.user));
         m.u(1, vb(&self.node));
-        m.u(2, match &self.relay_url {
-            Some(s) => Value::Text(s.clone()),
-            None => Value::Null,
-        });
+        m.u(
+            2,
+            match &self.relay_url {
+                Some(s) => Value::Text(s.clone()),
+                None => Value::Null,
+            },
+        );
         Value::Map(m)
     }
     fn from_value(v: Value) -> Result<Self, Error> {
@@ -277,7 +316,11 @@ impl CoTrustee {
         let node = m.take(1)?.into_array_n()?;
         let relay_url = m.take(2)?.into_opt_text()?;
         m.finish()?;
-        Ok(CoTrustee { user, node, relay_url })
+        Ok(CoTrustee {
+            user,
+            node,
+            relay_url,
+        })
     }
 }
 
@@ -361,7 +404,11 @@ impl Message for Hello {
         let card_version = m.take(1)?.into_uint()?;
         let roles = m.take(2)?.into_uint()?;
         m.finish()?;
-        Ok(Hello { protocol, card_version, roles })
+        Ok(Hello {
+            protocol,
+            card_version,
+            roles,
+        })
     }
 }
 
@@ -400,7 +447,10 @@ impl Message for ContactCard {
         m.u(0, vb(&self.user));
         m.u(1, Value::Text(self.display.clone()));
         m.u(2, vb(&self.enc_pub));
-        m.u(3, Value::Array(self.nodes.iter().map(|n| n.to_value()).collect()));
+        m.u(
+            3,
+            Value::Array(self.nodes.iter().map(|n| n.to_value()).collect()),
+        );
         m.u(4, self.offers.to_value());
         m.u(5, Value::Uint(self.version));
         m.u(22, vb(&self.by));
@@ -411,13 +461,27 @@ impl Message for ContactCard {
         let user = m.take(0)?.into_array_n()?;
         let display = m.take(1)?.into_text()?;
         let enc_pub = m.take(2)?.into_array_n()?;
-        let nodes = m.take(3)?.into_list()?.into_iter().map(NodeEntry::from_value).collect::<Result<_, _>>()?;
+        let nodes = m
+            .take(3)?
+            .into_list()?
+            .into_iter()
+            .map(NodeEntry::from_value)
+            .collect::<Result<_, _>>()?;
         let offers = Offers::from_value(m.take(4)?)?;
         let version = m.take(5)?.into_uint()?;
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ContactCard { user, display, enc_pub, nodes, offers, version, by, sig })
+        Ok(ContactCard {
+            user,
+            display,
+            enc_pub,
+            nodes,
+            offers,
+            version,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ContactCard);
@@ -450,7 +514,12 @@ impl Message for FriendRequest {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(FriendRequest { token, card, by, sig })
+        Ok(FriendRequest {
+            token,
+            card,
+            by,
+            sig,
+        })
     }
 }
 impl Signed for FriendRequest {
@@ -499,7 +568,12 @@ impl Message for FriendAccept {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(FriendAccept { card, friendship, by, sig })
+        Ok(FriendAccept {
+            card,
+            friendship,
+            by,
+            sig,
+        })
     }
 }
 impl Signed for FriendAccept {
@@ -571,10 +645,13 @@ impl Message for DeleteRequest {
     fn to_map(&self) -> Map {
         let mut m = Map::new();
         m.u(0, Value::Uint(self.scope));
-        m.u(1, match &self.vid {
-            Some(v) => vb(v),
-            None => Value::Null,
-        });
+        m.u(
+            1,
+            match &self.vid {
+                Some(v) => vb(v),
+                None => Value::Null,
+            },
+        );
         m.u(22, vb(&self.by));
         m.u(23, vb(&self.sig));
         m
@@ -588,7 +665,12 @@ impl Message for DeleteRequest {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(DeleteRequest { scope, vid, by, sig })
+        Ok(DeleteRequest {
+            scope,
+            vid,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(DeleteRequest);
@@ -621,7 +703,12 @@ impl Message for DeleteAck {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(DeleteAck { reference, ts, by, sig })
+        Ok(DeleteAck {
+            reference,
+            ts,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(DeleteAck);
@@ -662,7 +749,14 @@ impl Message for VaultAnnounce {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(VaultAnnounce { vid, epoch, replicas, digest, by, sig })
+        Ok(VaultAnnounce {
+            vid,
+            epoch,
+            replicas,
+            digest,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(VaultAnnounce);
@@ -699,7 +793,13 @@ impl Message for ManifestOffer {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ManifestOffer { vid, epoch, digest, by, sig })
+        Ok(ManifestOffer {
+            vid,
+            epoch,
+            digest,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ManifestOffer);
@@ -736,7 +836,13 @@ impl Message for ReplicaInvite {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ReplicaInvite { vid, epoch, approx_bytes, by, sig })
+        Ok(ReplicaInvite {
+            vid,
+            epoch,
+            approx_bytes,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ReplicaInvite);
@@ -769,7 +875,12 @@ impl Message for ReplicaAccept {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ReplicaAccept { vid, quota_bytes, by, sig })
+        Ok(ReplicaAccept {
+            vid,
+            quota_bytes,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ReplicaAccept);
@@ -799,8 +910,14 @@ impl Message for ShareGrant {
         m.u(0, vb(&self.subject));
         m.u(1, Value::Text(self.share_json.clone()));
         m.u(2, Value::Uint(self.recovery_delay));
-        m.u(3, Value::Array(self.cotrustees.iter().map(|c| c.to_value()).collect()));
-        m.u(4, Value::Array(self.refs.iter().map(|r| r.to_value()).collect()));
+        m.u(
+            3,
+            Value::Array(self.cotrustees.iter().map(|c| c.to_value()).collect()),
+        );
+        m.u(
+            4,
+            Value::Array(self.refs.iter().map(|r| r.to_value()).collect()),
+        );
         m.u(22, vb(&self.by));
         m.u(23, vb(&self.sig));
         m
@@ -809,12 +926,30 @@ impl Message for ShareGrant {
         let subject = m.take(0)?.into_array_n()?;
         let share_json = m.take(1)?.into_text()?;
         let recovery_delay = m.take(2)?.into_uint()?;
-        let cotrustees = m.take(3)?.into_list()?.into_iter().map(CoTrustee::from_value).collect::<Result<_, _>>()?;
-        let refs = m.take(4)?.into_list()?.into_iter().map(AnnounceRef::from_value).collect::<Result<_, _>>()?;
+        let cotrustees = m
+            .take(3)?
+            .into_list()?
+            .into_iter()
+            .map(CoTrustee::from_value)
+            .collect::<Result<_, _>>()?;
+        let refs = m
+            .take(4)?
+            .into_list()?
+            .into_iter()
+            .map(AnnounceRef::from_value)
+            .collect::<Result<_, _>>()?;
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ShareGrant { subject, share_json, recovery_delay, cotrustees, refs, by, sig })
+        Ok(ShareGrant {
+            subject,
+            share_json,
+            recovery_delay,
+            cotrustees,
+            refs,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ShareGrant);
@@ -851,7 +986,13 @@ impl Message for ShareAttestChallenge {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ShareAttestChallenge { subject, rsid, nonce, by, sig })
+        Ok(ShareAttestChallenge {
+            subject,
+            rsid,
+            nonce,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ShareAttestChallenge);
@@ -892,7 +1033,14 @@ impl Message for ShareAttestation {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ShareAttestation { subject, rsid, card_number, nonce, by, sig })
+        Ok(ShareAttestation {
+            subject,
+            rsid,
+            card_number,
+            nonce,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ShareAttestation);
@@ -925,7 +1073,12 @@ impl Message for ShareDestroy {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ShareDestroy { subject, rsid, by, sig })
+        Ok(ShareDestroy {
+            subject,
+            rsid,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ShareDestroy);
@@ -962,7 +1115,13 @@ impl Message for ShareDestroyAck {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ShareDestroyAck { subject, rsid, ts, by, sig })
+        Ok(ShareDestroyAck {
+            subject,
+            rsid,
+            ts,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(ShareDestroyAck);
@@ -993,7 +1152,10 @@ impl Message for FileGrant {
         m.u(1, vb(&self.vid));
         m.u(2, Value::Uint(self.epoch));
         m.u(3, pubs(&self.audience));
-        m.u(4, Value::Array(self.sealed.iter().map(|s| s.to_value()).collect()));
+        m.u(
+            4,
+            Value::Array(self.sealed.iter().map(|s| s.to_value()).collect()),
+        );
         m.u(22, vb(&self.by));
         m.u(23, vb(&self.sig));
         m
@@ -1003,11 +1165,24 @@ impl Message for FileGrant {
         let vid = m.take(1)?.into_array_n()?;
         let epoch = m.take(2)?.into_uint()?;
         let audience = from_pubs(m.take(3)?)?;
-        let sealed = m.take(4)?.into_list()?.into_iter().map(Sealed::from_value).collect::<Result<_, _>>()?;
+        let sealed = m
+            .take(4)?
+            .into_list()?
+            .into_iter()
+            .map(Sealed::from_value)
+            .collect::<Result<_, _>>()?;
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(FileGrant { grant_id, vid, epoch, audience, sealed, by, sig })
+        Ok(FileGrant {
+            grant_id,
+            vid,
+            epoch,
+            audience,
+            sealed,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(FileGrant);
@@ -1097,7 +1272,18 @@ impl Message for RecoveryOpen {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(RecoveryOpen { ceremony_id, subject, rsid, claimant_display, ceremony_enc, new_node, reason, opened_at, by, sig })
+        Ok(RecoveryOpen {
+            ceremony_id,
+            subject,
+            rsid,
+            claimant_display,
+            ceremony_enc,
+            new_node,
+            reason,
+            opened_at,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(RecoveryOpen);
@@ -1130,7 +1316,12 @@ impl Message for CeremonyApprove {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(CeremonyApprove { ceremony_id, ts, by, sig })
+        Ok(CeremonyApprove {
+            ceremony_id,
+            ts,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(CeremonyApprove);
@@ -1159,7 +1350,11 @@ impl Message for CeremonyAbort {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(CeremonyAbort { ceremony_id, by, sig })
+        Ok(CeremonyAbort {
+            ceremony_id,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(CeremonyAbort);
@@ -1192,7 +1387,12 @@ impl Message for CeremonyShare {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(CeremonyShare { ceremony_id, sealed, by, sig })
+        Ok(CeremonyShare {
+            ceremony_id,
+            sealed,
+            by,
+            sig,
+        })
     }
 }
 impl_signed!(CeremonyShare);
@@ -1231,7 +1431,10 @@ impl InviteTicket {
     }
     /// Render as the `carapace:` invite URI (lowercase unpadded base32 of the payload).
     pub fn uri(&self) -> String {
-        let payload = encode(&Value::Array(vec![Value::Uint(Self::TYPE), Value::Map(self.to_map())]));
+        let payload = encode(&Value::Array(vec![
+            Value::Uint(Self::TYPE),
+            Value::Map(self.to_map()),
+        ]));
         format!("carapace:{}", base32_lower_unpadded(&payload))
     }
 }
@@ -1241,8 +1444,19 @@ impl Message for InviteTicket {
         let mut m = Map::new();
         m.u(0, vb(&self.user));
         m.u(1, vb(&self.node));
-        m.u(2, Value::Array(self.addrs.iter().map(|s| Value::Text(s.clone())).collect()));
-        m.u(3, Value::Array(self.relay_urls.iter().map(|s| Value::Text(s.clone())).collect()));
+        m.u(
+            2,
+            Value::Array(self.addrs.iter().map(|s| Value::Text(s.clone())).collect()),
+        );
+        m.u(
+            3,
+            Value::Array(
+                self.relay_urls
+                    .iter()
+                    .map(|s| Value::Text(s.clone()))
+                    .collect(),
+            ),
+        );
         m.u(4, vb(&self.token));
         m.u(5, Value::Uint(self.expires));
         m.u(23, vb(&self.sig));
@@ -1251,13 +1465,31 @@ impl Message for InviteTicket {
     fn from_map(mut m: Map) -> Result<Self, Error> {
         let user = m.take(0)?.into_array_n()?;
         let node = m.take(1)?.into_array_n()?;
-        let addrs = m.take(2)?.into_list()?.into_iter().map(|x| x.into_text()).collect::<Result<_, _>>()?;
-        let relay_urls = m.take(3)?.into_list()?.into_iter().map(|x| x.into_text()).collect::<Result<_, _>>()?;
+        let addrs = m
+            .take(2)?
+            .into_list()?
+            .into_iter()
+            .map(|x| x.into_text())
+            .collect::<Result<_, _>>()?;
+        let relay_urls = m
+            .take(3)?
+            .into_list()?
+            .into_iter()
+            .map(|x| x.into_text())
+            .collect::<Result<_, _>>()?;
         let token = m.take(4)?.into_array_n()?;
         let expires = m.take(5)?.into_uint()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(InviteTicket { user, node, addrs, relay_urls, token, expires, sig })
+        Ok(InviteTicket {
+            user,
+            node,
+            addrs,
+            relay_urls,
+            token,
+            expires,
+            sig,
+        })
     }
 }
 
@@ -1315,8 +1547,18 @@ impl Friendship {
     pub fn create(k1: &SigningKey, k2: &SigningKey, established: u64) -> Self {
         let p1 = k1.verifying_key().to_bytes();
         let p2 = k2.verifying_key().to_bytes();
-        let (a, ka, b, kb) = if p1 <= p2 { (p1, k1, p2, k2) } else { (p2, k2, p1, k1) };
-        let mut fr = Friendship { a, b, established, sig_a: [0; 64], sig_b: [0; 64] };
+        let (a, ka, b, kb) = if p1 <= p2 {
+            (p1, k1, p2, k2)
+        } else {
+            (p2, k2, p1, k1)
+        };
+        let mut fr = Friendship {
+            a,
+            b,
+            established,
+            sig_a: [0; 64],
+            sig_b: [0; 64],
+        };
         let msg = fr.core_signing_bytes();
         fr.sig_a = ka.sign(&msg).to_bytes();
         fr.sig_b = kb.sign(&msg).to_bytes();
@@ -1325,8 +1567,10 @@ impl Friendship {
     /// Verify both signatures against a and b.
     pub fn verify(&self) -> Result<(), Error> {
         let msg = self.core_signing_bytes();
-        VerifyingKey::from_bytes(&self.a)?.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&self.sig_a))?;
-        VerifyingKey::from_bytes(&self.b)?.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&self.sig_b))?;
+        VerifyingKey::from_bytes(&self.a)?
+            .verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&self.sig_a))?;
+        VerifyingKey::from_bytes(&self.b)?
+            .verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&self.sig_b))?;
         Ok(())
     }
     fn to_map(&self) -> Map {
@@ -1349,7 +1593,13 @@ impl Friendship {
         let sig_a = m.take(3)?.into_array_n()?;
         let sig_b = m.take(4)?.into_array_n()?;
         m.finish()?;
-        Ok(Friendship { a, b, established, sig_a, sig_b })
+        Ok(Friendship {
+            a,
+            b,
+            established,
+            sig_a,
+            sig_b,
+        })
     }
     /// Encode as a bare document (no frame, no length prefix).
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1373,6 +1623,17 @@ pub struct GrantChunk {
     /// plaintext length.
     pub len: u64,
 }
+/// S1: a `GrantChunk` carries a disclosed chunk's convergent key and nonce in the
+/// clear. Scrub both on drop so a decoded `GrantBody` (the HPKE plaintext) does not
+/// leave copies of the keys in freed memory after reconstruction.
+impl Drop for GrantChunk {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.chunk_key.zeroize();
+        self.nonce.zeroize();
+    }
+}
+
 impl GrantChunk {
     fn to_value(&self) -> Value {
         let mut m = Map::new();
@@ -1389,7 +1650,12 @@ impl GrantChunk {
         let nonce = m.take(2)?.into_array_n()?;
         let len = m.take(3)?.into_uint()?;
         m.finish()?;
-        Ok(GrantChunk { chunk_id, chunk_key, nonce, len })
+        Ok(GrantChunk {
+            chunk_id,
+            chunk_key,
+            nonce,
+            len,
+        })
     }
 }
 
@@ -1411,7 +1677,10 @@ impl GrantFile {
         m.u(0, Value::Text(self.path.clone()));
         m.u(1, vb(&self.file_hash));
         m.u(2, Value::Uint(self.size));
-        m.u(3, Value::Array(self.chunks.iter().map(|c| c.to_value()).collect()));
+        m.u(
+            3,
+            Value::Array(self.chunks.iter().map(|c| c.to_value()).collect()),
+        );
         Value::Map(m)
     }
     fn from_value(v: Value) -> Result<Self, Error> {
@@ -1419,9 +1688,19 @@ impl GrantFile {
         let path = m.take(0)?.into_text()?;
         let file_hash = m.take(1)?.into_array_n()?;
         let size = m.take(2)?.into_uint()?;
-        let chunks = m.take(3)?.into_list()?.into_iter().map(GrantChunk::from_value).collect::<Result<_, _>>()?;
+        let chunks = m
+            .take(3)?
+            .into_list()?
+            .into_iter()
+            .map(GrantChunk::from_value)
+            .collect::<Result<_, _>>()?;
         m.finish()?;
-        Ok(GrantFile { path, file_hash, size, chunks })
+        Ok(GrantFile {
+            path,
+            file_hash,
+            size,
+            chunks,
+        })
     }
 }
 
@@ -1434,7 +1713,10 @@ pub struct GrantBody {
 impl GrantBody {
     fn to_map(&self) -> Map {
         let mut m = Map::new();
-        m.u(0, Value::Array(self.files.iter().map(|f| f.to_value()).collect()));
+        m.u(
+            0,
+            Value::Array(self.files.iter().map(|f| f.to_value()).collect()),
+        );
         m
     }
     /// Encode as a bare document.
@@ -1444,7 +1726,12 @@ impl GrantBody {
     /// Decode from a bare document.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let mut m = decode(bytes)?.into_map()?;
-        let files = m.take(0)?.into_list()?.into_iter().map(GrantFile::from_value).collect::<Result<_, _>>()?;
+        let files = m
+            .take(0)?
+            .into_list()?
+            .into_iter()
+            .map(GrantFile::from_value)
+            .collect::<Result<_, _>>()?;
         m.finish()?;
         Ok(GrantBody { files })
     }
@@ -1477,12 +1764,20 @@ impl FileEntry {
         m.u(1, Value::Uint(self.mode));
         m.u(2, Value::Uint(self.mtime));
         m.u(3, Value::Uint(self.size));
-        m.u(4, Value::Array(self.chunks.iter().map(|(id, len)| {
-            let mut cm = Map::new();
-            cm.u(0, vb(id));
-            cm.u(1, Value::Uint(*len));
-            Value::Map(cm)
-        }).collect()));
+        m.u(
+            4,
+            Value::Array(
+                self.chunks
+                    .iter()
+                    .map(|(id, len)| {
+                        let mut cm = Map::new();
+                        cm.u(0, vb(id));
+                        cm.u(1, Value::Uint(*len));
+                        Value::Map(cm)
+                    })
+                    .collect(),
+            ),
+        );
         m.u(5, vb(&self.file_hash));
         m.u(6, vv_to_value(&self.version));
         m.u(7, Value::Bool(self.deleted));
@@ -1494,18 +1789,32 @@ impl FileEntry {
         let mode = m.take(1)?.into_uint()?;
         let mtime = m.take(2)?.into_uint()?;
         let size = m.take(3)?.into_uint()?;
-        let chunks = m.take(4)?.into_list()?.into_iter().map(|x| {
-            let mut cm = x.into_map()?;
-            let id = cm.take(0)?.into_array_n()?;
-            let len = cm.take(1)?.into_uint()?;
-            cm.finish()?;
-            Ok((id, len))
-        }).collect::<Result<_, Error>>()?;
+        let chunks = m
+            .take(4)?
+            .into_list()?
+            .into_iter()
+            .map(|x| {
+                let mut cm = x.into_map()?;
+                let id = cm.take(0)?.into_array_n()?;
+                let len = cm.take(1)?.into_uint()?;
+                cm.finish()?;
+                Ok((id, len))
+            })
+            .collect::<Result<_, Error>>()?;
         let file_hash = m.take(5)?.into_array_n()?;
         let version = vv_from_value(m.take(6)?)?;
         let deleted = m.take(7)?.into_bool()?;
         m.finish()?;
-        Ok(FileEntry { path, mode, mtime, size, chunks, file_hash, version, deleted })
+        Ok(FileEntry {
+            path,
+            mode,
+            mtime,
+            size,
+            chunks,
+            file_hash,
+            version,
+            deleted,
+        })
     }
 }
 
@@ -1529,7 +1838,10 @@ impl Manifest {
         m.u(0, vb(&self.vid));
         m.u(1, Value::Uint(self.epoch));
         m.u(2, pubs(&self.authors));
-        m.u(3, Value::Array(self.files.iter().map(|f| f.to_value()).collect()));
+        m.u(
+            3,
+            Value::Array(self.files.iter().map(|f| f.to_value()).collect()),
+        );
         m.u(4, vv_to_value(&self.vv));
         m
     }
@@ -1543,10 +1855,21 @@ impl Manifest {
         let vid = m.take(0)?.into_array_n()?;
         let epoch = m.take(1)?.into_uint()?;
         let authors = from_pubs(m.take(2)?)?;
-        let files = m.take(3)?.into_list()?.into_iter().map(FileEntry::from_value).collect::<Result<_, _>>()?;
+        let files = m
+            .take(3)?
+            .into_list()?
+            .into_iter()
+            .map(FileEntry::from_value)
+            .collect::<Result<_, _>>()?;
         let vv = vv_from_value(m.take(4)?)?;
         m.finish()?;
-        Ok(Manifest { vid, epoch, authors, files, vv })
+        Ok(Manifest {
+            vid,
+            epoch,
+            authors,
+            files,
+            vv,
+        })
     }
 }
 
@@ -1607,6 +1930,13 @@ impl ManifestEnvelope {
         let by = m.take(22)?.into_array_n()?;
         let sig = m.take(23)?.into_array_n()?;
         m.finish()?;
-        Ok(ManifestEnvelope { vid, epoch, nonce, ct, by, sig })
+        Ok(ManifestEnvelope {
+            vid,
+            epoch,
+            nonce,
+            ct,
+            by,
+            sig,
+        })
     }
 }

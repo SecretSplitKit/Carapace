@@ -25,14 +25,15 @@ pub use state::State;
 use anyhow::{ensure, Context, Result};
 use carapace_crypto::kdf::{self, INFO_DISCLOSE};
 use carapace_crypto::seal::{self, HpkePrivateKey, HpkePublicKey};
-use carapace_net::endpoint::ALPN;
-use carapace_net::{read_frame_raw, read_msg, write_msg, CarapaceEndpoint, DocStore, IrohBlobStore};
-use carapace_vault::{
-    ingest_dir, new_vid, open_envelope, reconstruct, ChunkKeys, ChunkSecret, MemoryStore, VaultKeys,
-};
+use carapace_disclose::{self as disclose, DisclosureTable, Recipient};
 use carapace_friend::{
     accept_friend_request, build_friend_request, build_ticket, friendship_core_bytes,
     verify_friend_accept, verify_friend_request, TicketBook,
+};
+use carapace_net::endpoint::ALPN;
+use carapace_net::{
+    authorizing_event_sender, read_frame_raw, read_msg, write_msg, CarapaceEndpoint, DocStore,
+    IrohBlobStore,
 };
 use carapace_replica::{
     build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
@@ -40,14 +41,17 @@ use carapace_replica::{
     DEFAULT_RATE_REFILL_PER_SEC, MAX_REPLICA_BLOBS,
 };
 use carapace_share::{
-    answer_attest_challenge, build_attest_challenge, AttestTracker, Share, ShareAction, ShareHealth,
-    ShareMonitor,
+    answer_attest_challenge, build_attest_challenge, AttestTracker, Share, ShareAction,
+    ShareHealth, ShareMonitor,
+};
+use carapace_vault::{
+    ingest_dir, new_vid, open_envelope, reconstruct, ChunkKeys, ChunkSecret, MemoryStore, VaultKeys,
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
     ContactCard, FileGrant, FriendAccept, FriendRequest, Friendship, GrantBody, GrantChunk,
     GrantFile, Hello, InviteTicket, Manifest, ManifestEnvelope, NodeEntry, Offers, ReplicaAccept,
-    ReplicaInvite, Sealed, ShareAttestation, ShareAttestChallenge, Signed, VaultAnnounce,
+    ReplicaInvite, Sealed, ShareAttestChallenge, ShareAttestation, Signed, VaultAnnounce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -55,7 +59,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::EndpointAddr;
 use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -176,8 +180,20 @@ struct Shared {
     friend_grants: HashMap<[u8; 32], u64>,
     /// Tickets this daemon has issued and will honor exactly once (§6).
     tickets: TicketBook,
-    /// Per-owned-vault blob source (digest + ChunkIDs) for replica placement.
+    /// Per-owned-vault blob source (digest + ChunkIDs) for replica placement. Holds
+    /// only the CURRENT epoch's source (overwritten on republish).
     vault_blobs: HashMap<[u8; 32], VaultBlobs>,
+    /// Every ChunkID ever published for a vault this daemon OWNS, mapped to that
+    /// vault's vid and RETAINED across epoch bumps (unlike `vault_blobs`). The
+    /// blob-read gate ([`authorize_fetch`]) consults this so a superseded-epoch
+    /// chunk stays in the owner-gated set: a still-disclosed old chunk is served
+    /// only to its audience, an undisclosed old chunk to no non-device. Without it,
+    /// a chunk dropped from the current `vault_blobs` on republish would fall out of
+    /// the owned set and be served to any dialer (W2). ponytail: grows with the
+    /// distinct owned chunks over the daemon's life; bound it together with
+    /// old-epoch blob eviction from the store (GC), tracked as a separate resource
+    /// concern (spec-errata W2-gc).
+    owned_chunks: HashMap<[u8; 32], [u8; 32]>,
     /// Owner-side replica membership: vid -> accepted replica node ids.
     members: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// Owner-side replica invariant `r`, per vault.
@@ -202,6 +218,33 @@ struct Shared {
     /// recovery-set id, each with its continuous local CRC self-validation monitor
     /// (§10.2). Answers `ShareAttestChallenge`s from the owning friend.
     held_shares: HashMap<u64, (Share, ShareMonitor)>,
+    /// Per-owned-vault chunk secrets (key/nonce per ChunkID), retained from ingest
+    /// so the owner can later disclose a *subset* of files (§7.4) without
+    /// re-ingesting. Owner-only, in-memory, and zeroized on drop; no weaker than
+    /// already holding `k_root` (from which every content key derives) in memory.
+    vault_keys: HashMap<[u8; 32], ChunkKeys>,
+    /// Owner-side selective-disclosure table (§7.4 / D3): ChunkID -> audience users
+    /// authorized to fetch it, recorded from every issued `FileGrant`. The
+    /// blob-read gate ([`authorize_fetch`]) consults it so a granted chunk is
+    /// served only to an authenticated member of that grant's audience.
+    disclosure: DisclosureTable,
+    /// Nodes this daemon has authenticated on its `carapace/1` control stream (via
+    /// NodeID + card delegation, W5), classified as our own device or a specific
+    /// friend. The blob-read gate keys on this so that a raw `iroh-blobs` dialer is
+    /// served owned-vault chunks only after it proved, on the authenticated control
+    /// stream, who it is — closing the §7.4/D3 gap for owner-served granted content.
+    blob_auth: HashMap<[u8; 32], BlobAuth>,
+}
+
+/// How a node authenticated itself on this daemon's `carapace/1` control stream,
+/// used by the blob-read gate ([`authorize_fetch`]) to bind a raw `iroh-blobs`
+/// dialer's NodeID to a verified identity.
+#[derive(Clone, Copy, Debug)]
+enum BlobAuth {
+    /// A delegated device of our own user (the self branch of `authorize_dialer`).
+    OwnDevice,
+    /// A delegated device of the named established friend (the friend branch).
+    Friend([u8; 32]),
 }
 
 /// The `carapace/1` control-stream handler. It authenticates the dialer against
@@ -247,7 +290,8 @@ impl ControlHandler {
             }
             Some((ReplicaInvite::TYPE, body)) => {
                 let inv = ReplicaInvite::from_map(body)?;
-                self.serve_replica_store(inv, &remote, &mut send, &mut recv).await?;
+                self.serve_replica_store(inv, &remote, &mut send, &mut recv)
+                    .await?;
             }
             Some((ShareAttestChallenge::TYPE, body)) => {
                 let ch = ShareAttestChallenge::from_map(body)?;
@@ -275,12 +319,16 @@ impl ControlHandler {
 
         let now = unix_now();
         let (authorized, cards, announces, grants) = {
-            let s = self.shared.read().expect("shared lock");
-            let ok = authorize_dialer(&s, &self.self_user, card, remote, now);
-            if ok {
-                (true, s.cards.clone(), s.announces.clone(), s.grants.clone())
-            } else {
-                (false, Vec::new(), Vec::new(), Vec::new())
+            // W5: classify the dialer against its authenticated remote node id. On
+            // success, record the classification so the blob-read gate can bind this
+            // node's later raw iroh-blobs fetches to a verified identity (§7.4/D3).
+            let mut s = self.shared.write().expect("shared lock");
+            match classify_dialer(&s, &self.self_user, card, remote, now) {
+                Some(auth) => {
+                    s.blob_auth.insert(*remote, auth);
+                    (true, s.cards.clone(), s.announces.clone(), s.grants.clone())
+                }
+                None => (false, Vec::new(), Vec::new(), Vec::new()),
             }
         };
         if !authorized {
@@ -345,7 +393,8 @@ impl ControlHandler {
             // Agree a per-friend replica-storage grant at add-friend time. On the
             // accept path we grant this node's configured default; the initiating
             // `befriend` path can agree a different amount explicitly.
-            s.friend_grants.insert(requester_user, self.default_grant_bytes);
+            s.friend_grants
+                .insert(requester_user, self.default_grant_bytes);
             accept
         };
 
@@ -366,7 +415,8 @@ impl ControlHandler {
         recv: &mut RecvStream,
     ) -> Result<()> {
         let now = unix_now();
-        inv.verify().map_err(|e| anyhow::anyhow!("replica invite bad sig: {e}"))?;
+        inv.verify()
+            .map_err(|e| anyhow::anyhow!("replica invite bad sig: {e}"))?;
 
         // Authorize the inviting owner and rate-limit its push under one write
         // lock (all synchronous; the lock is released before any `.await`). The
@@ -397,7 +447,12 @@ impl ControlHandler {
             send.finish()?;
             return Ok(());
         };
-        let mut accept = ReplicaAccept { vid: inv.vid, quota_bytes: quota, by: [0; 32], sig: [0; 64] };
+        let mut accept = ReplicaAccept {
+            vid: inv.vid,
+            quota_bytes: quota,
+            by: [0; 32],
+            sig: [0; 64],
+        };
         accept.sign(&self.node_key);
         write_msg(send, &accept).await?;
 
@@ -422,11 +477,16 @@ impl ControlHandler {
             if i == 0 {
                 let env = ManifestEnvelope::from_bytes(&bytes)
                     .map_err(|e| anyhow::anyhow!("replica envelope decode: {e}"))?;
-                env.verify().map_err(|e| anyhow::anyhow!("replica envelope bad sig: {e}"))?;
+                env.verify()
+                    .map_err(|e| anyhow::anyhow!("replica envelope bad sig: {e}"))?;
             }
             self.blobs.add(&bytes).await?;
         }
-        self.shared.write().expect("shared lock").held.insert(inv.vid);
+        self.shared
+            .write()
+            .expect("shared lock")
+            .held
+            .insert(inv.vid);
         // Ack: tell the owner storage is durable before it records membership.
         write_u64(send, count).await?;
         send.finish()?;
@@ -449,13 +509,15 @@ impl ControlHandler {
         send: &mut SendStream,
     ) -> Result<()> {
         let now = unix_now();
-        ch.verify().map_err(|e| anyhow::anyhow!("attest challenge bad sig: {e}"))?;
+        ch.verify()
+            .map_err(|e| anyhow::anyhow!("attest challenge bad sig: {e}"))?;
 
         // Copy the share out under the read lock; answer (and await the write)
         // outside it so no lock is held across `.await`.
         let share = {
             let s = self.shared.read().expect("shared lock");
-            let authorized = node_is_authorized(&s, &self.self_user, &ch.by, now) && ch.by == *remote;
+            let authorized =
+                node_is_authorized(&s, &self.self_user, &ch.by, now) && ch.by == *remote;
             if !authorized {
                 None
             } else {
@@ -474,7 +536,9 @@ impl ControlHandler {
 
 impl std::fmt::Debug for ControlHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlHandler").field("self_user", &hex32(&self.self_user)).finish()
+        f.debug_struct("ControlHandler")
+            .field("self_user", &hex32(&self.self_user))
+            .finish()
     }
 }
 
@@ -535,7 +599,11 @@ impl Daemon {
             s.rate = RateLimiter::new(limits.rate_capacity, limits.rate_refill_per_sec);
         }
 
-        let hello = Hello { protocol: 1, card_version: 1, roles: 1 };
+        let hello = Hello {
+            protocol: 1,
+            card_version: 1,
+            roles: 1,
+        };
         let handler = ControlHandler {
             hello,
             node_key: node_key.clone(),
@@ -545,21 +613,45 @@ impl Daemon {
             shared: Arc::clone(&shared),
             default_grant_bytes: limits.quota_bytes,
         };
-        // S5 (inherited design limitation, spec-errata E-blob-authz): the blob
-        // store answers `iroh_blobs::ALPN` fetches from ANY dialer with no per-peer
-        // read authorization. Confidentiality rests entirely on the AEAD sealing of
-        // every chunk plus the unguessable ChunkIDs, which are revealed only inside
-        // the W2/W5-gated manifest+grant on the `carapace/1` control stream. A peer
-        // that never learns a ChunkID cannot ask for it, but anyone who does learn
-        // one can fetch the (still-encrypted) bytes. A future per-peer blob-read
-        // authz hook is owed here; this is not fixed in the current phase.
+        // §7.4 / D3 fetch authorization (closes S5 for owned granted content): the
+        // blob store no longer answers `iroh_blobs::ALPN` fetches from any dialer.
+        // Every get-request is gated by `authorize_fetch` against the dialer's
+        // authenticated node id and the requested ChunkID. Owner-served chunks of a
+        // vault we own are released only to our own delegated devices, this vault's
+        // replica-set members, or a friend authenticated as a member of a grant's
+        // audience covering that chunk — so a leaked grant document alone (presented
+        // by a non-audience party) authorizes nothing.
+        //
+        // ponytail (narrowed E-blob-authz residual): chunks we hold *as a replica*
+        // for another owner stay on the inherited residual (AEAD seal + ChunkID
+        // secrecy), because a replica cannot authenticate the owner's *other*
+        // devices without a card that enumerates them — out of scope here. The
+        // normative §7.4 selective-disclosure path (audience fetches from the owner
+        // who issued the grant) is fully gated.
+        let gate_shared = Arc::clone(&shared);
+        let events = authorizing_event_sender(move |node, chunk_id| {
+            let s = gate_shared.read().expect("shared lock");
+            authorize_fetch(&s, &node, &chunk_id)
+        });
         let router = Router::builder(ep.endpoint().clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(blobs.mem(), None))
+            .accept(
+                iroh_blobs::ALPN,
+                BlobsProtocol::new(blobs.mem(), Some(events)),
+            )
             .accept(ALPN, handler)
             .spawn();
 
         let docs = Arc::new(Mutex::new(DocStore::new()));
-        Ok(Self { ep, blobs, shared, node_key, user_key, k_root, docs, _router: router })
+        Ok(Self {
+            ep,
+            blobs,
+            shared,
+            node_key,
+            user_key,
+            k_root,
+            docs,
+            _router: router,
+        })
     }
 
     /// This device's node id (= iroh endpoint id).
@@ -605,7 +697,10 @@ impl Daemon {
         let ingest = ingest_dir(src, &self.node_key, &vkeys, epoch, &mut mem)?;
 
         let env_digest = self.blobs.add(&ingest.envelope.to_bytes()).await?;
-        ensure!(env_digest == ingest.digest, "envelope blob hash != manifestDigest");
+        ensure!(
+            env_digest == ingest.digest,
+            "envelope blob hash != manifestDigest"
+        );
         for f in &ingest.manifest.files {
             for (id, _len) in &f.chunks {
                 let ct = carapace_vault::ChunkStore::get(&mem, id)?
@@ -631,11 +726,31 @@ impl Daemon {
         }
 
         let mut s = self.shared.write().expect("shared lock");
-        s.vault_blobs
-            .insert(vid, VaultBlobs { digest: ingest.digest, chunk_ids, manifest: ingest.manifest.clone() });
+        // W2: retain every published ChunkID in the owner-gated set across epoch
+        // bumps, so superseded chunks keep the §7.4 owner gate (see `owned_chunks`).
+        for id in &chunk_ids {
+            s.owned_chunks.insert(*id, vid);
+        }
+        s.vault_blobs.insert(
+            vid,
+            VaultBlobs {
+                digest: ingest.digest,
+                chunk_ids,
+                manifest: ingest.manifest.clone(),
+            },
+        );
+        // Retain the per-chunk secrets so a later `disclose_files` can seal a subset
+        // of files into a friend-facing grant without re-ingesting (§7.4).
+        s.vault_keys.insert(vid, ingest.keys);
         let replicas = replica_list(self.node_id(), s.members.get(&vid));
-        let mut ann =
-            VaultAnnounce { vid, epoch, replicas, digest: ingest.digest, by: [0; 32], sig: [0; 64] };
+        let mut ann = VaultAnnounce {
+            vid,
+            epoch,
+            replicas,
+            digest: ingest.digest,
+            by: [0; 32],
+            sig: [0; 64],
+        };
         ann.sign(&self.node_key);
         // Replace any older announce/grant for this vid (monotonic epoch).
         s.announces.retain(|a| a.vid != vid);
@@ -681,7 +796,11 @@ impl Daemon {
     /// received both an announce and an openable grant. Each vault is written to
     /// `out_root/<hex vid>/`. Returns the vaults reconstructed. Blobs are fetched
     /// from the same `peer` that served the documents.
-    pub async fn sync_from(&self, peer: EndpointAddr, out_root: &Path) -> Result<Vec<Reconstructed>> {
+    pub async fn sync_from(
+        &self,
+        peer: EndpointAddr,
+        out_root: &Path,
+    ) -> Result<Vec<Reconstructed>> {
         self.sync_impl(peer.clone(), peer, out_root).await
     }
 
@@ -814,7 +933,10 @@ impl Daemon {
         // S6: the AEAD aad already binds env.epoch to the manifest; also bind the
         // independently-signed announce epoch so a higher advertised epoch cannot
         // point at a lower-epoch envelope.
-        ensure!(manifest.epoch == ann.epoch, "manifest epoch != announce epoch");
+        ensure!(
+            manifest.epoch == ann.epoch,
+            "manifest epoch != announce epoch"
+        );
 
         // Open the grant -> per-chunk secrets.
         let keys = self.open_file_grant(grant, disclose_priv, *vid)?;
@@ -834,7 +956,11 @@ impl Daemon {
 
         let out_dir = out_root.join(hex32(vid));
         reconstruct(&manifest, &store, &keys, &out_dir)?;
-        Ok(Reconstructed { vid: *vid, epoch: ann.epoch, out_dir })
+        Ok(Reconstructed {
+            vid: *vid,
+            epoch: ann.epoch,
+            out_dir,
+        })
     }
 
     // ---- friendship (§9.2) ---------------------------------------------
@@ -846,12 +972,21 @@ impl Daemon {
 
     /// Whether an established friendship exists with `user`.
     pub fn is_friend(&self, user: &[u8; 32]) -> bool {
-        self.shared.read().expect("shared lock").friendships.contains_key(user)
+        self.shared
+            .read()
+            .expect("shared lock")
+            .friendships
+            .contains_key(user)
     }
 
     /// The stored dual-signed friendship with `user`, if any.
     pub fn friendship_with(&self, user: &[u8; 32]) -> Option<Friendship> {
-        self.shared.read().expect("shared lock").friendships.get(user).cloned()
+        self.shared
+            .read()
+            .expect("shared lock")
+            .friendships
+            .get(user)
+            .cloned()
     }
 
     /// Test/diagnostic helper: perform a document pull against `peer` and return
@@ -953,7 +1088,8 @@ impl Daemon {
             s.friendships.insert(acceptor_user, friendship.clone());
             s.friends.insert(acceptor_user, accept.card.clone());
             // Agree the per-friend replica-storage grant at add-friend time.
-            s.friend_grants.insert(acceptor_user, grant_bytes.unwrap_or(DEFAULT_QUOTA_BYTES));
+            s.friend_grants
+                .insert(acceptor_user, grant_bytes.unwrap_or(DEFAULT_QUOTA_BYTES));
         }
         drop(conn);
         Ok(friendship)
@@ -969,7 +1105,11 @@ impl Daemon {
     /// Add `node` to the owner-side replica deny-list: this daemon will never place
     /// a replica on it, even if it is an established friend (S4).
     pub fn deny_replica_peer(&self, node: [u8; 32]) {
-        self.shared.write().expect("shared lock").replica_deny.insert(node);
+        self.shared
+            .write()
+            .expect("shared lock")
+            .replica_deny
+            .insert(node);
     }
 
     /// S4 owner-side placement gate: a candidate node may be invited only if it is
@@ -1003,7 +1143,11 @@ impl Daemon {
     ) -> Result<Vec<[u8; 32]>> {
         let (vb, epoch) = {
             let s = self.shared.read().expect("shared lock");
-            let vb = s.vault_blobs.get(&vid).cloned().context("vault not published")?;
+            let vb = s
+                .vault_blobs
+                .get(&vid)
+                .cloned()
+                .context("vault not published")?;
             let epoch = *s.epochs.get(&vid).context("vault has no epoch")?;
             (vb, epoch)
         };
@@ -1020,7 +1164,10 @@ impl Daemon {
             if !self.replica_candidate_ok(&node, &self_user, now) {
                 continue;
             }
-            if let Some(node) = self.invite_and_push(peer, vid, epoch, total, &blobs).await? {
+            if let Some(node) = self
+                .invite_and_push(peer, vid, epoch, total, &blobs)
+                .await?
+            {
                 placed.push(node);
             }
         }
@@ -1060,13 +1207,21 @@ impl Daemon {
             let s = self.shared.read().expect("shared lock");
             let before = s.members.get(&vid).cloned().unwrap_or_default();
             let r = *s.replica_target.get(&vid).unwrap_or(&before.len());
-            let vb = s.vault_blobs.get(&vid).cloned().context("vault not published")?;
+            let vb = s
+                .vault_blobs
+                .get(&vid)
+                .cloned()
+                .context("vault not published")?;
             let epoch = *s.epochs.get(&vid).context("vault has no epoch")?;
             (before, r, vb, epoch)
         };
 
         let mut members = before.clone();
-        members.retain(|m| !healths.get(m).is_some_and(|h| h.is_lost(now, DEFAULT_GRACE_SECS)));
+        members.retain(|m| {
+            !healths
+                .get(m)
+                .is_some_and(|h| h.is_lost(now, DEFAULT_GRACE_SECS))
+        });
 
         if members.len() < r {
             let blobs = self.gather_blob_bytes(&vb).await?;
@@ -1084,7 +1239,10 @@ impl Daemon {
                 if !self.replica_candidate_ok(&node, &self_user, now) {
                     continue;
                 }
-                if let Some(n) = self.invite_and_push(peer, vid, epoch, total, &blobs).await? {
+                if let Some(n) = self
+                    .invite_and_push(peer, vid, epoch, total, &blobs)
+                    .await?
+                {
                     members.push(n);
                 }
             }
@@ -1099,7 +1257,11 @@ impl Daemon {
             // members we confirmed lost, then union in the repaired set.
             let mut s = self.shared.write().expect("shared lock");
             let cur = s.members.entry(vid).or_default();
-            cur.retain(|m| !healths.get(m).is_some_and(|h| h.is_lost(now, DEFAULT_GRACE_SECS)));
+            cur.retain(|m| {
+                !healths
+                    .get(m)
+                    .is_some_and(|h| h.is_lost(now, DEFAULT_GRACE_SECS))
+            });
             for n in &members {
                 if !cur.contains(n) {
                     cur.push(*n);
@@ -1136,8 +1298,13 @@ impl Daemon {
         let conn = self.ep.connect(peer.clone(), ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        let mut inv =
-            ReplicaInvite { vid, epoch, approx_bytes: total, by: [0; 32], sig: [0; 64] };
+        let mut inv = ReplicaInvite {
+            vid,
+            epoch,
+            approx_bytes: total,
+            by: [0; 32],
+            sig: [0; 64],
+        };
         inv.sign(&self.node_key);
         write_msg(&mut send, &inv).await?;
 
@@ -1146,10 +1313,15 @@ impl Daemon {
             Some((ReplicaAccept::TYPE, body)) => ReplicaAccept::from_map(body)?,
             _ => return Ok(None),
         };
-        accept.verify().map_err(|e| anyhow::anyhow!("replica accept bad sig: {e}"))?;
+        accept
+            .verify()
+            .map_err(|e| anyhow::anyhow!("replica accept bad sig: {e}"))?;
         ensure!(accept.vid == vid, "replica accept named a different vault");
         ensure!(accept.by == node, "replica accept signer is not this peer");
-        ensure!(total <= accept.quota_bytes, "placement exceeds granted quota");
+        ensure!(
+            total <= accept.quota_bytes,
+            "placement exceeds granted quota"
+        );
 
         write_u64(&mut send, blobs.len() as u64).await?;
         for b in blobs {
@@ -1158,7 +1330,11 @@ impl Daemon {
         send.finish()?;
         // Wait for the replica's ack so membership only records durable storage.
         let acked = read_u64(&mut recv).await?;
-        ensure!(acked == blobs.len() as u64, "replica acked {acked} of {} blobs", blobs.len());
+        ensure!(
+            acked == blobs.len() as u64,
+            "replica acked {acked} of {} blobs",
+            blobs.len()
+        );
         Ok(Some(node))
     }
 
@@ -1204,7 +1380,11 @@ impl Daemon {
         for (node, addr) in members {
             let (due, r, wide) = {
                 let s = self.shared.read().expect("shared lock");
-                (s.por.due(*node, vid, now), s.por.round(*node, vid), s.por.is_wide_round(*node, vid))
+                (
+                    s.por.due(*node, vid, now),
+                    s.por.round(*node, vid),
+                    s.por.is_wide_round(*node, vid),
+                )
             };
             if !due {
                 continue;
@@ -1266,20 +1446,24 @@ impl Daemon {
         // Unreachable replica: no content answer at all -> signal transport failure.
         // The connect is time-bounded so a dead peer fails fast instead of hanging
         // the round on the QUIC handshake timeout (C1).
-        let conn =
-            match tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(addr.clone(), iroh_blobs::ALPN))
-                .await
-            {
-                Ok(Ok(conn)) => conn,
-                _ => return None,
-            };
+        let conn = match tokio::time::timeout(
+            POR_CONNECT_TIMEOUT,
+            self.ep.connect(addr.clone(), iroh_blobs::ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            _ => return None,
+        };
         let mut out = Vec::with_capacity(audit.samples.len());
         for s in &audit.samples {
-            let got = match tokio::time::timeout(POR_FETCH_TIMEOUT, scratch.fetch(&conn, s.chunk_id)).await
-            {
-                Ok(Ok(())) => scratch.get_bytes(s.chunk_id).await.ok(),
-                _ => None,
-            };
+            let got =
+                match tokio::time::timeout(POR_FETCH_TIMEOUT, scratch.fetch(&conn, s.chunk_id))
+                    .await
+                {
+                    Ok(Ok(())) => scratch.get_bytes(s.chunk_id).await.ok(),
+                    _ => None,
+                };
             out.push(got);
         }
         Some(out)
@@ -1293,7 +1477,11 @@ impl Daemon {
     /// [`AttestTracker::new`] for defaults, or `with_params` to tune the round /
     /// freshness intervals).
     pub fn register_recovery_set(&self, rsid: u64, tracker: AttestTracker) {
-        self.shared.write().expect("shared lock").share_sets.insert(rsid, tracker);
+        self.shared
+            .write()
+            .expect("shared lock")
+            .share_sets
+            .insert(rsid, tracker);
     }
 
     /// Store a share this daemon holds as a trustee for another owner, enabling it
@@ -1313,7 +1501,9 @@ impl Daemon {
     /// [`ShareHealth`] (or `None` if this daemon holds no share for that set).
     pub fn share_self_validate(&self, rsid: u64, now: u64) -> Option<ShareHealth> {
         let mut s = self.shared.write().expect("shared lock");
-        s.held_shares.get_mut(&rsid).map(|(share, mon)| mon.poll(share, now))
+        s.held_shares
+            .get_mut(&rsid)
+            .map(|(share, mon)| mon.poll(share, now))
     }
 
     /// Owner-side share-health round (§10.2). If a round is due at `now`, challenge
@@ -1356,7 +1546,10 @@ impl Daemon {
 
         let action = {
             let mut s = self.shared.write().expect("shared lock");
-            let t = s.share_sets.get_mut(&rsid).context("unknown recovery set")?;
+            let t = s
+                .share_sets
+                .get_mut(&rsid)
+                .context("unknown recovery set")?;
             // Fold only attestations that verify against this challenge; a bad or
             // mismatched one changes nothing (it simply is not counted live).
             for att in &atts {
@@ -1417,27 +1610,34 @@ impl Daemon {
         vid: [u8; 32],
         epoch: u64,
     ) -> Result<FileGrant> {
-        let body = grant_body(manifest, keys);
+        let body = grant_body(manifest, keys)?;
         let (_priv, disclose_pub) = self.disclose_keypair();
         let user_pub = self.user_key.verifying_key().to_bytes();
 
+        let mut grant_id = [0u8; 16];
+        getrandom::getrandom(&mut grant_id).map_err(|e| anyhow::anyhow!("grant id: {e}"))?;
+
         // Prefix the encapsulated key onto the HPKE ciphertext (Sealed carries no
         // separate encap field); split it back off on open. S7: the serialized
-        // body holds every chunk key in the clear, so scrub it after sealing.
+        // body holds every chunk key in the clear, so scrub it after sealing. S2:
+        // bind the seal to this exact grant (vid, epoch, grant_id), matching
+        // `open_file_grant`.
+        let aad = disclose::grant_aad(&vid, epoch, &grant_id);
         let body_bytes = Zeroizing::new(body.to_bytes());
-        let (enc, ct) = seal::seal(&disclose_pub, INFO_DISCLOSE, &vid, &body_bytes)
+        let (enc, ct) = seal::seal(&disclose_pub, INFO_DISCLOSE, &aad, &body_bytes)
             .map_err(|e| anyhow::anyhow!("grant seal: {e}"))?;
         let mut sealed_ct = enc;
         sealed_ct.extend_from_slice(&ct);
 
-        let mut grant_id = [0u8; 16];
-        getrandom::getrandom(&mut grant_id).map_err(|e| anyhow::anyhow!("grant id: {e}"))?;
         let mut fg = FileGrant {
             grant_id,
             vid,
             epoch,
             audience: vec![user_pub],
-            sealed: vec![Sealed { to: user_pub, ct: sealed_ct }],
+            sealed: vec![Sealed {
+                to: user_pub,
+                ct: sealed_ct,
+            }],
             by: [0; 32],
             sig: [0; 64],
         };
@@ -1457,15 +1657,246 @@ impl Daemon {
             .iter()
             .find(|s| s.to == user_pub)
             .context("grant has no sealed body for this user")?;
-        ensure!(sealed.ct.len() >= 32, "sealed grant too short for encap key");
+        ensure!(
+            sealed.ct.len() >= 32,
+            "sealed grant too short for encap key"
+        );
         let (enc, ct) = sealed.ct.split_at(32);
+        // S2: aad binds vid, epoch, and grant_id (matches `build_file_grant`).
+        let aad = disclose::grant_aad(&vid, grant.epoch, &grant.grant_id);
         // S7: the opened plaintext carries every chunk key; scrub it on drop.
         let pt = Zeroizing::new(
-            seal::open(disclose_priv, enc, INFO_DISCLOSE, &vid, ct)
+            seal::open(disclose_priv, enc, INFO_DISCLOSE, &aad, ct)
                 .map_err(|e| anyhow::anyhow!("grant open: {e}"))?,
         );
         let body = GrantBody::from_bytes(&pt)?;
         Ok(keys_from_grant(&body))
+    }
+
+    // ---- selective disclosure to an audience (§7.4) --------------------
+
+    /// Disclose exactly `paths` from owned vault `vid` to `audience` (a list of
+    /// established-friend user pubkeys — "reveal to all my friends" simply names the
+    /// current friend list at issuance). Assembles a [`GrantBody`] from the retained
+    /// per-chunk secrets, HPKE-seals it to each friend's `enc_pub`, signs a
+    /// [`FileGrant`], and records the owner-side disclosure table so the blob gate
+    /// will serve exactly those chunks to exactly that audience. Returns the grant to
+    /// deliver directly to each member (§7.4).
+    ///
+    /// NORMATIVE (§7.4): the returned grant is a **snapshot** of the vault's current
+    /// epoch and is **irrevocable** for the content it discloses — a later edit makes
+    /// new chunk keys (hence a new grant), and "revoke" means only "issue no future
+    /// version." This API never implies recall of already-disclosed content.
+    pub fn disclose_files(
+        &self,
+        vid: [u8; 32],
+        paths: &[&str],
+        audience: &[[u8; 32]],
+    ) -> Result<FileGrant> {
+        let mut grant_id = [0u8; 16];
+        getrandom::getrandom(&mut grant_id).map_err(|e| anyhow::anyhow!("grant id: {e}"))?;
+
+        let mut s = self.shared.write().expect("shared lock");
+        let epoch = *s.epochs.get(&vid).context("vault not published")?;
+        let manifest = s
+            .vault_blobs
+            .get(&vid)
+            .context("vault not published")?
+            .manifest
+            .clone();
+        let keys = s
+            .vault_keys
+            .get(&vid)
+            .context("vault keys missing")?
+            .clone();
+
+        // Resolve each audience member's disclosure key from their stored friend card.
+        let mut recipients = Vec::with_capacity(audience.len());
+        for user in audience {
+            let card = s.friends.get(user).with_context(|| {
+                format!(
+                    "audience member {} is not an established friend",
+                    hex32(user)
+                )
+            })?;
+            recipients.push(Recipient {
+                user: *user,
+                enc_pub: card.enc_pub,
+            });
+        }
+
+        let body = select_grant_body(&manifest, &keys, paths)?;
+        let grant = disclose::build_grant(&self.node_key, vid, epoch, grant_id, &body, &recipients)
+            .map_err(|e| anyhow::anyhow!("build grant: {e}"))?;
+        // Authorize this audience for exactly these chunks in the blob-read gate.
+        s.disclosure.record(&grant, &body);
+        Ok(grant)
+    }
+
+    /// Audience side of selective disclosure (§7.4): open `grant` (addressed to this
+    /// user), fetch its ciphertext chunks from `owner` over the authenticated blob
+    /// path, and reconstruct exactly the granted files under `out_root/<vid>/`.
+    /// Returns the written paths. Reconstructs ONLY the granted files.
+    pub async fn fetch_disclosed(
+        &self,
+        grant: &FileGrant,
+        owner: EndpointAddr,
+        out_root: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        grant
+            .verify()
+            .map_err(|e| anyhow::anyhow!("grant signature invalid: {e}"))?;
+        // W1: `grant.verify()` only proves self-consistency (signed by whatever
+        // `grant.by` claims). Authenticate the discloser too: `grant.by` must be a
+        // device our own user or an established friend currently delegates, so
+        // disclosed content carries verifiable provenance and an unknown party
+        // cannot push us a grant to reconstruct. Mirrors C1 on the sync path.
+        let now = unix_now();
+        {
+            let s = self.shared.read().expect("shared lock");
+            ensure!(
+                node_is_authorized(&s, &self.user_id(), &grant.by, now),
+                "disclosure signer {} is not a delegated device of self or any \
+                 established friend",
+                hex32(&grant.by)
+            );
+        }
+        let (disclose_priv, _pub) = self.disclose_keypair();
+        let my_user = self.user_id();
+        let body = disclose::open_grant(grant, my_user, &disclose_priv)
+            .map_err(|e| anyhow::anyhow!("open grant: {e}"))?;
+
+        // Authenticate on the owner's control stream first, so the owner's blob gate
+        // binds our node id to our (friend) identity before we open a raw blob
+        // connection and fetch (§7.4 / D3).
+        self.present_card(&owner).await?;
+
+        let bconn = self.ep.connect(owner, iroh_blobs::ALPN).await?;
+        let mut chunks: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        for f in &body.files {
+            for c in &f.chunks {
+                self.blobs.fetch(&bconn, c.chunk_id).await?;
+                chunks.insert(c.chunk_id, self.blobs.get_bytes(c.chunk_id).await?);
+            }
+        }
+        let out_dir = out_root.join(hex32(&grant.vid));
+        disclose::write_grant(&body, &grant.vid, &out_dir, |id| chunks.get(id).cloned())
+            .map_err(|e| anyhow::anyhow!("reconstruct disclosed files: {e}"))
+    }
+
+    /// Present our own card on `peer`'s control stream and drain the reply. Completes
+    /// the W5 authentication handshake so `peer` records our node id in its blob-read
+    /// allow-set before we open a raw blob connection (used by `fetch_disclosed`).
+    async fn present_card(&self, peer: &EndpointAddr) -> Result<()> {
+        let conn = self.ep.connect(peer.clone(), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let own_card = {
+            let s = self.shared.read().expect("shared lock");
+            s.cards.first().cloned().context("no own card")?
+        };
+        write_msg(&mut send, &own_card).await?;
+        while read_frame_raw(&mut recv).await?.is_some() {}
+        send.finish()?;
+        Ok(())
+    }
+
+    /// Test/diagnostic: open `grant` as this user and return the ChunkIDs it
+    /// discloses (empty if this user is not in the grant's audience or the open
+    /// fails). Lets a test learn a granted ChunkID to probe the fetch gate with.
+    #[doc(hidden)]
+    pub fn granted_chunk_ids(&self, grant: &FileGrant) -> Result<Vec<[u8; 32]>> {
+        let (disclose_priv, _pub) = self.disclose_keypair();
+        let body = disclose::open_grant(grant, self.user_id(), &disclose_priv)
+            .map_err(|e| anyhow::anyhow!("open grant: {e}"))?;
+        Ok(disclose::granted_chunk_ids(&body).into_iter().collect())
+    }
+
+    /// Test-only: attempt a raw single-blob fetch of `chunk_id` from `peer` over the
+    /// blobs ALPN WITHOUT first authenticating on the control stream — modeling a
+    /// non-audience party (e.g. a leaked-grant holder) that already knows a ChunkID.
+    /// The §7.4/D3 gate must refuse it.
+    #[doc(hidden)]
+    pub async fn try_fetch_chunk(&self, peer: EndpointAddr, chunk_id: [u8; 32]) -> Result<Vec<u8>> {
+        let conn = self.ep.connect(peer, iroh_blobs::ALPN).await?;
+        self.blobs.fetch(&conn, chunk_id).await?;
+        self.blobs.get_bytes(chunk_id).await
+    }
+}
+
+/// Build a `GrantBody` disclosing exactly the manifest files named in `paths`,
+/// pulling each chunk's retained secret from `keys`. Errors if any requested path
+/// is absent from (or deleted in) the vault, so a partial/typo'd disclosure fails
+/// loudly rather than silently under-disclosing.
+fn select_grant_body(manifest: &Manifest, keys: &ChunkKeys, paths: &[&str]) -> Result<GrantBody> {
+    let want: HashSet<&str> = paths.iter().copied().collect();
+    let mut files = Vec::with_capacity(want.len());
+    for f in &manifest.files {
+        if f.deleted || !want.contains(f.path.as_str()) {
+            continue;
+        }
+        let mut chunks = Vec::with_capacity(f.chunks.len());
+        for (id, len) in &f.chunks {
+            let secret = keys
+                .get(id)
+                .with_context(|| format!("missing chunk key for {}", f.path))?;
+            chunks.push(GrantChunk {
+                chunk_id: *id,
+                chunk_key: *secret.chunk_key,
+                nonce: *secret.nonce,
+                len: *len,
+            });
+        }
+        files.push(GrantFile {
+            path: f.path.clone(),
+            file_hash: f.file_hash,
+            size: f.size,
+            chunks,
+        });
+    }
+    ensure!(
+        files.len() == want.len(),
+        "disclose: {} of {} requested paths were not found in the vault",
+        want.len().saturating_sub(files.len()),
+        want.len()
+    );
+    Ok(GrantBody { files })
+}
+
+/// §7.4 / D3 blob-read gate: whether `node` (the dialer's authenticated iroh node
+/// id) may fetch `chunk_id` from this daemon.
+///
+/// For a chunk of a vault we OWN, release it only to (a) our own delegated devices,
+/// (b) this vault's replica-set members (repair), or (c) a friend authenticated on
+/// our control stream whose identity an owner-signed grant names in the audience
+/// covering that chunk. A dialer that never authenticated, or an authenticated
+/// friend outside the audience, is refused — a leaked grant document alone (from a
+/// non-audience party) authorizes nothing.
+///
+/// "A chunk of a vault we OWN" is any ChunkID in `owned_chunks` — every chunk ever
+/// published for an owned vault, retained across epoch bumps — so a superseded
+/// chunk keeps its owner gate (W2), not just the current epoch's.
+///
+/// A chunk we do NOT own (a manifest envelope, or one held as a replica for another
+/// owner) stays on the inherited residual (AEAD seal + ChunkID secrecy): a replica
+/// cannot authenticate the owner's other devices without a card enumerating them
+/// (narrowed spec-errata E-blob-authz). See the `start_with_limits` call site.
+fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
+    // Consult the RETAINED owned-chunk set, not the current-epoch `vault_blobs`, so
+    // a superseded chunk stays gated instead of regressing to the residual (W2).
+    let Some(vid) = s.owned_chunks.get(chunk_id).copied() else {
+        return true; // not an owned-vault chunk: inherited residual
+    };
+    match s.blob_auth.get(node) {
+        // (a) our own delegated device.
+        Some(BlobAuth::OwnDevice) => true,
+        // (b) replica-set member of this vault, or (c) an audience member of a grant
+        // covering this chunk.
+        Some(BlobAuth::Friend(user)) => {
+            s.members.get(&vid).is_some_and(|m| m.contains(node))
+                || s.disclosure.is_audience(chunk_id, user)
+        }
+        // Never authenticated on our control stream: refused.
+        None => false,
     }
 }
 
@@ -1557,22 +1988,24 @@ fn card_delegates_node(card: &ContactCard, node_id: &[u8; 32], now: u64) -> bool
 ///   (`s.friends`), never the delegations in the card the dialer presents. Once a
 ///   friend publishes a newer card dropping a device, a dialer presenting an old
 ///   card that still delegates that device is refused.
-fn authorize_dialer(
+fn classify_dialer(
     s: &Shared,
     self_user: &[u8; 32],
     card: &ContactCard,
     remote: &[u8; 32],
     now: u64,
-) -> bool {
+) -> Option<BlobAuth> {
     if card.verify().is_err() {
-        return false;
+        return None;
     }
     if card.user == *self_user {
-        return card_delegates_node(card, remote, now);
+        return card_delegates_node(card, remote, now).then_some(BlobAuth::OwnDevice);
     }
     match s.friends.get(&card.user) {
-        Some(stored) => card_delegates_node(stored, remote, now),
-        None => false,
+        Some(stored) if card_delegates_node(stored, remote, now) => {
+            Some(BlobAuth::Friend(card.user))
+        }
+        _ => None,
     }
 }
 
@@ -1588,10 +2021,15 @@ fn accept_binds_ticket(accept: &FriendAccept, ticket_user: &[u8; 32], fr: &Frien
 /// own card) or a device delegated by an established friend's newest card. Used to
 /// gate the replica-invite path on the inviting owner being a friend (or self).
 fn node_is_authorized(s: &Shared, self_user: &[u8; 32], node: &[u8; 32], now: u64) -> bool {
-    if s.cards.iter().any(|c| c.user == *self_user && card_delegates_node(c, node, now)) {
+    if s.cards
+        .iter()
+        .any(|c| c.user == *self_user && card_delegates_node(c, node, now))
+    {
         return true;
     }
-    s.friends.values().any(|c| card_delegates_node(c, node, now))
+    s.friends
+        .values()
+        .any(|c| card_delegates_node(c, node, now))
 }
 
 /// The per-friend replica-storage grant to enforce for a placement signed by
@@ -1603,7 +2041,11 @@ fn node_is_authorized(s: &Shared, self_user: &[u8; 32], node: &[u8; 32], now: u6
 fn friend_storage_grant(s: &Shared, node: &[u8; 32], now: u64) -> u64 {
     for (user, card) in &s.friends {
         if card_delegates_node(card, node, now) {
-            return s.friend_grants.get(user).copied().unwrap_or(DEFAULT_QUOTA_BYTES);
+            return s
+                .friend_grants
+                .get(user)
+                .copied()
+                .unwrap_or(DEFAULT_QUOTA_BYTES);
         }
     }
     DEFAULT_QUOTA_BYTES
@@ -1630,8 +2072,14 @@ fn reannounce(s: &mut Shared, vid: [u8; 32], self_node: [u8; 32], node_key: &Sig
     };
     let epoch = *s.epochs.get(&vid).unwrap_or(&0);
     let replicas = replica_list(self_node, s.members.get(&vid));
-    let mut ann =
-        VaultAnnounce { vid, epoch, replicas, digest: vb.digest, by: [0; 32], sig: [0; 64] };
+    let mut ann = VaultAnnounce {
+        vid,
+        epoch,
+        replicas,
+        digest: vb.digest,
+        by: [0; 32],
+        sig: [0; 64],
+    };
     ann.sign(node_key);
     s.announces.retain(|a| a.vid != vid);
     s.announces.push(ann);
@@ -1649,7 +2097,9 @@ async fn write_u64(send: &mut SendStream, v: u64) -> Result<()> {
 
 async fn read_u64(recv: &mut RecvStream) -> Result<u64> {
     let mut b = [0u8; 8];
-    recv.read_exact(&mut b).await.map_err(|e| anyhow::anyhow!("read u64: {e}"))?;
+    recv.read_exact(&mut b)
+        .await
+        .map_err(|e| anyhow::anyhow!("read u64: {e}"))?;
     Ok(u64::from_be_bytes(b))
 }
 
@@ -1660,7 +2110,9 @@ async fn write_sig(send: &mut SendStream, sig: &[u8; 64]) -> Result<()> {
 
 async fn read_sig(recv: &mut RecvStream) -> Result<[u8; 64]> {
     let mut b = [0u8; 64];
-    recv.read_exact(&mut b).await.map_err(|e| anyhow::anyhow!("read sig: {e}"))?;
+    recv.read_exact(&mut b)
+        .await
+        .map_err(|e| anyhow::anyhow!("read sig: {e}"))?;
     Ok(b)
 }
 
@@ -1672,9 +2124,14 @@ async fn write_blob(send: &mut SendStream, data: &[u8]) -> Result<()> {
 
 async fn read_blob(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let len = read_u64(recv).await? as usize;
-    ensure!(len <= MAX_REPLICA_BLOB, "replica blob length {len} exceeds cap");
+    ensure!(
+        len <= MAX_REPLICA_BLOB,
+        "replica blob length {len} exceeds cap"
+    );
     let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await.map_err(|e| anyhow::anyhow!("read blob: {e}"))?;
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("read blob: {e}"))?;
     Ok(buf)
 }
 
@@ -1686,25 +2143,35 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build a `GrantBody` carrying every non-deleted chunk's secret.
-fn grant_body(manifest: &Manifest, keys: &ChunkKeys) -> GrantBody {
-    let files = manifest
-        .files
-        .iter()
-        .filter(|f| !f.deleted)
-        .map(|f| {
-            let chunks = f
-                .chunks
-                .iter()
-                .map(|(id, len)| {
-                    let s = &keys[id];
-                    GrantChunk { chunk_id: *id, chunk_key: *s.chunk_key, nonce: *s.nonce, len: *len }
-                })
-                .collect();
-            GrantFile { path: f.path.clone(), file_hash: f.file_hash, size: f.size, chunks }
-        })
-        .collect();
-    GrantBody { files }
+/// Build a `GrantBody` carrying every non-deleted chunk's secret. Errors (rather
+/// than panicking — S3) if a manifest chunk id is absent from `keys`; both come
+/// from the same ingest, so this is an owner-local invariant, but fail loudly.
+fn grant_body(manifest: &Manifest, keys: &ChunkKeys) -> Result<GrantBody> {
+    let mut files = Vec::new();
+    for f in &manifest.files {
+        if f.deleted {
+            continue;
+        }
+        let mut chunks = Vec::with_capacity(f.chunks.len());
+        for (id, len) in &f.chunks {
+            let s = keys
+                .get(id)
+                .with_context(|| format!("missing chunk key for {}", f.path))?;
+            chunks.push(GrantChunk {
+                chunk_id: *id,
+                chunk_key: *s.chunk_key,
+                nonce: *s.nonce,
+                len: *len,
+            });
+        }
+        files.push(GrantFile {
+            path: f.path.clone(),
+            file_hash: f.file_hash,
+            size: f.size,
+            chunks,
+        });
+    }
+    Ok(GrantBody { files })
 }
 
 /// Rebuild the `ChunkKeys` map from an opened `GrantBody`.
@@ -1747,7 +2214,11 @@ fn build_card(user_key: &SigningKey, node_key: &SigningKey, k_root: &[u8; 32]) -
             addrs: vec![],
             relay_url: None,
         }],
-        offers: Offers { storage_bytes: 0, relay: false, trustee: false },
+        offers: Offers {
+            storage_bytes: 0,
+            relay: false,
+            trustee: false,
+        },
         version: 1,
         by: [0; 32],
         sig: [0; 64],
@@ -1776,8 +2247,14 @@ mod tests {
     }
 
     fn announce(node: &SigningKey, vid: [u8; 32], epoch: u64) -> VaultAnnounce {
-        let mut a =
-            VaultAnnounce { vid, epoch, replicas: vec![], digest: [7; 32], by: [0; 32], sig: [0; 64] };
+        let mut a = VaultAnnounce {
+            vid,
+            epoch,
+            replicas: vec![],
+            digest: [7; 32],
+            by: [0; 32],
+            sig: [0; 64],
+        };
         a.sign(node);
         a
     }
@@ -1835,7 +2312,10 @@ mod tests {
             &one_grant(&rogue, vid, 1),
             NOW,
         );
-        assert!(targets.is_empty(), "undelegated signer must be refused (C1)");
+        assert!(
+            targets.is_empty(),
+            "undelegated signer must be refused (C1)"
+        );
     }
 
     // C1: a valid announce survives even when a poison undelegated announce is in
@@ -1872,15 +2352,21 @@ mod tests {
         let card = build_card(&user, &node, &[9; 32]);
         let node_id = node.verifying_key().to_bytes();
         assert!(card_delegates_node(&card, &node_id, NOW));
-        assert!(!card_delegates_node(&card, &node_id, DELEG_NOT_AFTER + 1), "expired");
-        assert!(!card_delegates_node(&card, &[0x42; 32], NOW), "unknown node id");
+        assert!(
+            !card_delegates_node(&card, &node_id, DELEG_NOT_AFTER + 1),
+            "expired"
+        );
+        assert!(
+            !card_delegates_node(&card, &[0x42; 32], NOW),
+            "unknown node id"
+        );
     }
 
     /// A self-signed card for `user` delegating exactly `node`, at `version`.
     fn card_with(user: &SigningKey, node: &SigningKey, version: u64) -> ContactCard {
         let node_pub = node.verifying_key();
-        let deleg = carapace_crypto::identity::sign_delegation(user, &node_pub, DELEG_NOT_AFTER)
-            .to_bytes();
+        let deleg =
+            carapace_crypto::identity::sign_delegation(user, &node_pub, DELEG_NOT_AFTER).to_bytes();
         let mut card = ContactCard {
             user: user.verifying_key().to_bytes(),
             display: "x".into(),
@@ -1892,7 +2378,11 @@ mod tests {
                 addrs: vec![],
                 relay_url: None,
             }],
-            offers: Offers { storage_bytes: 0, relay: false, trustee: false },
+            offers: Offers {
+                storage_bytes: 0,
+                relay: false,
+                trustee: false,
+            },
             version,
             by: [0; 32],
             sig: [0; 64],
@@ -1920,13 +2410,118 @@ mod tests {
         let mut s = Shared::default();
         s.friends.insert(friend, v1.clone());
         // While v1 is newest, a dialer presenting v1 for node N is authorized.
-        assert!(authorize_dialer(&s, &self_user, &v1, &n_id, NOW));
+        assert!(classify_dialer(&s, &self_user, &v1, &n_id, NOW).is_some());
 
         // Friend publishes v2 (drops N). A dialer still presenting v1 for N loses.
         s.friends.insert(friend, v2);
         assert!(
-            !authorize_dialer(&s, &self_user, &v1, &n_id, NOW),
+            classify_dialer(&s, &self_user, &v1, &n_id, NOW).is_none(),
             "node N is revoked once the newer card dropping it is known (W2)"
+        );
+    }
+
+    // W1: `fetch_disclosed` authenticates the discloser (its `grant.by`) via
+    // `node_is_authorized` before reconstructing. A device of our own user or of an
+    // established friend passes; an unknown node (the `grant.by` of an unsolicited
+    // grant sealed to us by a stranger) is refused, so only established friends can
+    // push us disclosed content.
+    #[test]
+    fn w1_discloser_must_be_self_or_friend() {
+        let self_user = kp(0x01);
+        let self_node = kp(0x02);
+        let friend_user = kp(0x50);
+        let friend_node = kp(0x51);
+        let stranger = kp(0x77);
+        let self_uid = self_user.verifying_key().to_bytes();
+
+        let mut s = Shared::default();
+        s.cards.push(build_card(&self_user, &self_node, &[9; 32]));
+        s.friends.insert(
+            friend_user.verifying_key().to_bytes(),
+            card_with(&friend_user, &friend_node, 1),
+        );
+
+        assert!(
+            node_is_authorized(&s, &self_uid, &self_node.verifying_key().to_bytes(), NOW),
+            "our own delegated device may disclose"
+        );
+        assert!(
+            node_is_authorized(&s, &self_uid, &friend_node.verifying_key().to_bytes(), NOW),
+            "an established friend's delegated device may disclose"
+        );
+        assert!(
+            !node_is_authorized(&s, &self_uid, &stranger.verifying_key().to_bytes(), NOW),
+            "an unknown discloser (stranger-signed grant) is refused (W1)"
+        );
+    }
+
+    // W2: a superseded-epoch chunk keeps its §7.4 owner gate. Once a republish drops
+    // the old chunk from `vault_blobs`, `owned_chunks` still holds it, so an
+    // unauthenticated dialer and a non-audience friend are both refused, while the
+    // grant's audience is still served - the chunk never regresses to the residual.
+    #[test]
+    fn w2_superseded_chunk_stays_owner_gated() {
+        let vid = [0x55; 32];
+        let old_chunk = [0x11; 32];
+        let audience_user = [0xBB; 32];
+        let friend_node = [0xCC; 32];
+
+        let mut s = Shared::default();
+        // Published under an old epoch, then superseded: gone from vault_blobs but
+        // retained in owned_chunks.
+        s.owned_chunks.insert(old_chunk, vid);
+
+        // Record a grant that disclosed this old chunk to `audience_user`.
+        let owner = kp(0x03);
+        let mut fg = FileGrant {
+            grant_id: [0; 16],
+            vid,
+            epoch: 1,
+            audience: vec![audience_user],
+            sealed: vec![],
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        fg.sign(&owner);
+        let body = GrantBody {
+            files: vec![GrantFile {
+                path: "f1".into(),
+                file_hash: [0; 32],
+                size: 1,
+                chunks: vec![GrantChunk {
+                    chunk_id: old_chunk,
+                    chunk_key: [0; 32],
+                    nonce: [0; 24],
+                    len: 1,
+                }],
+            }],
+        };
+        s.disclosure.record(&fg, &body);
+
+        // Unauthenticated dialer: refused (pre-fix this fell through to the residual
+        // `return true` because the chunk was no longer in any current vault_blobs).
+        assert!(
+            !authorize_fetch(&s, &[0x99; 32], &old_chunk),
+            "unauthenticated dialer refused a superseded owned chunk (W2)"
+        );
+        // A friend outside the audience: refused.
+        s.blob_auth
+            .insert(friend_node, BlobAuth::Friend([0xDD; 32]));
+        assert!(
+            !authorize_fetch(&s, &friend_node, &old_chunk),
+            "non-audience friend refused a superseded owned chunk"
+        );
+        // The grant's audience: still served.
+        s.blob_auth
+            .insert(friend_node, BlobAuth::Friend(audience_user));
+        assert!(
+            authorize_fetch(&s, &friend_node, &old_chunk),
+            "the audience of a grant covering the chunk is still served"
+        );
+        // A genuinely foreign chunk (never owned) stays on the inherited residual.
+        assert!(
+            authorize_fetch(&s, &[0x99; 32], &[0xAB; 32]),
+            "a non-owned chunk keeps the residual (AEAD + ChunkID secrecy)"
         );
     }
 
@@ -1941,7 +2536,13 @@ mod tests {
 
         let friendship = |x: [u8; 32], y: [u8; 32]| {
             let (a, b) = if x <= y { (x, y) } else { (y, x) };
-            Friendship { a, b, established: 1, sig_a: [0; 64], sig_b: [0; 64] }
+            Friendship {
+                a,
+                b,
+                established: 1,
+                sig_a: [0; 64],
+                sig_b: [0; 64],
+            }
         };
         let accept = FriendAccept {
             card: card_with(&issuer_key, &kp(0x63), 1),

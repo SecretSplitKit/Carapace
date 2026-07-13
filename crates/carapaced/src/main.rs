@@ -30,7 +30,9 @@ async fn run(rest: Vec<String>) -> Result<()> {
     let mut it = rest.into_iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--state-dir" => state_dir = Some(it.next().context("--state-dir needs a value")?.into()),
+            "--state-dir" => {
+                state_dir = Some(it.next().context("--state-dir needs a value")?.into())
+            }
             "--publish" => publish = Some(it.next().context("--publish needs a value")?.into()),
             "--vid" => vid_hex = Some(it.next().context("--vid needs a value")?),
             other => bail!("unknown flag {other:?}"),

@@ -17,7 +17,7 @@ pub mod endpoint;
 pub mod frame;
 pub mod sync;
 
-pub use blobs::IrohBlobStore;
+pub use blobs::{authorizing_event_sender, IrohBlobStore};
 pub use endpoint::{CarapaceEndpoint, ALPN};
 pub use frame::{read_frame_raw, read_msg, write_msg};
 pub use sync::{pull_documents, DocStore, Reject, SyncHandler};

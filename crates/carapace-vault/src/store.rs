@@ -164,6 +164,9 @@ mod tests {
         assert_eq!(s.get(&id).unwrap().unwrap(), data);
         // wrong id is rejected
         let bad = [0u8; 32];
-        assert!(matches!(s.put(bad, b"x".to_vec()), Err(StoreError::IdMismatch { .. })));
+        assert!(matches!(
+            s.put(bad, b"x".to_vec()),
+            Err(StoreError::IdMismatch { .. })
+        ));
     }
 }

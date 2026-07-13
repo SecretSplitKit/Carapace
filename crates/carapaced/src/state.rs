@@ -51,13 +51,19 @@ impl State {
         let pass = passphrase.as_ref().map(|p| p.as_bytes());
         let node_seed = load_or_generate_seed(&dir.join("node.key"), pass)?;
         let root = load_or_generate_seed(&dir.join("root.key"), pass)?;
-        Ok(Self { node_key: SigningKey::from_bytes(&node_seed), k_root: Zeroizing::new(root) })
+        Ok(Self {
+            node_key: SigningKey::from_bytes(&node_seed),
+            k_root: Zeroizing::new(root),
+        })
     }
 
     /// Build state directly from raw seeds (used in tests and for scripted
     /// two-device setups that share a `k_root`).
     pub fn from_seeds(node_seed: [u8; 32], k_root: [u8; 32]) -> Self {
-        Self { node_key: SigningKey::from_bytes(&node_seed), k_root: Zeroizing::new(k_root) }
+        Self {
+            node_key: SigningKey::from_bytes(&node_seed),
+            k_root: Zeroizing::new(k_root),
+        }
     }
 
     /// The user signing key: `Ed25519(seed = HKDF(k_root, "…user-identity"))`.
@@ -75,8 +81,8 @@ fn load_or_generate_seed(path: &Path, passphrase: Option<&[u8]>) -> Result<[u8; 
     if path.exists() {
         let bytes = std::fs::read(path).with_context(|| format!("read {path:?}"))?;
         if let Some(sealed) = bytes.strip_prefix(ATREST_MAGIC) {
-            let pass =
-                passphrase.with_context(|| format!("{path:?} is sealed but {PASSPHRASE_ENV} is unset"))?;
+            let pass = passphrase
+                .with_context(|| format!("{path:?} is sealed but {PASSPHRASE_ENV} is unset"))?;
             let blob = decode_atrest(sealed)
                 .with_context(|| format!("malformed sealed key file {path:?}"))?;
             let secret = atrest::open_at_rest(pass, &blob)
@@ -139,7 +145,14 @@ fn decode_atrest(b: &[u8]) -> Result<AtRestBlob> {
     let m_cost = u32::from_be_bytes(b[40..44].try_into().expect("4 bytes"));
     let t_cost = u32::from_be_bytes(b[44..48].try_into().expect("4 bytes"));
     let p_cost = u32::from_be_bytes(b[48..52].try_into().expect("4 bytes"));
-    Ok(AtRestBlob { salt, nonce, m_cost, t_cost, p_cost, ciphertext: b[HEADER..].to_vec() })
+    Ok(AtRestBlob {
+        salt,
+        nonce,
+        m_cost,
+        t_cost,
+        p_cost,
+        ciphertext: b[HEADER..].to_vec(),
+    })
 }
 
 #[cfg(unix)]
@@ -152,7 +165,8 @@ fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("create {path:?}"))?;
-    f.write_all(bytes).with_context(|| format!("write {path:?}"))?;
+    f.write_all(bytes)
+        .with_context(|| format!("write {path:?}"))?;
     Ok(())
 }
 
@@ -179,8 +193,14 @@ mod tests {
 
         let seed = load_or_generate_seed(&path, Some(pass)).unwrap();
         let on_disk = std::fs::read(&path).unwrap();
-        assert!(on_disk.starts_with(ATREST_MAGIC), "sealed file must carry the magic");
-        assert!(!on_disk.windows(32).any(|w| w == seed), "raw seed must not appear on disk");
+        assert!(
+            on_disk.starts_with(ATREST_MAGIC),
+            "sealed file must carry the magic"
+        );
+        assert!(
+            !on_disk.windows(32).any(|w| w == seed),
+            "raw seed must not appear on disk"
+        );
 
         // Same passphrase reloads the same seed.
         assert_eq!(load_or_generate_seed(&path, Some(pass)).unwrap(), seed);
@@ -195,7 +215,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.key");
         let seed = load_or_generate_seed(&path, None).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), seed, "plaintext file is the raw seed");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            seed,
+            "plaintext file is the raw seed"
+        );
         assert_eq!(load_or_generate_seed(&path, None).unwrap(), seed);
         // Presenting a passphrase for a plaintext file is a hard error, not a
         // silent re-seal or wrong read.

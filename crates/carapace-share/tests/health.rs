@@ -180,7 +180,7 @@ fn off_roster_and_wrong_card_attestations_are_not_counted() {
     // one it was issued is refused (cannot claim a share it does not hold).
     let mut forged = atts[0].clone();
     forged.card_number = u64::from(trustees[1].1.x); // a co-trustee's share number
-    // Re-sign so the signature is valid but the card_number binding is wrong.
+                                                     // Re-sign so the signature is valid but the card_number binding is wrong.
     forged.sign(&trustees[0].0);
     assert!(matches!(
         tracker.record_attestation(&forged, &challenge, 0),
@@ -191,7 +191,11 @@ fn off_roster_and_wrong_card_attestations_are_not_counted() {
     for att in &atts {
         tracker.record_attestation(att, &challenge, 0).unwrap();
     }
-    assert_eq!(tracker.live_count(0), 5, "only the 5 enrolled shares count live");
+    assert_eq!(
+        tracker.live_count(0),
+        5,
+        "only the 5 enrolled shares count live"
+    );
 }
 
 // Trustee-side continuous CRC self-validation flags a corrupted share.

@@ -97,7 +97,13 @@ fn make_vault_n(owner_seed: u8, n: usize) -> Vault {
     let vr = k_vaultroot(&root, &vid);
     let ka = *k_audit(&*vr);
 
-    Vault { owner_node, store, manifest, env, k_audit: ka }
+    Vault {
+        owner_node,
+        store,
+        manifest,
+        env,
+        k_audit: ka,
+    }
 }
 
 /// A friend that has received every chunk of the vault (a healthy replica).
@@ -128,8 +134,11 @@ fn replica_missing_a_sampled_chunk_fails() {
     let audit = build_audit(&v.k_audit, v.vid(), v.env.epoch, 0, &v.manifest);
     let dropped = audit.samples[0].chunk_id;
 
-    let kept: Vec<([u8; 32], Vec<u8>)> =
-        v.chunk_blobs().into_iter().filter(|(id, _)| *id != dropped).collect();
+    let kept: Vec<([u8; 32], Vec<u8>)> = v
+        .chunk_blobs()
+        .into_iter()
+        .filter(|(id, _)| *id != dropped)
+        .collect();
     let mut peer = ReplicaPeer::new(key(20), Policy::open());
     peer.receive(&v.env, kept).unwrap();
 
@@ -175,7 +184,11 @@ fn three_consecutive_failures_mark_lost_and_yield_repair() {
         epoch: v.env.epoch,
         round: 0,
         wide: false,
-        samples: vec![carapace_replica::AuditSample { chunk_id: [0xFFu8; 32], offset: 0, len: 1 }],
+        samples: vec![carapace_replica::AuditSample {
+            chunk_id: [0xFFu8; 32],
+            offset: 0,
+            len: 1,
+        }],
     };
 
     let mut action = AuditAction::Passed;
@@ -232,7 +245,10 @@ fn a_pass_resets_the_failure_streak() {
     ));
     // A pass wipes the streak, so a later failure starts again at 1 rather than
     // tipping straight to Lost.
-    assert_eq!(tracker.record(replica, v.vid(), AuditOutcome::Pass, 200), AuditAction::Passed);
+    assert_eq!(
+        tracker.record(replica, v.vid(), AuditOutcome::Pass, 200),
+        AuditAction::Passed
+    );
     assert!(matches!(
         tracker.record(replica, v.vid(), fail, 300),
         AuditAction::Failed { consecutive: 1 }
@@ -259,7 +275,10 @@ fn unreachable_rounds_never_accumulate_failures() {
             "offline is not a retention failure"
         );
         // The round was rescheduled: the replica is no longer immediately due.
-        assert!(!tracker.due(replica, v.vid(), now), "unreachable round reschedules");
+        assert!(
+            !tracker.due(replica, v.vid(), now),
+            "unreachable round reschedules"
+        );
         now += 6 * 60 * 60;
     }
 
@@ -273,7 +292,11 @@ fn unreachable_rounds_never_accumulate_failures() {
             assert!(matches!(action, AuditAction::Failed { consecutive } if consecutive == i + 1));
         }
     }
-    assert_eq!(action, AuditAction::Lost, "answered-but-missing still loses at the limit");
+    assert_eq!(
+        action,
+        AuditAction::Lost,
+        "answered-but-missing still loses at the limit"
+    );
 }
 
 #[test]
@@ -296,7 +319,10 @@ fn samples_differ_across_epochs_rounds_and_keys() {
     // challenge, so it cannot precompute which chunks/ranges will be sampled.
     let peer_guess = [0x99u8; 32];
     let guessed = build_audit(&peer_guess, v.vid(), epoch, 0, &v.manifest);
-    assert_ne!(a.samples, guessed.samples, "sampling must depend on K_audit");
+    assert_ne!(
+        a.samples, guessed.samples,
+        "sampling must depend on K_audit"
+    );
 }
 
 #[test]
@@ -312,9 +338,12 @@ fn wide_audit_covers_a_large_subset() {
     assert_eq!(wide.samples.len(), 32);
 
     // Distinct ChunkIDs (sampled without replacement).
-    let distinct: std::collections::HashSet<_> =
-        wide.samples.iter().map(|s| s.chunk_id).collect();
-    assert_eq!(distinct.len(), wide.samples.len(), "wide samples are distinct chunks");
+    let distinct: std::collections::HashSet<_> = wide.samples.iter().map(|s| s.chunk_id).collect();
+    assert_eq!(
+        distinct.len(),
+        wide.samples.len(),
+        "wide samples are distinct chunks"
+    );
 
     // A healthy replica still passes the broad sweep; its stream differs from the
     // same-round spot audit (the wide flag separates the PRF streams).
@@ -355,7 +384,10 @@ fn tracker_randomizes_timing_per_replica_and_flags_wide_rounds() {
     }
     // After 4 recorded rounds the counter is at 4 -> next round is wide.
     t2.record(c, vid, AuditOutcome::Pass, 0);
-    assert!(t2.is_wide_round(c, vid), "every wide_every-th round is wide-coverage");
+    assert!(
+        t2.is_wide_round(c, vid),
+        "every wide_every-th round is wide-coverage"
+    );
 }
 
 /// Mirror of the tracker's private jitter for the schedule-separation assertion.

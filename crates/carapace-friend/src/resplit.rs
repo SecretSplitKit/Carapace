@@ -16,9 +16,7 @@
 //! both sets briefly coexist - two doors, each still requiring its own full quorum
 //! - and [`Resplit::progress`] reports where the sequence stands.
 
-use carapace_recovery::{
-    attestation_live, build_share_grant, verify_attestation, Share,
-};
+use carapace_recovery::{attestation_live, build_share_grant, verify_attestation, Share};
 use carapace_wire::{
     ShareAttestChallenge, ShareAttestation, ShareDestroy, ShareDestroyAck, ShareGrant, Signed,
 };
@@ -119,7 +117,9 @@ impl Resplit {
         let grants = new_trustees
             .iter()
             .zip(shares.iter())
-            .map(|(_t, s)| build_share_grant(owner_signer, subject, s, recovery_delay, vec![], vec![]))
+            .map(|(_t, s)| {
+                build_share_grant(owner_signer, subject, s, recovery_delay, vec![], vec![])
+            })
             .collect();
 
         // Pair each new trustee with the card number of the share it was granted,
@@ -127,7 +127,11 @@ impl Resplit {
         let new_set = new_trustees
             .into_iter()
             .zip(shares.iter())
-            .map(|(user, s)| NewTrustee { user, card_number: u64::from(s.x), attested: false })
+            .map(|(user, s)| NewTrustee {
+                user,
+                card_number: u64::from(s.x),
+                attested: false,
+            })
             .collect();
 
         let machine = Self {
@@ -139,7 +143,10 @@ impl Resplit {
             new_set,
             old_set: old_remaining
                 .into_iter()
-                .map(|user| OldTrustee { user, destroyed: false })
+                .map(|user| OldTrustee {
+                    user,
+                    destroyed: false,
+                })
                 .collect(),
             phase: ResplitPhase::AwaitingNewSet,
         };
@@ -246,7 +253,10 @@ impl Resplit {
 
     /// Old-set trustees that have not yet destroy-acked (destroy still queued).
     pub fn pending_old(&self) -> impl Iterator<Item = &[u8; 32]> {
-        self.old_set.iter().filter(|t| !t.destroyed).map(|t| &t.user)
+        self.old_set
+            .iter()
+            .filter(|t| !t.destroyed)
+            .map(|t| &t.user)
     }
 
     /// A snapshot for display (§9.3 step 4).
@@ -384,7 +394,14 @@ mod tests {
         let owner = key(3);
         let subject = pk(&key(5));
         let res = Resplit::begin(
-            &owner, &K_ROOT, subject, M, N, SLACK, false, 1,
+            &owner,
+            &K_ROOT,
+            subject,
+            M,
+            N,
+            SLACK,
+            false,
+            1,
             vec![],
             vec![[1; 32], [2; 32]], // only 2, not N=5
             100,
@@ -399,7 +416,17 @@ mod tests {
         let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
         let (mut rs, new_shares, _g) = Resplit::begin(
-            &owner, &K_ROOT, subject, M, N, SLACK, false, 1, vec![], new_trustees, 100,
+            &owner,
+            &K_ROOT,
+            subject,
+            M,
+            N,
+            SLACK,
+            false,
+            1,
+            vec![],
+            new_trustees,
+            100,
         )
         .unwrap();
 
@@ -424,14 +451,25 @@ mod tests {
         let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
         let (mut rs, new_shares, _g) = Resplit::begin(
-            &owner, &K_ROOT, subject, M, N, SLACK, false, 1, vec![], new_trustees, 100,
+            &owner,
+            &K_ROOT,
+            subject,
+            M,
+            N,
+            SLACK,
+            false,
+            1,
+            vec![],
+            new_trustees,
+            100,
         )
         .unwrap();
 
         // Trustee 0 answers with trustee 1's share: same set, valid signature and
         // echo, but the card number does not match trustee 0's granted share.
         let challenge = build_attest_challenge(&owner, subject, rs.new_rsid(), [0; 16]);
-        let att = answer_attest_challenge(&new_trustee_keys[0], &challenge, &new_shares[1]).unwrap();
+        let att =
+            answer_attest_challenge(&new_trustee_keys[0], &challenge, &new_shares[1]).unwrap();
         assert!(matches!(
             rs.record_attestation(&att, &challenge),
             Err(FriendError::WrongSet)
@@ -446,7 +484,14 @@ mod tests {
         let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
         let (mut rs, _shares, _g) = Resplit::begin(
-            &owner, &K_ROOT, subject, M, N, SLACK, false, 7,
+            &owner,
+            &K_ROOT,
+            subject,
+            M,
+            N,
+            SLACK,
+            false,
+            7,
             vec![pk(&honest)],
             new_trustees,
             100,

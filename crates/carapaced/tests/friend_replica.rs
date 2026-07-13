@@ -29,7 +29,9 @@ fn daemon_seeds(node: u8, root: u8) -> State {
 fn make_tree() -> (tempfile::TempDir, BTreeMap<String, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
     let mut expected = BTreeMap::new();
-    let big: Vec<u8> = (0..1_500_000u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+    let big: Vec<u8> = (0..1_500_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
     let files: Vec<(&str, Vec<u8>)> = vec![
         ("readme.txt", b"hello carapace replicas".to_vec()),
         ("empty.bin", Vec::new()),
@@ -64,7 +66,10 @@ async fn friend_gate_replica_placement_repair_and_recovery() -> Result<()> {
         let ticket = a.issue_ticket()?;
         let fr = friend.befriend(a.addr()?, &ticket, None).await?;
         fr.verify().context("friendship must be dual-signed")?;
-        assert!(friend.is_friend(&a.user_id()), "friend side persists friendship");
+        assert!(
+            friend.is_friend(&a.user_id()),
+            "friend side persists friendship"
+        );
         assert!(a.is_friend(&friend.user_id()), "A side persists friendship");
         // Same dual-signed record on both sides.
         assert_eq!(a.friendship_with(&friend.user_id()), Some(fr));
@@ -86,27 +91,50 @@ async fn friend_gate_replica_placement_repair_and_recovery() -> Result<()> {
     assert_eq!(placed.len(), 2, "both friends accepted the placement");
     let members = a.replica_members(&vid);
     assert!(members.contains(&b.node_id()) && members.contains(&c.node_id()));
-    assert!(b.holds_replica(&vid) && c.holds_replica(&vid), "replicas stored the blobs");
+    assert!(
+        b.holds_replica(&vid) && c.holds_replica(&vid),
+        "replicas stored the blobs"
+    );
 
     // ---- 3. W5: stranger gets nothing; a friend gets the document set ----
     let (dc, da, dg) = d.pull_doc_counts(a.addr()?).await?;
-    assert_eq!((dc, da, dg), (0, 0, 0), "unauthorized dialer D is served no documents (W5)");
+    assert_eq!(
+        (dc, da, dg),
+        (0, 0, 0),
+        "unauthorized dialer D is served no documents (W5)"
+    );
     let (bc, ba, bg) = b.pull_doc_counts(a.addr()?).await?;
-    assert!(ba >= 1 && bg >= 1 && bc >= 1, "a friend is served cards/announces/grants");
+    assert!(
+        ba >= 1 && bg >= 1 && bc >= 1,
+        "a friend is served cards/announces/grants"
+    );
 
     // ---- 4. repair: B lost past grace -> re-replicate onto spare friend E ----
     let mut healths = HashMap::new();
     healths.insert(b.node_id(), Health::UnreachableSince(0)); // now - 0 >> 24h grace
-    let changed = a.repair_vault(vid, &healths, &[c.addr()?, e.addr()?]).await?;
+    let changed = a
+        .repair_vault(vid, &healths, &[c.addr()?, e.addr()?])
+        .await?;
     assert!(changed, "repair changed the member set");
     let members = a.replica_members(&vid);
-    assert!(!members.contains(&b.node_id()), "lost replica B was dropped");
-    assert!(members.contains(&c.node_id()) && members.contains(&e.node_id()), "set is now {{C, E}}");
-    assert!(e.holds_replica(&vid), "the fresh replica E stored the blobs");
+    assert!(
+        !members.contains(&b.node_id()),
+        "lost replica B was dropped"
+    );
+    assert!(
+        members.contains(&c.node_id()) && members.contains(&e.node_id()),
+        "set is now {{C, E}}"
+    );
+    assert!(
+        e.holds_replica(&vid),
+        "the fresh replica E stored the blobs"
+    );
 
     // ---- 5. delegated device A2 reconstructs: docs from A, blobs from C ----
     let out = tempfile::tempdir()?;
-    let reconstructed = a2.reconstruct_from_replica(a.addr()?, c.addr()?, out.path()).await?;
+    let reconstructed = a2
+        .reconstruct_from_replica(a.addr()?, c.addr()?, out.path())
+        .await?;
     let got = reconstructed
         .iter()
         .find(|r| r.vid == vid)

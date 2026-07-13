@@ -23,11 +23,7 @@ pub fn delegation_message(node_id: &VerifyingKey, not_after: u64) -> Vec<u8> {
 }
 
 /// Sign a device delegation certifying `node_id` for the user until `not_after`.
-pub fn sign_delegation(
-    user_key: &SigningKey,
-    node_id: &VerifyingKey,
-    not_after: u64,
-) -> Signature {
+pub fn sign_delegation(user_key: &SigningKey, node_id: &VerifyingKey, not_after: u64) -> Signature {
     user_key.sign(&delegation_message(node_id, not_after))
 }
 
@@ -93,11 +89,16 @@ mod tests {
 
         assert!(verify_delegation(&user_pub, &node_pub, not_after, &sig, None).is_ok());
         // valid before expiry
-        assert!(verify_delegation(&user_pub, &node_pub, not_after, &sig, Some(not_after - 1)).is_ok());
+        assert!(
+            verify_delegation(&user_pub, &node_pub, not_after, &sig, Some(not_after - 1)).is_ok()
+        );
         // rejected after expiry
         assert_eq!(
             verify_delegation(&user_pub, &node_pub, not_after, &sig, Some(not_after + 1)),
-            Err(DelegationError::Expired { not_after, now: not_after + 1 })
+            Err(DelegationError::Expired {
+                not_after,
+                now: not_after + 1
+            })
         );
         // wrong signer rejected
         let impostor = SigningKey::from_bytes(&[0x02; 32]).verifying_key();

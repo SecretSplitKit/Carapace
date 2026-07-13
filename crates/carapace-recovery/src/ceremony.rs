@@ -6,7 +6,9 @@
 //! parameter so tests never sleep.
 
 use carapace_crypto::seal::{open, seal, HpkePrivateKey, HpkePublicKey};
-use carapace_wire::{CeremonyAbort, CeremonyApprove, CeremonyShare, RecoveryOpen, ShareGrant, Signed};
+use carapace_wire::{
+    CeremonyAbort, CeremonyApprove, CeremonyShare, RecoveryOpen, ShareGrant, Signed,
+};
 use ed25519_dalek::SigningKey;
 
 use crate::grant::verify_share_grant;
@@ -95,10 +97,7 @@ pub fn open_recovery(
 /// Verify a [`RecoveryOpen`]: valid signature AND the signer is a trustee of the subject's
 /// recovery set (protocol §8.5 step 1 - strangers cannot open). `roster` is the co-trustee user
 /// pubkeys for the set.
-pub fn verify_recovery_open(
-    open: &RecoveryOpen,
-    roster: &[[u8; 32]],
-) -> Result<(), RecoveryError> {
+pub fn verify_recovery_open(open: &RecoveryOpen, roster: &[[u8; 32]]) -> Result<(), RecoveryError> {
     // The wire `rsid` is a u64, but Chela's `recovery_set_id` is 11-bit; a larger value cannot
     // reference a real set, so reject it on ingest rather than carrying it inward.
     if open.rsid > MAX_RSID {
@@ -338,7 +337,13 @@ pub fn open_ceremony_share(
         return Err(RecoveryError::Open);
     }
     let (encapped, ct) = cs.sealed.split_at(32);
-    let plaintext = open(recipient, encapped, CEREMONY_SHARE_INFO, &cs.ceremony_id, ct)?;
+    let plaintext = open(
+        recipient,
+        encapped,
+        CEREMONY_SHARE_INFO,
+        &cs.ceremony_id,
+        ct,
+    )?;
     String::from_utf8(plaintext).map_err(|_| RecoveryError::Open)
 }
 
@@ -372,7 +377,10 @@ mod tests {
     fn setup() -> Setup {
         let (shares, _state, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
         let trustees: Vec<SigningKey> = (0..5).map(|i| key(0x40 + i)).collect();
-        let roster: Vec<[u8; 32]> = trustees.iter().map(|k| k.verifying_key().to_bytes()).collect();
+        let roster: Vec<[u8; 32]> = trustees
+            .iter()
+            .map(|k| k.verifying_key().to_bytes())
+            .collect();
         let subject_key = key(0x09);
         let subject = subject_key.verifying_key().to_bytes();
         Setup {
@@ -818,7 +826,14 @@ mod tests {
         let ceremony_enc: [u8; 32] = ceremony_pk.to_bytes().try_into().unwrap();
 
         let attacker = key(0xAB); // knows the semi-public ceremony_enc, but is not a trustee
-        let grant = build_share_grant(&s.trustees[0], s.subject, &s.shares[0], DELAY, vec![], vec![]);
+        let grant = build_share_grant(
+            &s.trustees[0],
+            s.subject,
+            &s.shares[0],
+            DELAY,
+            vec![],
+            vec![],
+        );
         let cs =
             build_ceremony_share(&attacker, [0xCE; 16], &ceremony_enc, &grant.share_json).unwrap();
         assert!(matches!(
@@ -835,7 +850,14 @@ mod tests {
         getrandom::getrandom(&mut ikm).unwrap();
         let (ceremony_sk, ceremony_pk) = derive_keypair(&ikm);
         let ceremony_enc: [u8; 32] = ceremony_pk.to_bytes().try_into().unwrap();
-        let grant = build_share_grant(&s.trustees[0], s.subject, &s.shares[0], DELAY, vec![], vec![]);
+        let grant = build_share_grant(
+            &s.trustees[0],
+            s.subject,
+            &s.shares[0],
+            DELAY,
+            vec![],
+            vec![],
+        );
         let mut cs =
             build_ceremony_share(&s.trustees[0], [0xCE; 16], &ceremony_enc, &grant.share_json)
                 .unwrap();

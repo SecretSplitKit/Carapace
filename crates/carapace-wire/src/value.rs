@@ -59,7 +59,9 @@ pub struct Map {
 impl Map {
     /// A new empty map.
     pub fn new() -> Self {
-        Map { entries: Vec::new() }
+        Map {
+            entries: Vec::new(),
+        }
     }
 
     /// Number of entries.
@@ -352,7 +354,9 @@ impl<'a> Decoder<'a> {
                 let len = self.length(ai)?;
                 let s = self.take(len)?;
                 Ok(Value::Text(
-                    core::str::from_utf8(s).map_err(|_| Error::InvalidUtf8)?.to_owned(),
+                    core::str::from_utf8(s)
+                        .map_err(|_| Error::InvalidUtf8)?
+                        .to_owned(),
                 ))
             }
             4 => {

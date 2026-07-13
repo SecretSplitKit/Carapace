@@ -130,6 +130,9 @@ mod tests {
         assert_ne!(*chunk_key(&content, &h1), *chunk_key(&content, &h2));
         assert_ne!(*chunk_nonce(&content, &h1), *chunk_nonce(&content, &h2));
         // key and nonce derivations are independent even for the same pt_hash.
-        assert_ne!(&chunk_key(&content, &h1)[..24], &chunk_nonce(&content, &h1)[..]);
+        assert_ne!(
+            &chunk_key(&content, &h1)[..24],
+            &chunk_nonce(&content, &h1)[..]
+        );
     }
 }

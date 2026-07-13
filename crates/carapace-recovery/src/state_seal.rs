@@ -102,7 +102,11 @@ mod tests {
     fn seal_open_roundtrip() {
         let k_root = [0x11u8; 32];
         let state = fresh_split();
-        let (rsid, m, issued) = (state.recovery_set_id(), state.threshold(), state.issued_count());
+        let (rsid, m, issued) = (
+            state.recovery_set_id(),
+            state.threshold(),
+            state.issued_count(),
+        );
 
         let sealed = seal_split_state(&k_root, &state).unwrap();
         assert_eq!(sealed.rsid, rsid);

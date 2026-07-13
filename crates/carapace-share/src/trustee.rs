@@ -47,7 +47,10 @@ impl ShareMonitor {
     /// A monitor that self-validates every `interval_secs`.
     #[must_use]
     pub fn with_interval(interval_secs: u64) -> Self {
-        Self { cadence: Cadence::new(interval_secs), status: ShareHealth::Unknown }
+        Self {
+            cadence: Cadence::new(interval_secs),
+            status: ShareHealth::Unknown,
+        }
     }
 
     /// The most recent verdict without running a new check.

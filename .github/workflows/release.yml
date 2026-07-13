@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: carapaced
+
+# Least privilege by default; the build job elevates to contents: write only for
+# the release-asset upload.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: write # softprops/action-gh-release attaches assets to the release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross: true
+    runs-on: ${{ matrix.os }}
+    # aarch64 cross targets rely on toolchain components (linux: apt
+    # cross-gcc, windows: MSVC ARM64 tools) that aren't guaranteed on every
+    # runner image; don't let a cross-target hiccup block the native builds.
+    continue-on-error: ${{ matrix.cross == true }}
+    steps:
+      # Path dependency on chela-engine/chela-bip39/chela-share
+      # (`../../../chela/...`) requires both repos as siblings.
+      - name: Checkout Carapace
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: Carapace
+
+      - name: Checkout chela
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: SecretSplitKit/Chela
+          ref: main
+          # The default GITHUB_TOKEN cannot read the separate private Chela repo;
+          # provide a PAT/App token as CHELA_CHECKOUT_TOKEN. The fallback works only
+          # if Chela is public.
+          token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
+          path: chela
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install aarch64 cross-compiler (Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: Carapace
+        run: cargo build --release --locked --target ${{ matrix.target }} -p carapaced
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: Carapace
+        run: |
+          staging="${BIN_NAME}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          echo "ASSET=Carapace/${staging}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: Carapace
+        run: |
+          $staging = "${env:BIN_NAME}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "$staging/"
+          Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
+          echo "ASSET=Carapace/${staging}.zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: ${{ env.ASSET }}

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: CI only reads the repo. `pull_request` (not
+# `pull_request_target`) already denies fork PRs the write token and secrets.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Carapace depends on chela-engine/chela-bip39/chela-share via a path
+      # dependency (`../../../chela/...` from crates/carapace-recovery), so
+      # both repos must land as siblings under the same parent directory.
+      - name: Checkout Carapace
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: Carapace
+
+      - name: Checkout chela
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: SecretSplitKit/Chela
+          ref: main
+          # The default GITHUB_TOKEN is scoped to THIS repo only and cannot read the
+          # separate private Chela repo. Provide a PAT/App token as the
+          # CHELA_CHECKOUT_TOKEN secret; the fallback works only if Chela is public.
+          token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
+          path: chela
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Carapace/target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Carapace/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-cargo-
+
+      - name: cargo fmt --check
+        working-directory: Carapace
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: Carapace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: Carapace
+        run: cargo test --workspace

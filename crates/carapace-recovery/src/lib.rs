@@ -21,11 +21,11 @@ pub mod grant;
 pub mod split;
 pub mod state_seal;
 
-pub use chela_engine::{Share, SplitState};
 pub use ceremony::{
     build_ceremony_share, open_ceremony_share, open_recovery, verify_recovery_open, CeremonyPhase,
     CeremonyState, RecoveryRateLimiter, CEREMONY_SHARE_INFO,
 };
+pub use chela_engine::{Share, SplitState};
 pub use grant::{
     answer_attest_challenge, attestation_live, build_attest_challenge, build_share_grant,
     self_validate_share, share_from_json, verify_attestation, verify_share_grant,
@@ -175,9 +175,10 @@ pub(crate) fn key_to_mnemonic(key: &[u8; 32]) -> Result<Zeroizing<String>, Recov
 pub(crate) fn mnemonic_to_key(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, RecoveryError> {
     let mut idx: Vec<u16> = Vec::with_capacity(24);
     for w in mnemonic.split_whitespace() {
-        idx.push(chela_bip39::word_to_index(w).ok_or(RecoveryError::Bip39(
-            chela_bip39::Bip39Error::UnknownWord,
-        ))?);
+        idx.push(
+            chela_bip39::word_to_index(w)
+                .ok_or(RecoveryError::Bip39(chela_bip39::Bip39Error::UnknownWord))?,
+        );
     }
     let mut out = Zeroizing::new([0u8; 32]);
     let n = chela_bip39::decode_indices_to_entropy(&idx, out.as_mut_slice())?;
