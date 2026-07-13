@@ -1,0 +1,33 @@
+[package]
+name = "carapaced"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "carapaced"
+path = "src/lib.rs"
+
+[[bin]]
+name = "carapaced"
+path = "src/main.rs"
+
+[dependencies]
+carapace-wire = { path = "../carapace-wire" }
+carapace-crypto = { path = "../carapace-crypto" }
+carapace-vault = { path = "../carapace-vault" }
+carapace-net = { path = "../carapace-net" }
+ed25519-dalek = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+anyhow = "1"
+iroh = "1.0.2"
+iroh-blobs = "0.103"
+blake3 = "1"
+zeroize = "1"
+getrandom = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

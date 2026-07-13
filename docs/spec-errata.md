@@ -25,7 +25,21 @@ advantage is irrelevant here. **Resolution: HPKE uses ChaCha20-Poly1305
 (RFC 9180 AEAD id 0x0003).** Chunk sealing and at-rest sealing keep
 XChaCha20-Poly1305 as specified (they are not HPKE). No golden vector is
 affected — Appendix B treats HPKE ciphertext as an opaque `0xEE` placeholder.
-Spec §2 table and §7.4 updated.
+Spec §2 table and §7.4 updated. **Impl note (Phase 1):** the `hpke` crate is
+pinned to `0.13` (not `0.14`), because iroh 1.0.x exact-pins the RustCrypto
+release-candidate stack (`curve25519-dalek 5.0.0-rc`, `aead 0.6.0-rc`) and
+`hpke 0.14` forces the final `curve/aead` majors, which Cargo cannot co-resolve.
+`0.13` keeps carapace-crypto on the 4.x/0.5.x line that coexists with iroh. Same
+ChaCha20-Poly1305 construction; no vector affected. Revisit when iroh moves to
+the released RustCrypto stack.
+
+## Note — iroh version
+
+The spec said iroh "v1.0.0-rc". At Phase 1 the released line is **iroh 1.0.2 /
+iroh-blobs 0.103** (there is a 1.x). API renames adopted: `NodeId→EndpointId`,
+`NodeAddr→EndpointAddr`, blob fetch via `store.remote().fetch(conn, hash)`.
+`iroh_blobs::Hash::new == blake3::hash`, so Carapace ChunkID == iroh blob hash
+holds by construction.
 
 ## E3 — FastCDC variant/params unpinned (protocol §5)
 

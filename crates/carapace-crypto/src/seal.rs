@@ -12,6 +12,7 @@
 use hpke::aead::ChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
+use hpke::rand_core::{CryptoRng, RngCore};
 use hpke::{
     single_shot_open, single_shot_seal, Deserializable, Kem as KemTrait, OpModeR, OpModeS,
     Serializable,
@@ -20,6 +21,27 @@ use hpke::{
 type Kem = X25519HkdfSha256;
 type Aead = ChaCha20Poly1305;
 type Kdf = HkdfSha256;
+
+/// A CSPRNG for HPKE's `single_shot_seal`, backed by `getrandom`. `hpke 0.13`
+/// takes the sealing RNG as an argument (unlike `0.14`); this bridges the OS
+/// CSPRNG into hpke's `rand_core` traits without adding a `rand` dependency.
+struct OsCsprng;
+impl RngCore for OsCsprng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::getrandom(dest).expect("CSPRNG");
+    }
+}
+impl CryptoRng for OsCsprng {}
 
 /// The recipient's private HPKE key (X25519). Wraps the `hpke` private key so
 /// callers never touch the trait soup. The inner key material is an
@@ -58,12 +80,13 @@ pub fn seal(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), HpkeError> {
-    let (encapped, ciphertext) = single_shot_seal::<Aead, Kdf, Kem>(
+    let (encapped, ciphertext) = single_shot_seal::<Aead, Kdf, Kem, _>(
         &OpModeS::Base,
         &recipient.0,
         info,
         plaintext,
         aad,
+        &mut OsCsprng,
     )
     .map_err(|_| HpkeError::Seal)?;
     Ok((encapped.to_bytes().to_vec(), ciphertext))
