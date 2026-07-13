@@ -27,6 +27,10 @@ fn io_err(e: impl std::fmt::Display) -> StoreError {
 }
 
 /// An iroh-blobs in-memory store presented as a carapace [`ChunkStore`].
+///
+/// Cloning shares the same underlying store and runtime handle (both are
+/// cheap Arc-backed handles), so a clone serves and mutates the same blobs.
+#[derive(Clone)]
 pub struct IrohBlobStore {
     store: MemStore,
     handle: Handle,

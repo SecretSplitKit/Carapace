@@ -88,12 +88,20 @@ pub fn build_attest_challenge(
 /// Answer a challenge with a signed [`ShareAttestation`] (protocol §10.2). The share is first
 /// self-validated (a corrupt share is [`RecoveryError::Engine`]); the attestation echoes only the
 /// label fields (`card_number` = the share's `x`) and the challenge nonce - never the words.
+///
+/// S6: the answered share MUST belong to the recovery set the challenge names
+/// (`share.recovery_set_id == challenge.rsid`). Without this pin a trustee could
+/// answer a new-set liveness challenge with a valid share from *any* set it holds,
+/// so the attested-live count would not bind the actual new-set share (§10.2).
 pub fn answer_attest_challenge(
     signer: &SigningKey,
     challenge: &ShareAttestChallenge,
     share: &Share,
 ) -> Result<ShareAttestation, RecoveryError> {
     challenge.verify()?;
+    if u64::from(share.recovery_set_id) != challenge.rsid {
+        return Err(RecoveryError::ChallengeMismatch);
+    }
     self_validate_share(share)?;
     let mut att = ShareAttestation {
         subject: challenge.subject,
@@ -197,8 +205,9 @@ mod tests {
         let owner = trustee_key(3);
         let subject = owner.verifying_key().to_bytes();
         let share = a_share();
+        let rsid = u64::from(share.recovery_set_id);
 
-        let challenge = build_attest_challenge(&owner, subject, 0x321, [0x5A; 16]);
+        let challenge = build_attest_challenge(&owner, subject, rsid, [0x5A; 16]);
         let att = answer_attest_challenge(&trustee, &challenge, &share).unwrap();
         // Label fields only: card_number is the share x, nonce echoes the challenge.
         assert_eq!(att.card_number, u64::from(share.x));
@@ -211,7 +220,8 @@ mod tests {
         let trustee = trustee_key(7);
         let owner = trustee_key(3);
         let share = a_share();
-        let challenge = build_attest_challenge(&owner, [4; 32], 1, [0x11; 16]);
+        let rsid = u64::from(share.recovery_set_id);
+        let challenge = build_attest_challenge(&owner, [4; 32], rsid, [0x11; 16]);
         let mut att = answer_attest_challenge(&trustee, &challenge, &share).unwrap();
         att.nonce = [0x22; 16];
         att.sign(&trustee); // re-sign so the signature is valid but the echo is wrong
@@ -226,9 +236,26 @@ mod tests {
         let trustee = trustee_key(7);
         let owner = trustee_key(3);
         let mut share = a_share();
+        let rsid = u64::from(share.recovery_set_id);
         share.word_indices[2] ^= 1;
-        let challenge = build_attest_challenge(&owner, [4; 32], 1, [0x11; 16]);
+        let challenge = build_attest_challenge(&owner, [4; 32], rsid, [0x11; 16]);
         assert!(answer_attest_challenge(&trustee, &challenge, &share).is_err());
+    }
+
+    // S6: a share that belongs to a *different* recovery set cannot answer a
+    // challenge naming this set - liveness must bind the actual set's share.
+    #[test]
+    fn attestation_of_share_from_other_set_refused() {
+        let trustee = trustee_key(7);
+        let owner = trustee_key(3);
+        let share = a_share();
+        let real = u64::from(share.recovery_set_id);
+        // Challenge some other set id the trustee's share is not part of.
+        let challenge = build_attest_challenge(&owner, [4; 32], real ^ 1, [0x11; 16]);
+        assert!(matches!(
+            answer_attest_challenge(&trustee, &challenge, &share),
+            Err(RecoveryError::ChallengeMismatch)
+        ));
     }
 
     #[test]

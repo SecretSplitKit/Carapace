@@ -1,0 +1,15 @@
+[package]
+name = "carapace-replica"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+carapace-wire = { path = "../carapace-wire" }
+carapace-crypto = { path = "../carapace-crypto" }
+carapace-vault = { path = "../carapace-vault" }
+ed25519-dalek = "2"
+hex = "0.4"

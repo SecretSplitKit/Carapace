@@ -65,6 +65,21 @@ value. **Recommendation: the spec SHOULD state a floor (e.g. reject `recovery_de
 unless an explicit override is set) and clients SHOULD warn below it.** Tracked as advisory;
 `build_share_grant` documents the risk at the call site.
 
+## E-blob-authz — replica blobs are served without per-peer read authorization (protocol §10.1, S5)
+
+A replica daemon answers `iroh_blobs::ALPN` fetches from any dialer: the blob
+transport has no per-peer read gate. Confidentiality therefore rests entirely on
+(a) every chunk being AEAD-sealed and (b) ChunkIDs being unguessable BLAKE3 hashes
+revealed only inside the W2/W5-gated manifest+grant on the `carapace/1` control
+stream. A peer that never learns a ChunkID cannot request it; a peer that does
+(e.g. a former replica, or one that saw a manifest) can still fetch the sealed
+bytes even after it should have lost read access. This is an inherited design
+limitation, not a Phase-3 code bug. **Owed: a per-peer blob-read authorization hook
+on the blobs protocol** (gate `fetch` on the same friend-graph/delegation check
+`authorize_dialer` applies to documents). Until then the sealing + ChunkID secrecy
+are the only confidentiality boundary. Flagged at the `BlobsProtocol` accept site
+in `carapaced::Daemon::start_with_limits`.
+
 ## E3 — FastCDC variant/params unpinned (protocol §5)
 
 §5 names "FastCDC" with MIN 256 KiB / AVG 1 MiB / MAX 4 MiB but not the
@@ -74,3 +89,16 @@ cross-client convergent dedup. **Resolution: pin FastCDC v2016 with the
 standard Gear table**, matching the implementation. A chunk-boundary test
 vector is owed (tracked for Phase 1, when the chunker is exercised
 end-to-end).
+
+## Note — per-friend replica-storage grant is local (protocol §9, §10.1)
+
+The storage limit a node grants a friend for replicas is agreed PER-FRIEND at
+add-friend time and stored locally (the daemon's `friend_grants`, keyed by the
+friend's user pubkey); `serve_replica_store` enforces that friend's agreed limit
+as its replica quota (W1), never a global default. This is kept independent of
+the counterpart's advertised `ContactCard.offers.storage_bytes` (§9.1): the
+offer is what they claim to hold for me, the grant is what I enforce for them.
+No wire message or Appendix B vector changes - the advertised offer travels in
+the card, the grant is local policy. A formal bilateral over-the-wire
+storage-agreement message is a possible future spec addition; the card-offer +
+local-grant model satisfies it for now.
