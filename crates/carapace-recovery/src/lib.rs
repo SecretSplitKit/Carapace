@@ -28,7 +28,7 @@ pub use ceremony::{
 pub use chela_engine::{Share, SplitState};
 pub use grant::{
     answer_attest_challenge, attestation_live, build_attest_challenge, build_share_grant,
-    self_validate_share, share_from_json, verify_attestation, verify_share_grant,
+    self_validate_share, share_from_json, share_to_json, verify_attestation, verify_share_grant,
 };
 pub use split::{
     add_trustee, check_initial_issuance, extend_split, recover_key_from_shares, replace_lost_share,

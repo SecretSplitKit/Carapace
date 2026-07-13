@@ -1,16 +1,18 @@
-//! `carapaced` CLI. The mandatory Phase 1 deliverable is the two-device sync
-//! integration test; this binary is a thin operator surface over [`carapaced`].
+//! `carapaced` CLI: bind the daemon endpoint and start the loopback control API.
 //!
 //! Usage:
-//!   carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>]
+//!   carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>] [--api-port <PORT>]
 //!
-//! `run` binds the endpoint, serves the blob store + control protocol, prints
-//! this device's node id and dialable address, optionally publishes a vault, and
-//! idles until Ctrl-C.
+//! `run` loads/generates the device state, starts the daemon (serving the blob
+//! store + `carapace/1` control protocol), optionally publishes a vault, starts the
+//! loopback control API (127.0.0.1 + per-session bearer token), prints the API URL
+//! and where the token lives, and idles until Ctrl-C.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use carapaced::{Daemon, State};
-use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,7 +20,9 @@ async fn main() -> Result<()> {
     match args.next().as_deref() {
         Some("run") => run(args.collect()).await,
         Some(other) => bail!("unknown command {other:?}; try: carapaced run --state-dir <PATH>"),
-        None => bail!("usage: carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>]"),
+        None => bail!(
+            "usage: carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>] [--api-port <PORT>]"
+        ),
     }
 }
 
@@ -26,6 +30,7 @@ async fn run(rest: Vec<String>) -> Result<()> {
     let mut state_dir: Option<PathBuf> = None;
     let mut publish: Option<PathBuf> = None;
     let mut vid_hex: Option<String> = None;
+    let mut api_port: u16 = 0;
 
     let mut it = rest.into_iter();
     while let Some(flag) = it.next() {
@@ -35,13 +40,20 @@ async fn run(rest: Vec<String>) -> Result<()> {
             }
             "--publish" => publish = Some(it.next().context("--publish needs a value")?.into()),
             "--vid" => vid_hex = Some(it.next().context("--vid needs a value")?),
+            "--api-port" => {
+                api_port = it
+                    .next()
+                    .context("--api-port needs a value")?
+                    .parse()
+                    .context("--api-port must be a u16 port")?
+            }
             other => bail!("unknown flag {other:?}"),
         }
     }
 
     let state_dir = state_dir.context("--state-dir is required")?;
     let state = State::load_or_generate(&state_dir)?;
-    let daemon = Daemon::start(state).await?;
+    let daemon = Arc::new(Daemon::start(state).await?);
 
     println!("node_id: {}", hex(&daemon.node_id()));
     match daemon.addr() {
@@ -52,18 +64,26 @@ async fn run(rest: Vec<String>) -> Result<()> {
     if let Some(dir) = publish {
         let vid = match vid_hex {
             Some(h) => parse_vid(&h)?,
-            None => {
-                let (v, _nonce) = daemon.new_vid();
-                v
-            }
+            None => daemon.new_vid().0,
         };
         let epoch = daemon.publish_vault(&dir, vid).await?;
         println!("published vid {} at epoch {epoch}", hex(&vid));
     }
 
+    let api = carapace_api::serve(Arc::clone(&daemon), &state_dir, api_port).await?;
+    println!("control API: {}", api.url());
+    println!(
+        "api token: {} (bearer, 0600)",
+        state_dir.join("api-token").display()
+    );
+
     println!("serving; press Ctrl-C to stop");
     tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
-    daemon.shutdown().await;
+    api.shutdown();
+    match Arc::try_unwrap(daemon) {
+        Ok(d) => d.shutdown().await,
+        Err(_) => eprintln!("daemon still referenced at shutdown; skipping graceful close"),
+    }
     Ok(())
 }
 

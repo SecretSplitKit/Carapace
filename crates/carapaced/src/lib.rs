@@ -35,6 +35,10 @@ use carapace_net::{
     authorizing_event_sender, read_frame_raw, read_msg, write_msg, CarapaceEndpoint, DocStore,
     IrohBlobStore,
 };
+use carapace_recovery::{
+    extend_split, share_to_json, split_root, split_vault, CeremonyState, PolicyWarning,
+    RecoveryRateLimiter,
+};
 use carapace_replica::{
     build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
     Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
@@ -49,14 +53,15 @@ use carapace_vault::{
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
-    ContactCard, FileGrant, FriendAccept, FriendRequest, Friendship, GrantBody, GrantChunk,
-    GrantFile, Hello, InviteTicket, Manifest, ManifestEnvelope, NodeEntry, Offers, ReplicaAccept,
-    ReplicaInvite, Sealed, ShareAttestChallenge, ShareAttestation, Signed, VaultAnnounce,
+    CeremonyAbort, CeremonyApprove, ContactCard, FileGrant, FriendAccept, FriendRequest,
+    Friendship, GrantBody, GrantChunk, GrantFile, Hello, InviteTicket, Manifest, ManifestEnvelope,
+    NodeEntry, Offers, RecoveryOpen, ReplicaAccept, ReplicaInvite, Sealed, ShareAttestChallenge,
+    ShareAttestation, ShareGrant, Signed, VaultAnnounce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -234,6 +239,33 @@ struct Shared {
     /// served owned-vault chunks only after it proved, on the authenticated control
     /// stream, who it is — closing the §7.4/D3 gap for owner-served granted content.
     blob_auth: HashMap<[u8; 32], BlobAuth>,
+    /// Owner-side recovery split-states (§8), keyed by recovery-set id. Holds the
+    /// open Chela split polynomial (a secret, kept in memory beside `k_root`) so
+    /// `recovery_extend` can issue further shares on the same polynomial without
+    /// re-splitting. ponytail: in-memory, daemon-lifetime like the rest of daemon
+    /// state; persist a sealed split-state blob if extend must survive a restart.
+    split_states: HashMap<u64, RecoverySet>,
+    /// Recovery ceremonies this device tracks (§8.5), keyed by ceremony id. The GUI
+    /// drives approve/abort against these; `phase`/`can_release` read from them.
+    ceremonies: HashMap<[u8; 16], carapace_recovery::CeremonyState>,
+}
+
+/// One owner-side recovery split: the scope it splits (identity `K_root` or a scoped
+/// `K_vaultroot(vid)`) and the open Chela [`SplitState`] to extend from.
+struct RecoverySet {
+    scope: RecoveryScope,
+    state: carapace_recovery::SplitState,
+}
+
+/// What a recovery split targets (§8.2). The inner circle splits `K_root` (a full
+/// door to the identity); a scoped set splits `K_vaultroot(vid)` (a quorum recovers
+/// that vault only, never the identity).
+#[derive(Clone, Copy, Debug)]
+pub enum RecoveryScope {
+    /// Split the identity master key `K_root` (§8.1).
+    Root,
+    /// Split `K_vaultroot(vid)` for one vault only (§8.2).
+    Vault([u8; 32]),
 }
 
 /// How a node authenticated itself on this daemon's `carapace/1` control stream,
@@ -567,6 +599,10 @@ pub struct Daemon {
     /// in-memory, so nothing survives a restart anyway; persist to disk here and
     /// in the blob store together if durable rollback across restarts is needed.
     docs: Arc<Mutex<DocStore>>,
+    /// Per-subject recovery-open rate limiter (§8.5): a forged/abusive `RecoveryOpen`
+    /// cannot exhaust an honest subject's budget. Single long-lived limiter guarded by
+    /// its own mutex so `ceremony_open` can charge it without touching `shared`.
+    recovery_limiter: Mutex<RecoveryRateLimiter>,
     _router: Router,
 }
 
@@ -650,6 +686,8 @@ impl Daemon {
             user_key,
             k_root,
             docs,
+            // §8.5: at most 5 recovery opens per subject per 24 h window.
+            recovery_limiter: Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)),
             _router: router,
         })
     }
@@ -1821,6 +1859,219 @@ impl Daemon {
         self.blobs.fetch(&conn, chunk_id).await?;
         self.blobs.get_bytes(chunk_id).await
     }
+
+    // ---- read accessors (control-API status surface) -------------------
+
+    /// The user ids of every established friendship (§9.2), for the status surface.
+    pub fn friend_ids(&self) -> Vec<[u8; 32]> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .friendships
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Every vault this daemon has published, as `(vid, current epoch)`.
+    pub fn published_vaults(&self) -> Vec<([u8; 32], u64)> {
+        let s = self.shared.read().expect("shared lock");
+        s.vault_blobs
+            .keys()
+            .map(|vid| (*vid, s.epochs.get(vid).copied().unwrap_or(0)))
+            .collect()
+    }
+
+    /// Every vault this daemon stores as a replica for some owner.
+    pub fn held_replica_vids(&self) -> Vec<[u8; 32]> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .held
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// This device's dialable socket-address strings (best-effort). Empty if no
+    /// bound socket is available. Handed to a prospective friend alongside a ticket
+    /// so they can dial back without a discovery service.
+    pub fn dialable_addr_strings(&self) -> Vec<String> {
+        match self.addr() {
+            Ok(ea) => ea.ip_addrs().map(|s| s.to_string()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Recovery-set share-health counts for the status surface:
+    /// `(recovery_sets_owned, shares_held_as_trustee)`.
+    pub fn share_health_counts(&self) -> (usize, usize) {
+        let s = self.shared.read().expect("shared lock");
+        (s.share_sets.len(), s.held_shares.len())
+    }
+
+    // ---- address-string wrappers (control-API friendly) ----------------
+    // These let the loopback control API drive the network paths with a node id
+    // (hex) plus dialable socket-address strings, so the API crate never has to
+    // depend on iroh's `EndpointAddr` directly.
+
+    /// [`Daemon::befriend`] against a peer named by node id + dialable addresses.
+    pub async fn befriend_at(
+        &self,
+        node: [u8; 32],
+        addrs: &[String],
+        ticket: &InviteTicket,
+        grant_bytes: Option<u64>,
+    ) -> Result<Friendship> {
+        let peer = endpoint_addr(node, addrs)?;
+        self.befriend(peer, ticket, grant_bytes).await
+    }
+
+    /// [`Daemon::place_replicas`] against peers named by node id + addresses.
+    pub async fn place_replicas_at(
+        &self,
+        vid: [u8; 32],
+        peers: &[([u8; 32], Vec<String>)],
+        r: usize,
+    ) -> Result<Vec<[u8; 32]>> {
+        let mut addrs = Vec::with_capacity(peers.len());
+        for (node, a) in peers {
+            addrs.push(endpoint_addr(*node, a)?);
+        }
+        self.place_replicas(vid, &addrs, r).await
+    }
+
+    /// [`Daemon::fetch_disclosed`] from an owner named by node id + addresses.
+    pub async fn fetch_disclosed_at(
+        &self,
+        grant: &FileGrant,
+        owner_node: [u8; 32],
+        owner_addrs: &[String],
+        out_root: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let owner = endpoint_addr(owner_node, owner_addrs)?;
+        self.fetch_disclosed(grant, owner, out_root).await
+    }
+
+    // ---- recovery orchestration (§8) -----------------------------------
+
+    /// Split a recovery secret `M`-of-`N` (§8.1/§8.2) and record the open split-state
+    /// under `rsid` so it can later be extended. `scope` selects identity vs. a scoped
+    /// per-vault key. Returns each share's canonical `chela.share` JSON carrier (the
+    /// words the owner distributes) plus any §8.3 policy warnings. Overwrites any
+    /// prior split recorded for `rsid` (this is also the "re-split" path, §8.3).
+    ///
+    /// SECURITY: the returned JSON carries the actual share words. This is served only
+    /// over the authenticated loopback control API to the owner; it is the point of
+    /// the split (the owner must distribute the words), not a leak.
+    pub fn recovery_split(
+        &self,
+        rsid: u64,
+        scope: RecoveryScope,
+        m: u8,
+        n: u8,
+        allow_over_cap: bool,
+    ) -> Result<(Vec<String>, Vec<PolicyWarning>)> {
+        let (shares, state, warnings) = match scope {
+            RecoveryScope::Root => split_root(&self.k_root, m, n, allow_over_cap),
+            RecoveryScope::Vault(vid) => split_vault(&self.k_root, &vid, m, n, allow_over_cap),
+        }
+        .map_err(|e| anyhow::anyhow!("recovery split failed: {e:?}"))?;
+        let jsons = shares.iter().map(share_to_json).collect();
+        self.shared
+            .write()
+            .expect("shared lock")
+            .split_states
+            .insert(rsid, RecoverySet { scope, state });
+        Ok((jsons, warnings))
+    }
+
+    /// Issue `count` further shares on the recorded split for `rsid` (§8.1), on the
+    /// same polynomial so existing shares stay valid. Returns the new shares'
+    /// `chela.share` JSON carriers. Errors if no split was recorded for `rsid`, or if
+    /// issuance would exceed the §8.3 soft cap and `allow_over_cap` is false.
+    pub fn recovery_extend(
+        &self,
+        rsid: u64,
+        count: u8,
+        allow_over_cap: bool,
+    ) -> Result<Vec<String>> {
+        let mut s = self.shared.write().expect("shared lock");
+        let set = s
+            .split_states
+            .get_mut(&rsid)
+            .context("no recovery split recorded for this recovery-set id")?;
+        let secret = match set.scope {
+            RecoveryScope::Root => self.k_root.clone(),
+            RecoveryScope::Vault(vid) => Zeroizing::new(*kdf::k_vaultroot(&*self.k_root, &vid)),
+        };
+        let shares = extend_split(&mut set.state, &secret, count, allow_over_cap)
+            .map_err(|e| anyhow::anyhow!("recovery extend failed: {e:?}"))?;
+        Ok(shares.iter().map(share_to_json).collect())
+    }
+
+    /// Begin tracking an inbound recovery ceremony (§8.5) from a signed `RecoveryOpen`
+    /// gated by a signed `ShareGrant`. Verifies both, derives roster/`M`/delay from the
+    /// grant, charges the per-subject rate limit, and records the ceremony. Returns the
+    /// ceremony id and its observable phase. `now` is this observer's wall clock and
+    /// anchors the abort delay (a sponsor cannot backdate it).
+    pub fn ceremony_open(
+        &self,
+        open: &RecoveryOpen,
+        grant: &ShareGrant,
+        now: u64,
+    ) -> Result<([u8; 16], carapace_recovery::CeremonyPhase)> {
+        let state = {
+            let mut limiter = self.recovery_limiter.lock().expect("recovery limiter lock");
+            CeremonyState::open_from_grant(open, grant, &mut limiter, now)
+                .map_err(|e| anyhow::anyhow!("ceremony open rejected: {e:?}"))?
+        };
+        let id = state.ceremony_id;
+        let phase = state.phase(now);
+        self.shared
+            .write()
+            .expect("shared lock")
+            .ceremonies
+            .insert(id, state);
+        Ok((id, phase))
+    }
+
+    /// Apply a trustee's signed `CeremonyApprove` (§8.5 step 4) to a tracked ceremony.
+    /// Returns the running distinct-approval count. Errors if the ceremony is unknown
+    /// or the approver is not a roster trustee.
+    pub fn ceremony_approve(&self, approve: &CeremonyApprove) -> Result<usize> {
+        let mut s = self.shared.write().expect("shared lock");
+        let cer = s
+            .ceremonies
+            .get_mut(&approve.ceremony_id)
+            .context("unknown ceremony")?;
+        cer.approve(approve)
+            .map_err(|e| anyhow::anyhow!("ceremony approve rejected: {e:?}"))?;
+        Ok(cer.approvals_count())
+    }
+
+    /// Abort a recovery ceremony (§8.5 step 3) by signing a `CeremonyAbort` with THIS
+    /// device's user key. Only the subject user can abort; this daemon is the subject
+    /// iff its own user key matches the ceremony's subject. Applies the abort to the
+    /// locally tracked ceremony (if any) and returns the signed message so the GUI can
+    /// broadcast it to the trustees. The abort is only *authoritative* if this device's
+    /// user key is the ceremony's subject: every trustee checks `abort.by == subject`,
+    /// so an abort this daemon signs for a ceremony it is not the subject of is inert
+    /// (and, if the ceremony is locally tracked, `abort()` rejects it as `NotSubject`).
+    pub fn ceremony_abort(&self, ceremony_id: [u8; 16]) -> Result<CeremonyAbort> {
+        let mut ab = CeremonyAbort {
+            ceremony_id,
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        ab.sign(&self.user_key);
+        let mut s = self.shared.write().expect("shared lock");
+        if let Some(cer) = s.ceremonies.get_mut(&ceremony_id) {
+            cer.abort(&ab)
+                .map_err(|e| anyhow::anyhow!("ceremony abort rejected: {e:?}"))?;
+        }
+        Ok(ab)
+    }
 }
 
 /// Build a `GrantBody` disclosing exactly the manifest files named in `paths`,
@@ -2133,6 +2384,23 @@ async fn read_blob(recv: &mut RecvStream) -> Result<Vec<u8>> {
         .await
         .map_err(|e| anyhow::anyhow!("read blob: {e}"))?;
     Ok(buf)
+}
+
+/// Build a dialable [`EndpointAddr`] from a node id and zero or more socket-address
+/// strings (e.g. `"127.0.0.1:52345"`). An empty `addrs` yields an id-only address
+/// (usable only with a discovery service). A malformed node id or socket string is a
+/// hard error rather than a silently-dropped address.
+fn endpoint_addr(node: [u8; 32], addrs: &[String]) -> Result<EndpointAddr> {
+    let id = EndpointId::from_bytes(&node)
+        .map_err(|e| anyhow::anyhow!("bad node id {}: {e}", hex32(&node)))?;
+    let mut ea = EndpointAddr::new(id);
+    for a in addrs {
+        let sock: std::net::SocketAddr = a
+            .parse()
+            .with_context(|| format!("bad socket address {a:?}"))?;
+        ea = ea.with_ip_addr(sock);
+    }
+    Ok(ea)
 }
 
 /// Current unix time in seconds (for delegation-expiry checks).

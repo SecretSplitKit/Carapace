@@ -11,10 +11,6 @@ workspace = true
 name = "carapaced"
 path = "src/lib.rs"
 
-[[bin]]
-name = "carapaced"
-path = "src/main.rs"
-
 [dependencies]
 carapace-wire = { path = "../carapace-wire" }
 carapace-crypto = { path = "../carapace-crypto" }
@@ -24,6 +20,7 @@ carapace-disclose = { path = "../carapace-disclose" }
 carapace-friend = { path = "../carapace-friend" }
 carapace-replica = { path = "../carapace-replica" }
 carapace-share = { path = "../carapace-share" }
+carapace-recovery = { path = "../carapace-recovery" }
 ed25519-dalek = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 anyhow = "1"
@@ -35,4 +32,3 @@ getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-carapace-recovery = { path = "../carapace-recovery" }

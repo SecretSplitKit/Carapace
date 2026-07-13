@@ -60,6 +60,13 @@ pub fn share_from_json(share_json: &str) -> Result<Share, RecoveryError> {
     Ok(shares.pop().expect("len == 1")?)
 }
 
+/// Render one [`Share`] to its canonical `chela.share` JSON carrier (SPEC §6.2) with default
+/// backup metadata. This is the words-carrying document an owner hands to (or stores for) a
+/// trustee; it is the inverse of [`share_from_json`].
+pub fn share_to_json(share: &Share) -> String {
+    chela_share::render_share_json(share, &BackupMeta::default())
+}
+
 /// Self-validate a stored share with the Chela decoder: a single share validates alone via the
 /// CRC over its words (SPEC §4.6). Trustee daemons run this periodically to catch bit-rot (§10.2).
 pub fn self_validate_share(share: &Share) -> Result<(), RecoveryError> {
