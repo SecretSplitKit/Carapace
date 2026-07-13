@@ -102,3 +102,57 @@ No wire message or Appendix B vector changes - the advertised offer travels in
 the card, the grant is local policy. A formal bilateral over-the-wire
 storage-agreement message is a possible future spec addition; the card-offer +
 local-grant model satisfies it for now.
+
+## Note — PoR round counter is in-memory; unreachable is not retention loss (§10.1)
+
+Phase 4 audit findings C1/S2. Two related PoR (§10.1) points settled in code:
+
+- **C1 (fixed): transport failure is not a retention failure.** A replica the
+  owner cannot dial is fed to `AuditTracker::record_unreachable` (yielding
+  `AuditAction::Skipped`), which reschedules the next audit without touching the
+  consecutive-failure streak. Only a peer that *answered* with a missing or
+  hash-mismatched sampled chunk advances the streak toward `AuditAction::Lost`.
+  A transiently-offline friend is therefore never evicted by PoR; a peer that
+  stays gone is handled by the separate reachability/grace path
+  (`Health::UnreachableSince`, 24 h grace). The daemon's `fetch_audit_samples`
+  distinguishes the two: a bounded-timeout connect failure returns `None`
+  (unreachable), a connected-but-empty answer returns per-sample `None`
+  (content loss).
+
+- **S2 (accepted, not fixed): the per-replica round counter is in-memory.** The
+  entire daemon runtime state (members, epochs, vault blob refs, the PoR tracker)
+  lives in `Shared` and is not persisted; only the node/root keys are on disk.
+  On restart the round counter reseeds at 0 and re-arms every member's audit, so
+  a restart re-issues the `(epoch, round=0)` challenge and bursts audits at
+  startup - a marginal aid to a pre-staging proxy. Persisting only the round
+  counter while the rest of the set state stays ephemeral would be inconsistent;
+  this is deferred until the daemon grows a runtime-state store, at which point
+  the round counter is persisted alongside the member set.
+
+## Note — attestation liveness binds to the enrolled roster (§10.2)
+
+Phase 4 audit finding W1. `AttestTracker` now carries the set's enrolled roster
+(trustee signing-key -> its issued `card_number`/share `x`). `record_attestation`
+counts an attestation toward the live count only if its signer is on the roster
+(`RecoveryError::NotATrustee` otherwise) and it echoes that signer's own card
+number (`RecoveryError::ChallengeMismatch` otherwise), and it keys liveness by the
+validated `card_number` so duplicate answers for one share collapse to a single
+live entry. The count is thus "distinct enrolled shares whose holder cooperated
+and self-validated," not "distinct online signers." This cannot prove *possession*
+over the label-only §10.2 channel (the words never transmit): an enrolled trustee
+that discarded its words but stays online is caught only by its own
+`answer_attest_challenge` self-validation failing (silent non-answer -> ages out of
+the freshness window), never by the owner-side count. Attestation proves
+liveness/cooperation and roster/share binding, not retained possession.
+
+## Note — PoR sampled-range fidelity (§10.1, audit S1)
+
+The PoR module samples a per-chunk `offset..offset+len` range, but the wired
+adapter fetches the whole content-addressed chunk and BLAKE3-verifies it against
+the sampled ChunkID; a full valid chunk always covers the range, so
+`AuditFailure::ShortRange` is unreachable on the wired path and the per-sample
+range is a focus record, not a bytes-on-the-wire boundary. The anti-proxy cost
+therefore rests on randomized per-replica timing and occasional wide-coverage
+rounds, not on range minimality. Production SHOULD narrow this to bao
+verified-range streaming so only the sampled bytes cross the wire; the module
+docs were softened to state the current property rather than the aspirational one.

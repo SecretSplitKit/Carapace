@@ -406,11 +406,21 @@ dependencies = [
 name = "carapace-replica"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "carapace-crypto",
  "carapace-vault",
  "carapace-wire",
  "ed25519-dalek 2.2.0",
  "hex",
+]
+
+[[package]]
+name = "carapace-share"
+version = "0.1.0"
+dependencies = [
+ "carapace-recovery",
+ "carapace-wire",
+ "ed25519-dalek 2.2.0",
 ]
 
 [[package]]
@@ -444,7 +454,9 @@ dependencies = [
  "carapace-crypto",
  "carapace-friend",
  "carapace-net",
+ "carapace-recovery",
  "carapace-replica",
+ "carapace-share",
  "carapace-vault",
  "carapace-wire",
  "ed25519-dalek 2.2.0",

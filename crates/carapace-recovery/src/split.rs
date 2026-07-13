@@ -16,7 +16,9 @@ use crate::{key_to_mnemonic, mnemonic_to_key, RecoveryError};
 /// it a recovering coalition would need at most ⅓ of outstanding shares.
 #[must_use]
 pub fn soft_cap(m: u8) -> usize {
-    usize::from(m) * 3 - 1
+    // S3: saturating so a bogus m=0 (thresholds are >= 2 in practice) yields 0
+    // rather than underflowing/panicking; `3*M - 1` for every real threshold.
+    usize::from(m).saturating_mul(3).saturating_sub(1)
 }
 
 /// A non-fatal issuance-policy note (protocol §8.3). Advisory: surfaced to the owner, never a

@@ -22,8 +22,9 @@ carapace-vault = { path = "../carapace-vault" }
 carapace-net = { path = "../carapace-net" }
 carapace-friend = { path = "../carapace-friend" }
 carapace-replica = { path = "../carapace-replica" }
+carapace-share = { path = "../carapace-share" }
 ed25519-dalek = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 anyhow = "1"
 iroh = "1.0.2"
 iroh-blobs = "0.103"
@@ -33,3 +34,4 @@ getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+carapace-recovery = { path = "../carapace-recovery" }

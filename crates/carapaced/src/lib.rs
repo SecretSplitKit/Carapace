@@ -35,14 +35,19 @@ use carapace_friend::{
     verify_friend_accept, verify_friend_request, TicketBook,
 };
 use carapace_replica::{
-    Health, Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
+    build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
+    Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
     DEFAULT_RATE_REFILL_PER_SEC, MAX_REPLICA_BLOBS,
+};
+use carapace_share::{
+    answer_attest_challenge, build_attest_challenge, AttestTracker, Share, ShareAction, ShareHealth,
+    ShareMonitor,
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
     ContactCard, FileGrant, FriendAccept, FriendRequest, Friendship, GrantBody, GrantChunk,
     GrantFile, Hello, InviteTicket, Manifest, ManifestEnvelope, NodeEntry, Offers, ReplicaAccept,
-    ReplicaInvite, Sealed, Signed, VaultAnnounce,
+    ReplicaInvite, Sealed, ShareAttestation, ShareAttestChallenge, Signed, VaultAnnounce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -52,10 +57,25 @@ use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// A far-future delegation expiry for the demo (2100-01-01Z, unix seconds).
 const DELEG_NOT_AFTER: u64 = 4_102_444_800;
+
+/// Distinct chunks a wide-coverage PoR round samples in one window (§10.1): a broad
+/// sweep that raises the cost of live friend-proxying. Capped at the vault's chunk
+/// count by the sampler, so a small vault simply samples all of it.
+const WIDE_AUDIT_COVERAGE: usize = 64;
+
+/// Per-sample timeout for a PoR probe fetch. Bounds a stalled transfer or a
+/// missing-blob fetch so one unresponsive sample cannot hang the audit round.
+const POR_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for the initial dial of a replica during a PoR probe. Without it an
+/// unreachable peer's QUIC connect can hang for ~30 s, stalling the whole round;
+/// bounding it makes an offline peer fail fast to the "unreachable" path (C1).
+const POR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tunable limits for the replica-store receive path (W1). Defaults come from the
 /// replica crate: a 1 GiB default per-friend storage grant and a 256 MiB /
@@ -83,6 +103,24 @@ impl Default for ReplicaLimits {
     }
 }
 
+/// The outcome of one PoR audit round over a vault's replicas ([`Daemon::por_audit_round`]).
+#[derive(Clone, Debug, Default)]
+pub struct PorRound {
+    /// Each replica audited this round and the action its result produced.
+    pub audited: Vec<([u8; 32], AuditAction)>,
+    /// Replicas that crossed the consecutive-failure limit this round (confirmed
+    /// retention loss, §10.1) and were fed to the repair path.
+    pub lost: Vec<[u8; 32]>,
+    /// Replicas that could not be reached this round (transport failure, C1). These
+    /// are NOT retention failures: the audit was rescheduled and the loss streak
+    /// left untouched, so a transiently-offline friend is never evicted by PoR.
+    /// A peer that stays gone is handled by the reachability/grace path instead.
+    pub unreachable: Vec<[u8; 32]>,
+    /// Whether a repair (re-replication + re-announce) actually changed the member
+    /// set as a result of this round's losses.
+    pub repaired: bool,
+}
+
 /// A reconstructed vault, returned by [`Daemon::sync_from`].
 pub struct Reconstructed {
     /// The vault id.
@@ -99,6 +137,10 @@ pub struct Reconstructed {
 struct VaultBlobs {
     digest: [u8; 32],
     chunk_ids: Vec<[u8; 32]>,
+    /// The sealed manifest (chunk `{id, len}` list) the PoR loop samples over to
+    /// build unpredictable retention challenges (§10.1). Held from the last
+    /// `publish_vault`; the owner already has it in hand there.
+    manifest: Manifest,
 }
 
 /// The mutable document set the daemon advertises during anti-entropy, plus the
@@ -148,6 +190,18 @@ struct Shared {
     /// Per-peer token buckets limiting how much a friend can push into our replica
     /// store per unit time (W1). Configured from [`ReplicaLimits`] at start.
     rate: RateLimiter,
+    /// Owner-side PoR bookkeeping (§10.1): per-`(replica, vid)` audit schedule,
+    /// round counter, and consecutive-failure streak against an injected clock.
+    /// Single-writer per vault: only the vault owner's `por_audit_round` mutates it.
+    por: AuditTracker,
+    /// Owner-side share-health trackers (§10.2), keyed by recovery-set id. Each
+    /// gates the daily attestation cadence and folds verified attestations into an
+    /// attested-live count under a freshness window.
+    share_sets: HashMap<u64, AttestTracker>,
+    /// Trustee-side stored shares this daemon holds for other owners, keyed by
+    /// recovery-set id, each with its continuous local CRC self-validation monitor
+    /// (§10.2). Answers `ShareAttestChallenge`s from the owning friend.
+    held_shares: HashMap<u64, (Share, ShareMonitor)>,
 }
 
 /// The `carapace/1` control-stream handler. It authenticates the dialer against
@@ -194,6 +248,10 @@ impl ControlHandler {
             Some((ReplicaInvite::TYPE, body)) => {
                 let inv = ReplicaInvite::from_map(body)?;
                 self.serve_replica_store(inv, &remote, &mut send, &mut recv).await?;
+            }
+            Some((ShareAttestChallenge::TYPE, body)) => {
+                let ch = ShareAttestChallenge::from_map(body)?;
+                self.serve_attest(ch, &remote, &mut send).await?;
             }
             // Unknown/legacy first frame (or a bare Hello): reveal only the Hello.
             _ => {
@@ -374,6 +432,44 @@ impl ControlHandler {
         send.finish()?;
         Ok(())
     }
+
+    /// Trustee half of the §10.2 share-health cadence: answer an owner's
+    /// `ShareAttestChallenge` for a share this daemon holds. The challenge signer
+    /// must be an established friend (or our own device) AND the connection's
+    /// authenticated peer, so only the owning friend can probe liveness. The reply
+    /// echoes label fields only (`card_number` + nonce) via
+    /// [`carapace_recovery::answer_attest_challenge`] - never the share words. A
+    /// daemon holding no share for the named set, or holding a corrupt one,
+    /// finishes the stream with no attestation frame (a silent non-answer, which the
+    /// owner counts as "not live").
+    async fn serve_attest(
+        &self,
+        ch: ShareAttestChallenge,
+        remote: &[u8; 32],
+        send: &mut SendStream,
+    ) -> Result<()> {
+        let now = unix_now();
+        ch.verify().map_err(|e| anyhow::anyhow!("attest challenge bad sig: {e}"))?;
+
+        // Copy the share out under the read lock; answer (and await the write)
+        // outside it so no lock is held across `.await`.
+        let share = {
+            let s = self.shared.read().expect("shared lock");
+            let authorized = node_is_authorized(&s, &self.self_user, &ch.by, now) && ch.by == *remote;
+            if !authorized {
+                None
+            } else {
+                s.held_shares.get(&ch.rsid).map(|(share, _)| share.clone())
+            }
+        };
+        if let Some(share) = share {
+            if let Ok(att) = answer_attest_challenge(&self.node_key, &ch, &share) {
+                write_msg(send, &att).await?;
+            }
+        }
+        send.finish()?;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ControlHandler {
@@ -535,7 +631,8 @@ impl Daemon {
         }
 
         let mut s = self.shared.write().expect("shared lock");
-        s.vault_blobs.insert(vid, VaultBlobs { digest: ingest.digest, chunk_ids });
+        s.vault_blobs
+            .insert(vid, VaultBlobs { digest: ingest.digest, chunk_ids, manifest: ingest.manifest.clone() });
         let replicas = replica_list(self.node_id(), s.members.get(&vid));
         let mut ann =
             VaultAnnounce { vid, epoch, replicas, digest: ingest.digest, by: [0; 32], sig: [0; 64] };
@@ -1063,6 +1160,243 @@ impl Daemon {
         let acked = read_u64(&mut recv).await?;
         ensure!(acked == blobs.len() as u64, "replica acked {acked} of {} blobs", blobs.len());
         Ok(Some(node))
+    }
+
+    // ---- PoR retention audit loop (§10.1) ------------------------------
+
+    /// Run one Proof-of-Retention audit round for `vid` over `members`
+    /// (`replica node id -> dialable address`), then repair on confirmed loss.
+    ///
+    /// For each member due at `now` (per the injected-clock [`AuditTracker`]) the
+    /// owner derives an unpredictable sample of chunks from `K_audit(vid)` (a key
+    /// only the owner holds), fetches exactly those chunks *from that replica* into
+    /// a throwaway store so the transfer genuinely comes off the peer, and BLAKE3-
+    /// verifies them against their ChunkIDs. A missing or wrong chunk fails the
+    /// round; [`DEFAULT_POR_FAIL_LIMIT`](carapace_replica::DEFAULT_POR_FAIL_LIMIT)
+    /// consecutive failures marks the replica lost, which is fed to
+    /// [`Daemon::repair_vault`] as [`Health::AuditLost`] (re-replicate onto a spare
+    /// from `candidates`, re-announce). Returns what happened this round.
+    ///
+    /// The caller ticks this (a `tokio::time::interval` in a real deployment, an
+    /// injected `now` in tests); the tracker's per-replica jittered schedule decides
+    /// which members are actually probed on any given tick (§10.1). No lock is held
+    /// across the network fetch: audits read a manifest/schedule snapshot, probe off
+    /// the lock, then record synchronously.
+    pub async fn por_audit_round(
+        &self,
+        vid: [u8; 32],
+        members: &HashMap<[u8; 32], EndpointAddr>,
+        candidates: &[EndpointAddr],
+        now: u64,
+    ) -> Result<PorRound> {
+        let (manifest, epoch) = {
+            let s = self.shared.read().expect("shared lock");
+            let vb = s.vault_blobs.get(&vid).context("vault not published")?;
+            let epoch = *s.epochs.get(&vid).context("vault has no epoch")?;
+            (vb.manifest.clone(), epoch)
+        };
+        // K_audit(vid) = HKDF(K_vaultroot(vid), "por") - owner-only, so the sample
+        // set is unpredictable to the replica being probed.
+        let vaultroot = kdf::k_vaultroot(&*self.k_root, &vid);
+        let k_audit: [u8; 32] = *kdf::k_audit(&*vaultroot);
+
+        let mut round = PorRound::default();
+        for (node, addr) in members {
+            let (due, r, wide) = {
+                let s = self.shared.read().expect("shared lock");
+                (s.por.due(*node, vid, now), s.por.round(*node, vid), s.por.is_wide_round(*node, vid))
+            };
+            if !due {
+                continue;
+            }
+            let audit = if wide {
+                build_wide_audit(&k_audit, vid, epoch, r, &manifest, WIDE_AUDIT_COVERAGE)
+            } else {
+                build_audit(&k_audit, vid, epoch, r, &manifest)
+            };
+            // C1: an unreachable replica (connect failed) is a transport failure,
+            // not a retention answer - it must never advance the loss streak, or a
+            // transiently-offline friend would be evicted without grace. Only a peer
+            // that actually answered is judged on content via `record`.
+            let action = match self.fetch_audit_samples(addr, &audit).await {
+                None => {
+                    let mut s = self.shared.write().expect("shared lock");
+                    s.por.record_unreachable(*node, vid, now)
+                }
+                Some(responses) => {
+                    let outcome = verify_audit_response(&audit, &responses);
+                    let mut s = self.shared.write().expect("shared lock");
+                    s.por.record(*node, vid, outcome, now)
+                }
+            };
+            match action {
+                AuditAction::Lost => round.lost.push(*node),
+                AuditAction::Skipped => round.unreachable.push(*node),
+                _ => {}
+            }
+            round.audited.push((*node, action));
+        }
+
+        if !round.lost.is_empty() {
+            let mut healths = HashMap::new();
+            for n in &round.lost {
+                healths.insert(*n, Health::AuditLost);
+            }
+            round.repaired = self.repair_vault(vid, &healths, candidates).await?;
+        }
+        Ok(round)
+    }
+
+    /// Probe `addr` for each sampled chunk of `audit`. Returns `Some(responses)`
+    /// (one `Option<Vec<u8>>` per sample: `Some` bytes if the chunk was served,
+    /// `None` if the connected peer did not produce it) when the replica answered,
+    /// or `None` when the replica could not be reached at all.
+    ///
+    /// C1: the connect-failure `None` is distinct from a per-sample `None`. An
+    /// unreachable peer is a transport failure and must not be scored as a retention
+    /// loss; only a peer that connected is judged on the content of its answers.
+    /// Fetches into a fresh empty store so a chunk the owner already holds is still
+    /// pulled from the replica; a per-sample timeout bounds a stalled/missing probe.
+    async fn fetch_audit_samples(
+        &self,
+        addr: &EndpointAddr,
+        audit: &Audit,
+    ) -> Option<Vec<Option<Vec<u8>>>> {
+        let scratch = IrohBlobStore::new();
+        // Unreachable replica: no content answer at all -> signal transport failure.
+        // The connect is time-bounded so a dead peer fails fast instead of hanging
+        // the round on the QUIC handshake timeout (C1).
+        let conn =
+            match tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(addr.clone(), iroh_blobs::ALPN))
+                .await
+            {
+                Ok(Ok(conn)) => conn,
+                _ => return None,
+            };
+        let mut out = Vec::with_capacity(audit.samples.len());
+        for s in &audit.samples {
+            let got = match tokio::time::timeout(POR_FETCH_TIMEOUT, scratch.fetch(&conn, s.chunk_id)).await
+            {
+                Ok(Ok(())) => scratch.get_bytes(s.chunk_id).await.ok(),
+                _ => None,
+            };
+            out.push(got);
+        }
+        Some(out)
+    }
+
+    // ---- share-health cadence (§10.2) ----------------------------------
+
+    /// Register a recovery set this daemon owns, so [`Daemon::run_share_health_round`]
+    /// tracks its attested-live count and drift. `tracker` carries the set's `M`,
+    /// slack, lifetime issued-share count, and cadence (build it with
+    /// [`AttestTracker::new`] for defaults, or `with_params` to tune the round /
+    /// freshness intervals).
+    pub fn register_recovery_set(&self, rsid: u64, tracker: AttestTracker) {
+        self.shared.write().expect("shared lock").share_sets.insert(rsid, tracker);
+    }
+
+    /// Store a share this daemon holds as a trustee for another owner, enabling it
+    /// to answer that owner's `ShareAttestChallenge`s and to run continuous local
+    /// CRC self-validation (§10.2). Keyed by the share's recovery-set id.
+    pub fn store_share(&self, share: Share) {
+        let rsid = u64::from(share.recovery_set_id);
+        self.shared
+            .write()
+            .expect("shared lock")
+            .held_shares
+            .insert(rsid, (share, ShareMonitor::new()));
+    }
+
+    /// Trustee-side continuous self-validation (§10.2): run the local CRC over the
+    /// held share for `rsid` if its cadence is due at `now`, returning the current
+    /// [`ShareHealth`] (or `None` if this daemon holds no share for that set).
+    pub fn share_self_validate(&self, rsid: u64, now: u64) -> Option<ShareHealth> {
+        let mut s = self.shared.write().expect("shared lock");
+        s.held_shares.get_mut(&rsid).map(|(share, mon)| mon.poll(share, now))
+    }
+
+    /// Owner-side share-health round (§10.2). If a round is due at `now`, challenge
+    /// every `trustee` (`dialable address`) for the set `rsid` over the control
+    /// stream, fold each verified attestation into the set's attested-live count,
+    /// then return the drift decision: [`ShareAction::Healthy`], an
+    /// [`ShareAction::Extend`] recommendation when live has drifted below `M + slack`
+    /// with cap headroom, or [`ShareAction::ResplitLargerM`] at the §8.3 cap. When no
+    /// round is due this just re-reads the current decision without probing.
+    ///
+    /// This SURFACES the recommendation; issuing the actual extend / re-split stays
+    /// in [`carapace_recovery`]. No lock is held across the network round-trips.
+    pub async fn run_share_health_round(
+        &self,
+        rsid: u64,
+        subject: [u8; 32],
+        trustees: &[EndpointAddr],
+        now: u64,
+    ) -> Result<ShareAction> {
+        let due = {
+            let s = self.shared.read().expect("shared lock");
+            let t = s.share_sets.get(&rsid).context("unknown recovery set")?;
+            t.round_due(now)
+        };
+        if !due {
+            let s = self.shared.read().expect("shared lock");
+            return Ok(s.share_sets.get(&rsid).expect("checked above").decide(now));
+        }
+
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("attest nonce: {e}"))?;
+        let challenge = build_attest_challenge(&self.node_key, subject, rsid, nonce);
+
+        let mut atts = Vec::new();
+        for peer in trustees {
+            if let Some(att) = self.challenge_trustee(peer, &challenge).await? {
+                atts.push(att);
+            }
+        }
+
+        let action = {
+            let mut s = self.shared.write().expect("shared lock");
+            let t = s.share_sets.get_mut(&rsid).context("unknown recovery set")?;
+            // Fold only attestations that verify against this challenge; a bad or
+            // mismatched one changes nothing (it simply is not counted live).
+            for att in &atts {
+                let _ = t.record_attestation(att, &challenge, now);
+            }
+            t.mark_round(now);
+            t.decide(now)
+        };
+        Ok(action)
+    }
+
+    /// Dial `peer`'s control stream, send `challenge`, and return its
+    /// `ShareAttestation` if it answers (a trustee holding no share, or refusing,
+    /// finishes without one).
+    async fn challenge_trustee(
+        &self,
+        peer: &EndpointAddr,
+        challenge: &ShareAttestChallenge,
+    ) -> Result<Option<ShareAttestation>> {
+        let conn = self.ep.connect(peer.clone(), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, challenge).await?;
+        let att = match read_frame_raw(&mut recv).await? {
+            Some((ShareAttestation::TYPE, body)) => Some(ShareAttestation::from_map(body)?),
+            _ => None,
+        };
+        send.finish()?;
+        Ok(att)
+    }
+
+    /// Test-only: record `node` as a replica member of `vid` without pushing it the
+    /// blobs, modeling a replica that accepted a placement but has since lost its
+    /// stored copy. The PoR loop then detects the loss on audit.
+    #[doc(hidden)]
+    pub fn inject_lost_member_for_test(&self, vid: [u8; 32], node: [u8; 32]) {
+        let mut s = self.shared.write().expect("shared lock");
+        let members = s.members.entry(vid).or_default();
+        if !members.contains(&node) {
+            members.push(node);
+        }
     }
 
     /// Gracefully close the endpoint.

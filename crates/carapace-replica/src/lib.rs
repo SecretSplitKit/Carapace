@@ -23,12 +23,19 @@
 pub mod owner;
 pub mod peer;
 pub mod policy;
+pub mod por;
 
 pub use owner::{PlacementCtx, ReplicaSet};
 pub use peer::ReplicaPeer;
 pub use policy::{
     Health, Policy, RateLimiter, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
     DEFAULT_RATE_REFILL_PER_SEC,
+};
+pub use por::{
+    build_audit, build_audit_n, build_wide_audit, run_audit, signed_audit_notice,
+    verify_audit_response, Audit, AuditAction, AuditFailure, AuditOutcome, AuditResponder,
+    AuditSample, AuditTracker, AUDIT_CODE_RETENTION_LOST, DEFAULT_POR_FAIL_LIMIT,
+    DEFAULT_POR_INTERVAL_SECS, DEFAULT_SAMPLES_PER_ROUND, DEFAULT_WIDE_EVERY,
 };
 
 /// Default replica invariant `r` (§10.1).

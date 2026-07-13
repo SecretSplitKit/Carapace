@@ -145,6 +145,12 @@ pub enum Health {
     UnreachableSince(u64),
     /// The friendship ended: confirmed loss, repair immediately.
     Unfriended,
+    /// The replica failed the retention audit past the fail limit (§10.1: failed
+    /// audits are confirmed loss). Like [`Health::Unfriended`] it repairs
+    /// immediately, independent of the grace window - the peer has demonstrably
+    /// dropped sampled chunks, so waiting out grace buys nothing. Produced from a
+    /// [`crate::por::AuditAction::Lost`].
+    AuditLost,
 }
 
 impl Health {
@@ -154,7 +160,7 @@ impl Health {
     pub fn is_lost(&self, now: u64, grace: u64) -> bool {
         match self {
             Health::Reachable => false,
-            Health::Unfriended => true,
+            Health::Unfriended | Health::AuditLost => true,
             Health::UnreachableSince(since) => now.saturating_sub(*since) >= grace,
         }
     }
