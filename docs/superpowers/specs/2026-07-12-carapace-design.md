@@ -16,8 +16,15 @@ Normative sources (do not restate, cite): `carapace-protocol.md` (v0.10),
 - Chela consumed as a path/git-rev dependency; extendable-split added inside
   `chela/` at Phase 2 (separate audited workspace, no new Chela deps).
 - "Clients" = daemon (`carapaced`) + CLI (`carapace`) as native binaries on
-  the three desktop OSes, built/tested in CI matrix. A GUI is a separate
-  downstream sub-project (spec §15 places UI above the core), out of scope.
+  the three desktop OSes, built/tested in CI matrix.
+- GUI = a local web app served by the daemon: SvelteKit static build embedded
+  in the daemon binary (`rust-embed`), opened in the user's browser. The
+  daemon exposes a loopback control API (`carapace-api`) bound to `127.0.0.1`
+  only, guarded by a per-session bearer token (written to a local file the GUI
+  reads) and strict Origin/Host checks (localhost CSRF defense); WebSocket for
+  live status push, JSON for actions. This API fronts a process holding
+  `K_root` and vault plaintext, so it is a trust boundary: opus + auditor
+  treatment, no action without token, no external bind ever. Phase 6.
 - Definition of done, per phase: `cargo test` green, phase-specific
   conformance/behavior verified against a real oracle or harness, adversarial
   `auditor` pass folded in. No upper layer is claimed working without a test
@@ -37,6 +44,8 @@ carapace-friend    contact cards, friendships, tickets, unfriend/re-split    [3]
 carapace-replica   placement, repair, PoR retention audit                  [3-4]
 carapace-share     share health, attestation cadence                         [4]
 carapace-disclose  FileGrant selective disclosure                            [5]
+carapace-api       loopback control API (127.0.0.1 + token + WS), grows/phase [1+]
+carapace-gui       SvelteKit static web app, embedded in daemon (rust-embed)  [6]
 carapaced (bin)    daemon      carapace (bin)  CLI client                  [1+]
 ```
 
@@ -114,6 +123,15 @@ no hand-rolled primitives.
   drift-driven extend/re-split prompts.
 - **5 Disclosure + polish:** FileGrant selective disclosure with
   audience-authenticated fetch; cross-platform CI matrix; release binaries.
+- **6 GUI:** SvelteKit static app embedded in the daemon and served on
+  loopback; live status dashboard (vaults, replicas, trustees/share health,
+  relay reachability, ceremonies) over WebSocket, plus action flows for every
+  daemon capability (create vault, friend/unfriend, invite tickets, replica
+  grants, split/extend/re-split, recovery ceremony, file grants). The
+  `carapace-api` crate (token-auth loopback control surface) is built
+  incrementally from Phase 1 onward as each capability lands, so Phase 6 is
+  mostly frontend over an API that already exists. `frontend-design` skill
+  applies here. Auditor pass focuses on the loopback trust boundary.
 
 ## Cross-cutting
 

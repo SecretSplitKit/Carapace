@@ -68,7 +68,7 @@ Axioms:
 | Content encryption | XChaCha20-Poly1305 (24-byte nonce), per-chunk keys — never bare AES-GCM |
 | Hashing / addressing | BLAKE3-256 (ChunkID = iroh blob hash) |
 | Signatures | Ed25519 (user keys, device delegations, documents) |
-| Sealed disclosure | HPKE (RFC 9180): X25519 + XChaCha20-Poly1305 |
+| Sealed disclosure | HPKE (RFC 9180): X25519 + ChaCha20-Poly1305 (AEAD id 0x0003; see errata E2) |
 | Root-at-rest KDF | Argon2id (local sealing only) |
 | Transport | iroh endpoint (QUIC, TLS 1.3, dial-by-NodeID) |
 | Threshold recovery | **Chela** SPEC v1.0.0 (+ extendable-split profile, companion doc) |
@@ -118,8 +118,9 @@ as acting for a user.
 
 ## 5. Content model (unchanged from v0.5)
 
-**Chunking:** FastCDC, MIN 256 KiB / AVG 1 MiB / MAX 4 MiB, standard Gear hash
-(normative for cross-client dedup).
+**Chunking:** FastCDC (v2016, standard Gear table), MIN 256 KiB / AVG 1 MiB /
+MAX 4 MiB (normative for cross-client dedup; see errata E3 — a chunk-boundary
+vector is owed).
 
 **Encryption & addressing:**
 
@@ -378,7 +379,7 @@ cards **is** your address book.
 ```
 Friendship = {
   a: user_pubkey, b: user_pubkey, established: uint,
-  sig_a, sig_b,                    # both USER keys over ("carapace/v1/friend" ‖ a ‖ b ‖ established)
+  sig_a, sig_b,                    # both USER keys, Appendix B doc-type-0 discipline: "carapace-sig-v1" ‖ det_cbor([0,{0:a,1:b,2:established}]) (see errata E1)
 }
 ```
 
