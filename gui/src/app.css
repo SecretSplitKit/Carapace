@@ -1,0 +1,221 @@
+/* Self-hosted fonts: bundled woff2 from node_modules, no CDN/network request at
+   runtime. Only the weights actually used. */
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@import '@fontsource/ibm-plex-mono/600.css';
+@import '@fontsource/hanken-grotesk/400.css';
+@import '@fontsource/hanken-grotesk/500.css';
+@import '@fontsource/hanken-grotesk/600.css';
+@import '@fontsource/hanken-grotesk/700.css';
+
+:root {
+	color-scheme: dark;
+
+	/* -- Chitin palette: dark default -- */
+	--ink: #14100c;
+	--plate: #1f1913;
+	--plate-raised: #241d16;
+	--hairline: #2e251b;
+	--bronze: #c8843c;
+	--bronze-strong: #e0a05c;
+	--verdigris: #4e8d7c;
+	--coral: #e0674a;
+	--bone: #eae0d2;
+	--muted: #9a8f7e;
+
+	--font-sans:
+		'Hanken Grotesk', ui-sans-serif, system-ui, -apple-system, sans-serif;
+	--font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+	/* Modular type scale, 1.2 ratio on a 16px base. */
+	--step--1: 0.833rem;
+	--step-0: 1rem;
+	--step-1: 1.2rem;
+	--step-2: 1.44rem;
+	--step-3: 1.728rem;
+	--step-4: 2.074rem;
+	--step-5: 2.488rem;
+
+	--radius: 10px;
+	--transition: 160ms ease;
+
+	background: var(--ink);
+	color: var(--bone);
+}
+
+:root[data-theme='light'] {
+	color-scheme: light;
+	--ink: #f4ede0;
+	--plate: #e7dac2;
+	--plate-raised: #f0e6d3;
+	--hairline: #cdb994;
+	--bronze: #9c5f22;
+	--bronze-strong: #7a4a1a;
+	--verdigris: #2f6e5c;
+	--coral: #b83f27;
+	--bone: #241d16;
+	--muted: #6b5f4d;
+}
+
+@media (prefers-color-scheme: light) {
+	:root:not([data-theme='dark']) {
+		color-scheme: light;
+		--ink: #f4ede0;
+		--plate: #e7dac2;
+		--plate-raised: #f0e6d3;
+		--hairline: #cdb994;
+		--bronze: #9c5f22;
+		--bronze-strong: #7a4a1a;
+		--verdigris: #2f6e5c;
+		--coral: #b83f27;
+		--bone: #241d16;
+		--muted: #6b5f4d;
+	}
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	min-height: 100%;
+}
+
+body {
+	background: var(--ink);
+	color: var(--bone);
+	font-family: var(--font-sans);
+	font-size: var(--step-0);
+	line-height: 1.5;
+	transition:
+		background var(--transition),
+		color var(--transition);
+}
+
+h1,
+h2,
+h3 {
+	font-family: var(--font-sans);
+	font-weight: 700;
+	line-height: 1.2;
+	margin: 0 0 0.5em;
+}
+
+h1 {
+	font-size: var(--step-4);
+}
+h2 {
+	font-size: var(--step-2);
+}
+h3 {
+	font-size: var(--step-1);
+}
+
+code,
+.mono {
+	font-family: var(--font-mono);
+	font-variant-ligatures: none;
+}
+
+a {
+	color: var(--bronze-strong);
+}
+
+button,
+input,
+select,
+textarea {
+	font-family: inherit;
+	font-size: inherit;
+	color: inherit;
+}
+
+button {
+	background: var(--plate-raised);
+	border: 1px solid var(--hairline);
+	color: var(--bone);
+	border-radius: var(--radius);
+	padding: 0.55em 1em;
+	cursor: pointer;
+	transition:
+		background var(--transition),
+		border-color var(--transition);
+}
+
+button:hover {
+	border-color: var(--bronze);
+}
+
+button.primary {
+	background: var(--bronze);
+	border-color: var(--bronze);
+	color: var(--ink);
+	font-weight: 600;
+}
+
+button.primary:hover {
+	background: var(--bronze-strong);
+	border-color: var(--bronze-strong);
+}
+
+button:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+input,
+select,
+textarea {
+	background: var(--plate);
+	border: 1px solid var(--hairline);
+	border-radius: calc(var(--radius) * 0.6);
+	padding: 0.5em 0.7em;
+}
+
+/* Visible keyboard focus everywhere - never suppressed. */
+:focus-visible {
+	outline: 2px solid var(--bronze);
+	outline-offset: 2px;
+}
+
+.card {
+	background: var(--plate);
+	border: 1px solid var(--hairline);
+	border-radius: var(--radius);
+	padding: 1.25rem;
+}
+
+.muted {
+	color: var(--muted);
+}
+
+.healthy {
+	color: var(--verdigris);
+}
+
+.at-risk {
+	color: var(--coral);
+}
+
+.visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+		scroll-behavior: auto !important;
+	}
+}

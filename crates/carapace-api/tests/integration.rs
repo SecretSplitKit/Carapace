@@ -183,6 +183,167 @@ async fn token_file_is_written_owner_only() {
     api.shutdown();
 }
 
+/// Split a raw HTTP/1.1 response into `(headers_block, body)`.
+fn split_response(resp: &str) -> (&str, &str) {
+    match resp.split_once("\r\n\r\n") {
+        Some((h, b)) => (h, b),
+        None => (resp, ""),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_injects_the_token_and_references_built_assets() {
+    let (api, _d, _dir) = boot().await;
+    let (code, resp) = get(api.local_addr, "/", "");
+    assert_eq!(code, 200, "GET / must serve the shell: {resp}");
+    let (headers, body) = split_response(&resp);
+
+    // The session token is injected verbatim into a script the page can read.
+    let inject = format!("window.__CARAPACE_TOKEN__=\"{}\"", api.token);
+    assert!(
+        body.contains(&inject),
+        "index must inject the session token: {body}"
+    );
+
+    // The built SvelteKit bundle is referenced (immutable entry + stylesheet).
+    assert!(
+        body.contains("/_app/immutable/"),
+        "index must reference built assets: {body}"
+    );
+
+    // The token page is not cacheable, is nosniff, and carries the strict CSP.
+    let lower = headers.to_ascii_lowercase();
+    assert!(lower.contains("cache-control: no-store"), "{headers}");
+    assert!(
+        lower.contains("x-content-type-options: nosniff"),
+        "{headers}"
+    );
+    assert!(
+        lower.contains("content-security-policy:"),
+        "must set a CSP: {headers}"
+    );
+    assert!(lower.contains("default-src 'self'"), "{headers}");
+    // `connect-src` is same-origin only: no loopback wildcards that would let a
+    // post-XSS script beacon to other local ports.
+    assert!(lower.contains("connect-src 'self';"), "{headers}");
+    assert!(
+        !lower.contains("ws://"),
+        "no ws:// wildcards in CSP: {headers}"
+    );
+    assert!(lower.contains("object-src 'none'"), "{headers}");
+    assert!(lower.contains("frame-ancestors 'none'"), "{headers}");
+    assert!(lower.contains("base-uri 'none'"), "{headers}");
+    // The inline token script must run under a nonce, never 'unsafe-inline' scripts.
+    assert!(
+        lower.contains("script-src 'self' 'nonce-"),
+        "script-src must be nonce-gated: {headers}"
+    );
+    assert!(
+        !lower.contains("'unsafe-inline'") || !lower.contains("script-src 'self' 'unsafe-inline'"),
+        "inline scripts must not be blanket-allowed: {headers}"
+    );
+
+    // The injected script and SvelteKit's bootstrap both carry that nonce.
+    let nonce = headers
+        .lines()
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("content-security-policy:")
+        })
+        .and_then(|l| l.split("'nonce-").nth(1))
+        .and_then(|s| s.split('\'').next())
+        .expect("csp carries a nonce");
+    assert_eq!(nonce.len(), 32, "nonce is 16 bytes hex: {nonce}");
+    let nonced = format!("<script nonce=\"{nonce}\">");
+    assert!(
+        body.matches(&nonced).count() >= 2,
+        "both inline scripts must carry the nonce: {body}"
+    );
+
+    api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn built_asset_is_served_with_a_sane_content_type() {
+    let (api, _d, _dir) = boot().await;
+    // Pull a real hashed JS path out of the served index rather than hardcoding it.
+    let (_c, index) = get(api.local_addr, "/", "");
+    let js_path = index
+        .split('"')
+        .find(|s| s.starts_with("/_app/immutable/") && s.ends_with(".js"))
+        .expect("index references a built JS asset")
+        .to_string();
+
+    let (code, resp) = get(api.local_addr, &js_path, "");
+    assert_eq!(code, 200, "built asset must be 200: {resp}");
+    let (headers, _body) = split_response(&resp);
+    let lower = headers.to_ascii_lowercase();
+    assert!(
+        lower.contains("content-type: text/javascript")
+            || lower.contains("content-type: application/javascript"),
+        "JS must have a JS content-type: {headers}"
+    );
+    assert!(
+        lower.contains("x-content-type-options: nosniff"),
+        "assets must be nosniff: {headers}"
+    );
+
+    api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spa_fallback_serves_the_shell_for_unknown_routes() {
+    let (api, _d, _dir) = boot().await;
+    let (code, resp) = get(api.local_addr, "/vaults/deep/link", "");
+    assert_eq!(
+        code, 200,
+        "unknown route must fall back to the shell: {resp}"
+    );
+    let (_h, body) = split_response(&resp);
+    assert!(
+        body.contains("window.__CARAPACE_TOKEN__="),
+        "fallback shell must still inject the token: {body}"
+    );
+    api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_api_path_is_404_json_not_the_token_shell() {
+    let (api, _d, _dir) = boot().await;
+    // An unmatched `/api/*` path is a missing endpoint: it must 404 as JSON, never
+    // fall through to the token-injected SPA shell (which would echo the token).
+    let (code, resp) = get(
+        api.local_addr,
+        "/api/does-not-exist",
+        &format!("Authorization: Bearer {}\r\n", api.token),
+    );
+    assert_eq!(code, 404, "unknown /api path must be 404: {resp}");
+    let (_h, body) = split_response(&resp);
+    assert!(
+        !body.contains("window.__CARAPACE_TOKEN__="),
+        "unknown /api path must not serve the token shell: {resp}"
+    );
+    assert!(body.contains("\"error\""), "404 body must be JSON: {resp}");
+    api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_page_is_not_served_cross_origin() {
+    let (api, _d, _dir) = boot().await;
+    // A cross-site page's request carries a non-loopback Origin. The global guard must
+    // refuse it BEFORE the shell (and thus the embedded token) is ever rendered.
+    let (code, resp) = get(api.local_addr, "/", "Origin: http://evil.com\r\n");
+    assert_eq!(
+        code, 403,
+        "cross-origin request for the shell must be forbidden"
+    );
+    assert!(
+        !resp.contains(&api.token),
+        "the token must never appear in a cross-origin response: {resp}"
+    );
+    api.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_split_round_trips_over_the_api() {
     let (api, _d, _dir) = boot().await;

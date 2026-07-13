@@ -28,27 +28,108 @@ use crate::{auth, AppState};
 #[folder = "static/"]
 struct Assets;
 
-/// Serve an embedded GUI asset, falling back to `index.html` for unknown paths so a
-/// client-routed SPA works. No auth: this is the app shell, which carries no secrets
-/// and drives every privileged action through the token-gated `/api` routes.
-pub async fn static_asset(uri: Uri) -> Response {
+/// Serve an embedded GUI asset, falling back to the token-injected `index.html` for
+/// `/` and any unmatched non-`/api` path so a client-routed SPA works. No token auth:
+/// the shell carries no secrets by itself and drives every privileged action through
+/// the token-gated `/api` routes. The Host/Origin guard still applies (global layer),
+/// so `index.html` - which DOES embed the session token - is only ever handed to a
+/// same-origin loopback request; a cross-origin page cannot read it (same-origin
+/// policy) even if it could reach the port.
+pub async fn static_asset(State(st): State<AppState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
-    if let Some(file) = Assets::get(path) {
-        return (
-            [(header::CONTENT_TYPE, file.metadata.mimetype())],
-            file.data.into_owned(),
-        )
-            .into_response();
+    // An unmatched `/api/*` path is a missing endpoint, not a client route: 404 JSON,
+    // never the token-injected shell. Only non-`/api` paths get the SPA fallback.
+    if path == "api" || path.starts_with("api/") {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response();
     }
-    match Assets::get("index.html") {
+    // `index.html` must always route through injection, never be served raw.
+    if path.is_empty() || path == "index.html" {
+        return serve_index(&st.token);
+    }
+    match Assets::get(path) {
         Some(file) => (
-            [(header::CONTENT_TYPE, "text/html")],
+            [
+                (header::CONTENT_TYPE, file.metadata.mimetype()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
             file.data.into_owned(),
         )
             .into_response(),
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+        // SPA fallback: an unknown path is a client route, not a 404.
+        None => serve_index(&st.token),
     }
+}
+
+/// A per-response CSP nonce: 16 CSPRNG bytes, hex. Unpredictable per response, so an
+/// injected inline `<script>` cannot be forged by anything that didn't see this page.
+fn gen_nonce() -> Option<String> {
+    let mut raw = [0u8; 16];
+    getrandom::getrandom(&mut raw).ok()?;
+    Some(hex::encode(raw))
+}
+
+/// The session token is a 64-char lowercase-hex CSPRNG value (`hex::encode` of 32
+/// bytes). Asserting the shape before injection guarantees it cannot break out of the
+/// `<script>` context - there is no quote, angle bracket, or slash it could carry.
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Inject the session token as `window.__CARAPACE_TOKEN__` and add the CSP nonce to
+/// every inline `<script>` (the injected token script and SvelteKit's bootstrap), so
+/// both run under a strict `script-src 'self' 'nonce-...'`. Returns `None` if the
+/// token is not well-formed hex or the shell has no `</head>` to inject before - both
+/// are impossible in practice and are treated as a loud 500 by the caller, never as a
+/// tokenless page.
+fn render_index(html: &str, token: &str, nonce: &str) -> Option<String> {
+    if !is_hex64(token) || !html.contains("</head>") {
+        return None;
+    }
+    let with_nonce = html.replace("<script>", &format!("<script nonce=\"{nonce}\">"));
+    let inject =
+        format!("<script nonce=\"{nonce}\">window.__CARAPACE_TOKEN__=\"{token}\"</script>");
+    Some(with_nonce.replacen("</head>", &format!("{inject}</head>"), 1))
+}
+
+/// Serve the SPA shell with the token injected, a strict CSP, `nosniff`, and
+/// `no-store` (the page embeds the session token, so it must never be cached).
+fn serve_index(token: &str) -> Response {
+    let Some(file) = Assets::get("index.html") else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "gui shell not embedded").into_response();
+    };
+    let html = String::from_utf8_lossy(&file.data);
+    let Some(nonce) = gen_nonce() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "csprng unavailable").into_response();
+    };
+    let Some(rendered) = render_index(&html, token, &nonce) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "cannot render shell").into_response();
+    };
+    // No external origins. `script-src` is `'self'` plus this response's nonce; inline
+    // style attributes in the built shell (e.g. `style="display: contents"`) force
+    // `style-src 'unsafe-inline'`. The WS events feed is same-origin (the client builds
+    // it from `location.host`), which `connect-src 'self'` covers under CSP Level 3 - no
+    // loopback wildcards, so a post-XSS script can't beacon to other local ports.
+    let csp = format!(
+        "default-src 'self'; \
+         script-src 'self' 'nonce-{nonce}'; \
+         connect-src 'self'; \
+         img-src 'self' data:; \
+         style-src 'self' 'unsafe-inline'; \
+         font-src 'self'; \
+         object-src 'none'; \
+         base-uri 'none'; \
+         frame-ancestors 'none'"
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, csp.as_str()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        rendered,
+    )
+        .into_response()
 }
 
 // ---- error type --------------------------------------------------------

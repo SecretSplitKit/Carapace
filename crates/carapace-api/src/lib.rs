@@ -10,8 +10,9 @@
 //! (which validates the token from a query parameter instead, since browsers cannot
 //! set an `Authorization` header on a WS handshake), and the embedded static GUI.
 //!
-//! The GUI is embedded with `rust-embed` from `static/`; the SvelteKit build lands
-//! there in Phase 6b. For now it is a placeholder shell.
+//! The GUI is embedded with `rust-embed` from `static/` (the SvelteKit build). The
+//! served `index.html` gets the session token injected as `window.__CARAPACE_TOKEN__`
+//! under a strict per-response CSP nonce; see [`handlers::static_asset`].
 
 mod auth;
 mod handlers;
@@ -95,19 +96,20 @@ pub fn app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.token.clone(),
             auth::require_token,
-        ))
-        .with_state(state.clone());
+        ));
 
     let public = Router::new()
         .route("/api/health", get(handlers::health))
-        .route("/api/events", get(handlers::events))
-        .with_state(state);
+        .route("/api/events", get(handlers::events));
 
+    // `with_state` is applied once at the end so the static/SPA fallback (which reads
+    // the session token to inject it) shares the same `AppState` as the `/api` routes.
     Router::new()
         .merge(protected)
         .merge(public)
         .fallback(handlers::static_asset)
         .layer(middleware::from_fn(auth::guard_host_origin))
+        .with_state(state)
 }
 
 /// Generate a 32-byte CSPRNG token, hex-encode it, and write it to
