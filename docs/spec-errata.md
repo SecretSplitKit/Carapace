@@ -41,6 +41,30 @@ iroh-blobs 0.103** (there is a 1.x). API renames adopted: `NodeId→EndpointId`,
 `iroh_blobs::Hash::new == blake3::hash`, so Carapace ChunkID == iroh blob hash
 holds by construction.
 
+## E4 — Recovery delay must anchor to local first-observation, not sponsor `opened_at` (protocol §8.5 step 5)
+
+§8.5 step 5 says "No share moves before `opened_at + recovery_delay`", where `opened_at`
+is a field of the sponsor-signed `RecoveryOpen`. Taken literally this is exploitable: the
+sponsor is a free-choosing party, so a malicious sponsoring trustee sets `opened_at = 0`
+(or any past time) and the `opened_at + recovery_delay` gate is already satisfied - the
+abort/alarm window the delay exists to create is removed the instant `M` approvals land.
+**Resolution: each observing party gates on `max(opened_at, first_seen) + recovery_delay`,
+where `first_seen` is that party's own wall clock when it began tracking the ceremony.** A
+backdated `opened_at` can no longer shorten the delay (the local `first_seen` floor holds);
+a future-dated `opened_at` only pushes release later, which is safe. The implementation
+(`carapace-recovery::ceremony::CeremonyState`) records `first_seen` at `open`/`open_from_grant`
+and `can_release` uses the max. §8.5 step 5 should be reworded to specify the local-clock anchor.
+
+## E5 — `recovery_delay` has no floor (protocol §8.5 step 5)
+
+§8.5 gives `recovery_delay` a default (72 h) "chosen at split time" but no minimum. A grant
+with `recovery_delay = 0` collapses the abort window to just "M approvals", removing the
+slow-takeover defense even when `opened_at` is honest (E4). It is the owner's own signed
+choice, so the implementation accepts it verbatim rather than hard-rejecting a spec-sanctioned
+value. **Recommendation: the spec SHOULD state a floor (e.g. reject `recovery_delay < 24 h`
+unless an explicit override is set) and clients SHOULD warn below it.** Tracked as advisory;
+`build_share_grant` documents the risk at the call site.
+
 ## E3 — FastCDC variant/params unpinned (protocol §5)
 
 §5 names "FastCDC" with MIN 256 KiB / AVG 1 MiB / MAX 4 MiB but not the

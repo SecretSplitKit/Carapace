@@ -12,6 +12,8 @@ pub const INFO_MANIFEST: &[u8] = b"manifest";
 pub const INFO_AUDIT: &[u8] = b"por";
 pub const INFO_USERID: &[u8] = b"carapace/v1/user-identity";
 pub const INFO_DISCLOSE: &[u8] = b"carapace/v1/disclosure";
+/// Split-state sealing key (protocol §8.1): AEAD key for the Chela extendable-split state.
+pub const INFO_SPLIT_STATE: &[u8] = b"carapace/v1/split-state";
 
 /// Per-chunk key/nonce info prefixes: `info = PREFIX ‖ pt_hash` (protocol §5).
 pub const CHUNK_KEY_PREFIX: &[u8] = b"chunk-key";
@@ -67,6 +69,12 @@ pub fn k_userid(k_root: &[u8]) -> Key32 {
 /// `K_disclose = HKDF(K_root, "carapace/v1/disclosure")` (X25519/HPKE seed).
 pub fn k_disclose(k_root: &[u8]) -> Key32 {
     derive32(k_root, INFO_DISCLOSE)
+}
+
+/// `K_splitstate = HKDF(K_root, "carapace/v1/split-state")` (protocol §8.1). The AEAD key
+/// under which the daemon seals a Chela split-state before persisting it.
+pub fn k_split_state(k_root: &[u8]) -> Key32 {
+    derive32(k_root, INFO_SPLIT_STATE)
 }
 
 /// `chunk_key = HKDF(K_content, "chunk-key" ‖ pt_hash)`.

@@ -1,0 +1,22 @@
+[package]
+name = "carapace-recovery"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+carapace-wire = { path = "../carapace-wire" }
+carapace-crypto = { path = "../carapace-crypto" }
+chela-engine = { path = "../../../chela/chela-engine" }
+chela-bip39 = { path = "../../../chela/chela-bip39" }
+chela-share = { path = "../../../chela/chela-share" }
+chacha20poly1305 = "0.10"
+zeroize = "1"
+getrandom = "0.2"
+ed25519-dalek = "2"
+
+[dev-dependencies]
+hex = "0.4"
