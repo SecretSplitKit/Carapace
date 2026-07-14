@@ -31,6 +31,7 @@ async fn run(rest: Vec<String>) -> Result<()> {
     let mut publish: Option<PathBuf> = None;
     let mut vid_hex: Option<String> = None;
     let mut api_port: u16 = 0;
+    let mut bind: Option<String> = None;
 
     let mut it = rest.into_iter();
     while let Some(flag) = it.next() {
@@ -47,13 +48,20 @@ async fn run(rest: Vec<String>) -> Result<()> {
                     .parse()
                     .context("--api-port must be a u16 port")?
             }
+            "--bind" => bind = Some(it.next().context("--bind needs an ip:port value")?),
             other => bail!("unknown flag {other:?}"),
         }
     }
 
     let state_dir = state_dir.context("--state-dir is required")?;
     let state = State::load_or_generate(&state_dir)?;
-    let daemon = Arc::new(Daemon::start(state).await?);
+    let daemon = Arc::new(match bind {
+        Some(b) => {
+            let addr: std::net::SocketAddr = b.parse().context("--bind must be ip:port")?;
+            Daemon::start_on(state, carapaced::ReplicaLimits::default(), addr).await?
+        }
+        None => Daemon::start(state).await?,
+    });
 
     println!("node_id: {}", hex(&daemon.node_id()));
     match daemon.addr() {

@@ -23,13 +23,18 @@ impl CarapaceEndpoint {
     /// iroh NodeID is the carapace node id by construction. Uses the `Minimal`
     /// preset (no DNS/relay discovery) for deterministic in-process operation.
     pub async fn bind(node_key: &SigningKey) -> Result<Self> {
+        Self::bind_on(node_key, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await
+    }
+
+    /// Like [`bind`](Self::bind) but binds on a caller-chosen socket address.
+    /// Pass `0.0.0.0:<port>` to listen on every interface so peers on other
+    /// hosts can dial this node (the loopback default is for in-process use).
+    pub async fn bind_on(node_key: &SigningKey, bind: SocketAddr) -> Result<Self> {
         let sk = SecretKey::from_bytes(&node_key.to_bytes());
         let builder = Endpoint::builder(presets::Minimal)
             .secret_key(sk)
             .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()]);
-        let builder = builder
-            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-            .context("bind address")?;
+        let builder = builder.bind_addr(bind).context("bind address")?;
         let ep = builder.bind().await.context("bind iroh endpoint")?;
         Ok(Self { ep })
     }

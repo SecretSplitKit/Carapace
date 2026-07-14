@@ -619,11 +619,28 @@ impl Daemon {
     /// use this to set a small quota or a tight rate limit and exercise the
     /// cut-offs without pushing gigabytes.
     pub async fn start_with_limits(state: State, limits: ReplicaLimits) -> Result<Self> {
+        Self::start_on(
+            state,
+            limits,
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        )
+        .await
+    }
+
+    /// Like [`Daemon::start_with_limits`] but binds the iroh endpoint on a
+    /// caller-chosen socket address. Pass `0.0.0.0:<port>` to make the node
+    /// reachable from other hosts (the default binds loopback for in-process
+    /// tests). Peers dial this node by its node id plus a routable `ip:port`.
+    pub async fn start_on(
+        state: State,
+        limits: ReplicaLimits,
+        bind: std::net::SocketAddr,
+    ) -> Result<Self> {
         let node_key = state.node_key.clone();
         let user_key = state.user_key();
         let k_root = state.k_root.clone();
 
-        let ep = CarapaceEndpoint::bind(&node_key).await?;
+        let ep = CarapaceEndpoint::bind_on(&node_key, bind).await?;
         let blobs = IrohBlobStore::new();
         let shared = Arc::new(RwLock::new(Shared::default()));
 
