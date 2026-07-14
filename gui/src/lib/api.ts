@@ -73,6 +73,48 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	return (await res.json()) as T;
 }
 
+/** Like `request` but returns the raw response body as text (for non-JSON endpoints,
+ *  e.g. the printable paper-card HTML). Shares the same auth headers + error handling. */
+async function requestText(path: string, init?: RequestInit): Promise<string> {
+	let res: Response;
+	try {
+		res = await fetch(BASE + path, {
+			...init,
+			headers: {
+				Authorization: `Bearer ${apiToken()}`,
+				...init?.headers
+			}
+		});
+	} catch (e) {
+		const msg = `Could not reach the daemon (${path}). Is it running? (${(e as Error).message})`;
+		reportError(msg);
+		throw new ApiClientError(msg);
+	}
+
+	if (res.status === 401 || res.status === 403) {
+		const msg =
+			res.status === 401
+				? 'The daemon rejected this session (bad or missing token). Reload the page.'
+				: 'The daemon refused this request (Host/Origin guard). Reload the page.';
+		reportError(msg);
+		throw new ApiClientError(msg, res.status);
+	}
+
+	if (!res.ok) {
+		let detail = res.statusText;
+		try {
+			const body = await res.json();
+			if (typeof body?.error === 'string') detail = body.error;
+		} catch {
+			// non-JSON error body: keep statusText
+		}
+		reportError(`${path} failed: ${detail}`);
+		throw new ApiClientError(detail, res.status);
+	}
+
+	return res.text();
+}
+
 const get = <T>(path: string) => request<T>(path);
 const post = <T>(path: string, body?: unknown) =>
 	request<T>(path, { method: 'POST', body: body !== undefined ? JSON.stringify(body) : undefined });
@@ -104,6 +146,9 @@ export const api = {
 	unfriend: (user_pubkey: string) =>
 		post<UnfriendResult>(`/api/friends/${user_pubkey}/unfriend`),
 	resplitStatus: (rsid: number) => get<ResplitStatus>(`/api/recovery/${rsid}/resplit-status`),
+	// W15 (§8, §10.2): printable paper cards for one owned recovery set. Returns raw HTML
+	// (share WORDS - a bearer secret) the caller opens in a print view, never JSON.
+	paperCards: (rsid: number) => requestText(`/api/recovery/${rsid}/paper`),
 	// §9.3.4: start the re-split the PROMPT was raised for; omit trustees to use the suggested set.
 	resplitStart: (rsid: number, trustees?: string[]) =>
 		post<ResplitStatus>(`/api/recovery/${rsid}/resplit-start`, trustees ? { trustees } : undefined),

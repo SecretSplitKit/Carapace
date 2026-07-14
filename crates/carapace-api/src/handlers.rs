@@ -417,6 +417,34 @@ pub async fn resplit_status(
     }
 }
 
+/// `GET /api/recovery/{rsid}/paper`: the W15 paper-card backstop (§8, §10.2). Renders the
+/// owned recovery set's retained shares as a printable HTML document (one page per share),
+/// recoverable from the words alone, offline, with no Carapace software. Behind the same
+/// loopback/token/Host+Origin guards as every other recovery route. 404 if `rsid` is not an
+/// owned recovery set.
+///
+/// SECURITY: the body embeds share WORDS (a bearer secret). Same trust boundary as the
+/// recovery endpoints - handed only to the owner's authenticated loopback GUI, never logged.
+/// `no-store` keeps it out of the browser cache; `nosniff` fixes the type.
+pub async fn recovery_paper(
+    Path(rsid): Path<u64>,
+    State(st): State<AppState>,
+) -> Result<Response, ApiError> {
+    let html = st
+        .daemon
+        .paper_cards(rsid)
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        html,
+    )
+        .into_response())
+}
+
 #[derive(Deserialize)]
 pub struct ResplitStartReq {
     /// Override of the suggested new trustee set (hex user pubkeys of established friends or

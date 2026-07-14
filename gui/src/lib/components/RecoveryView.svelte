@@ -67,6 +67,23 @@
 		}
 	}
 
+	// W15 (§8, §10.2): fetch the printable paper cards for one owned recovery set and open
+	// them in a new tab for printing. The HTML embeds the share WORDS (a bearer secret), so
+	// it is opened in a standalone print view, never rendered inline in the app chrome.
+	let printing = $state<number | null>(null);
+	async function printPaperCards(rsid: number) {
+		printing = rsid;
+		try {
+			const html = await api.paperCards(rsid);
+			const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+			window.open(url, '_blank', 'noopener');
+			// Revoke after the new tab has had time to load the document.
+			setTimeout(() => URL.revokeObjectURL(url), 60_000);
+		} finally {
+			printing = null;
+		}
+	}
+
 	async function copy(text: string, mark: (v: boolean) => void) {
 		if (await copyToClipboard(text)) {
 			mark(true);
@@ -159,6 +176,30 @@
 				{$status.share_health.recovery_sets_owned} recovery set(s) split ·
 				{$status.share_health.shares_held} share(s) held here in trust for others
 			</p>
+		</div>
+	{/if}
+
+	{#if $status?.recovery_grants?.minted?.length}
+		<h2 style="margin-top: 1.5rem">Paper cards (offline backstop)</h2>
+		<p class="muted" style="font-size: var(--step--1)">
+			Print a paper card for each recovery set (§8, §10.2). A card recovers from its words
+			alone - offline, with no Carapace software - so it is the backstop that never goes
+			offline. The card shows a share's secret words; print it, then keep or destroy the copy.
+		</p>
+		<div class="list">
+			{#each $status.recovery_grants.minted as g (g.rsid)}
+				<div class="card set-row">
+					<span class="mono">rsid {g.rsid}</span>
+					<span class="muted">{g.trustees.length} share(s)</span>
+					<button
+						type="button"
+						disabled={printing === g.rsid}
+						onclick={() => printPaperCards(g.rsid)}
+					>
+						{printing === g.rsid ? 'Opening…' : 'Print / export paper cards'}
+					</button>
+				</div>
+			{/each}
 		</div>
 	{/if}
 

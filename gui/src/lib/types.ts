@@ -7,6 +7,9 @@ export interface StatusSnapshot {
 	friends: { count: number; list: string[] };
 	vaults: { published: PublishedVault[]; held_replicas: string[] };
 	share_health: { recovery_sets_owned: number; shares_held: number };
+	// W3 (§8, §7.3): per owned recovery set, the minted grants (rsid + trustees) this owner
+	// retains - the set W15 can print paper cards for - plus subjects whose grants we hold.
+	recovery_grants: { minted: MintedGrant[]; held: string[] };
 	// W5 (§9.3 step 4): open trustee re-splits after an unfriend, streamed live.
 	resplits: ResplitStatus[];
 	// §9.3.4: re-splits detected on unfriend but awaiting the user's prompt to start.
@@ -14,6 +17,15 @@ export interface StatusSnapshot {
 	reachability: string;
 	relay_networks: number;
 	relay_diversity_warning: boolean;
+}
+
+/** One owned recovery set's minted grant surface (W3): which trustees hold a share and
+ *  the announce-ref freshness the maintenance loop keeps current. */
+export interface MintedGrant {
+	rsid: number;
+	subject: string;
+	trustees: { user: string; delivered: boolean }[];
+	refs: { vid: string; epoch: number }[];
 }
 
 /** One remaining friend's role + live reachability in a re-split (§9.3 step 4). */

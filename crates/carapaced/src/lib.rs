@@ -4735,6 +4735,21 @@ impl Daemon {
             .collect()
     }
 
+    /// W15 (§8, §10.2): render the printable paper cards for one owned recovery set -
+    /// one page per share, recoverable from the words alone, offline, with no Carapace
+    /// software (the §10.2 backstop that never goes offline). Pulls the shares this owner
+    /// already retains for `rsid` from the same `granted` map the maintenance loop
+    /// re-signs from; no regeneration, no re-split, no change to the issued count. Errors
+    /// if no such recovery set is owned. Per-rsid when the owner holds several sets.
+    ///
+    /// SECURITY: the returned HTML embeds the share WORDS (a bearer secret). It is never
+    /// logged or persisted here - it is handed straight back over the loopback API to the
+    /// owner's own authenticated GUI, the same trust boundary as every recovery endpoint.
+    pub fn paper_cards(&self, rsid: u64) -> Result<String> {
+        let s = self.shared.read().expect("shared lock");
+        render_paper_cards(&s, rsid)
+    }
+
     /// Trustee-side: the full [`ShareGrant`] this daemon holds for `subject` (the owner
     /// whose secret was split), if any (§8, W3). Carries the co-trustee roster, the
     /// recovery delay, and the latest announce refs - what a ceremony needs.
@@ -5849,6 +5864,29 @@ fn online_within_window(last_seen: Option<u64>, now: u64) -> bool {
 /// set - and retire the old set's trackers. One-shot per re-split (guarded by
 /// [`OpenResplit::registered`]); the destroy-gate invariant is untouched (the old shares
 /// were already destroyed through [`Resplit::share_destroy`] to reach `Complete`).
+/// W15 (§8, §10.2): render one owned recovery set's retained shares as printable paper
+/// cards (one page per share) via `chela_share`. Free function over [`Shared`] so it is
+/// unit-testable without a live daemon, mirroring [`Daemon::paper_cards`]. Errors if the
+/// set is unknown or (defensively) holds no shares.
+fn render_paper_cards(s: &Shared, rsid: u64) -> Result<String> {
+    let g = s
+        .granted
+        .get(&rsid)
+        .with_context(|| format!("no owned recovery set {rsid} to print paper cards for"))?;
+    let shares: Vec<Share> = g.trustees.iter().map(|t| t.share.clone()).collect();
+    ensure!(
+        !shares.is_empty(),
+        "recovery set {rsid} has no retained shares to print"
+    );
+    let label = format!("Carapace recovery set {:04X}", rsid & 0x7FF);
+    let meta = chela_share::BackupMeta {
+        backup_name: Some(&label),
+        description: None,
+        shareholder_names: None,
+    };
+    Ok(chela_share::render_paper_html(&shares, &meta))
+}
+
 fn register_completed_resplit(s: &mut Shared, old_rsid: u64) {
     // Snapshot the registration data and mark it done, dropping the `&mut o` borrow before
     // mutating the sibling maps (`granted`/`share_sets`/`split_states`).
@@ -7262,6 +7300,39 @@ mod tests {
                 refs: vec![],
             },
         )
+    }
+
+    // W15 (§8, §10.2): the paper-card backstop renders one printable page per retained
+    // share of an owned set, and refuses an unknown set.
+    #[test]
+    fn w15_paper_cards_render_one_card_per_share() {
+        let a = kp(0x71);
+        let b = kp(0x72);
+        let c = kp(0x73);
+        let (rsid, og) = granted_set(&[0x44; 32], 2, &[&a, &b, &c]);
+        let mut s = Shared::default();
+        s.granted.insert(rsid, og);
+
+        let html = render_paper_cards(&s, rsid).unwrap();
+        assert!(
+            html.starts_with("<!DOCTYPE html>"),
+            "printable HTML document"
+        );
+        // One printable page per retained share (3 trustees -> 3 cards).
+        assert_eq!(
+            html.matches("<article class=\"share-page\">").count(),
+            3,
+            "one card per retained share"
+        );
+        // Each retained share's own words + card code survive onto its printed page.
+        for t in &s.granted[&rsid].trustees {
+            let card = chela_share::format_share(&t.share);
+            assert!(html.contains(card.trim()), "share words present on a card");
+        }
+
+        // An unknown recovery set errors rather than rendering an empty document.
+        let err = render_paper_cards(&s, rsid ^ 0x5A).unwrap_err();
+        assert!(err.to_string().contains("no owned recovery set"), "{err}");
     }
 
     // §9.3 steps 1-3 (local half): the teardown drops the ex-friend from the graph,

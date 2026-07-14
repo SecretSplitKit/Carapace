@@ -22,7 +22,7 @@ unit-tested but never wired to the daemon control stream or a background loop**
 | W12 | §11 filesystem watcher for Dropbox-like live sync | MAJOR | daemon | DONE |
 | W13 | IPv6 bind/verify (unverifiable — may already dual-stack) | MINOR | net | DONE (non-gap: iroh 1.0.2 dual-stacks) |
 | W14 | Default initial split N0 = M+1 when caller doesn't override (§12) | MINOR | recovery | DONE |
-| W15 | Paper-card export/print route + GUI action (§10.2 backstop) | MINOR | api, gui | TODO |
+| W15 | Paper-card export/print route + GUI action (§10.2 backstop) | MINOR | api, gui | DONE |
 
 No-action (spec-deferred per §13): shared multi-writer vaults, iroh-docs revisit,
 erasure-coded cold tier, K_root at-rest policy.
