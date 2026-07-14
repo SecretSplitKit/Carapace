@@ -281,3 +281,17 @@ fn gather_chunks(store: &impl ChunkStore, manifest: &Manifest) -> Result<Vec<Chu
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // §9.3 W5: a member with a `Health::Unfriended` signal is dropped by `repair`
+    // regardless of the grace window (the fast-path the daemon's repair relies on to
+    // treat an unfriended peer as confirmed-lost NOW, with no 24 h grace).
+    #[test]
+    fn unfriended_health_is_lost_before_grace() {
+        assert!(Health::Unfriended.is_lost(0, DEFAULT_GRACE_SECS));
+        assert!(!Health::Unfriended.serves_reads());
+    }
+}

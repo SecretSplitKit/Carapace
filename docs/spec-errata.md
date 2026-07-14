@@ -346,3 +346,70 @@ local first_seen)+recovery_delay` elapsed AND no abort) replies with its `Ceremo
 HPKE-sealed to `ceremony_enc`; otherwise it replies with nothing. The spec prose is
 unaffected (it does not prescribe the grant's signer); this is an implementation
 reconciliation between the W3 grant format and the ceremony primitives.
+
+## Note — W13 IPv6 bind is a non-gap: iroh 1.0.2 is dual-stack by construction (§6)
+
+W13 asks that a node be reachable over IPv6. `CarapaceEndpoint::bind_on` hands its
+caller-chosen `SocketAddr` straight to iroh's `Endpoint::builder(...).bind_addr(bind)`
+(`crates/carapace-net/src/endpoint.rs`), and the `--bind` CLI flag parses its value with
+`str::parse::<SocketAddr>` - which accepts `[::]:port` and `[::1]:port` - so an IPv6 bind
+already flows through unmodified. The question was whether iroh actually binds an IPv6
+socket.
+
+It does, in **both** directions, because iroh 1.0.2's builder is dual-stack by default:
+
+- `Builder::empty()` (the base every preset, including `presets::Minimal`, is built on)
+  pre-loads *two* IP transports:
+  `TransportConfig::default_ipv4()` (bind `0.0.0.0:0`, `is_required: true`) and
+  `TransportConfig::default_ipv6()` (bind `[::]:0`, `is_required: false`).
+  Evidence: `iroh-1.0.2/src/endpoint.rs:341-346` (`empty()`), and
+  `iroh-1.0.2/src/socket/transports.rs:123-153` (`default_ipv4`/`default_ipv6`).
+- `bind_addr(addr)` does **not** clear the whole transport list; it only pushes a
+  user-defined transport for `addr`'s address family. The resolver in
+  `Transports::bind` (`iroh-1.0.2/src/socket/transports.rs:190-221`) drops a
+  pre-configured default *only* when a user-defined default of the **same family**
+  exists (`has_ipv4_default` / `has_ipv6_default`). Evidence: the skip guard
+  `!is_user_defined && (is_ipv4 && has_ipv4_default || is_ipv6 && has_ipv6_default)`.
+
+Consequences:
+
+- Passing an **IPv4** bind (carapace's default `0.0.0.0:port` / loopback) replaces only
+  the IPv4 default; the pre-configured `[::]:0` IPv6 socket is still bound (its
+  `is_required: false` means it degrades gracefully to silent skip on hosts without IPv6,
+  rather than failing the endpoint). The node is IPv6-reachable regardless.
+- Passing an **IPv6** bind (`[::]:port`) replaces the IPv6 default and keeps the
+  `0.0.0.0:0` IPv4 default - full dual-stack, IPv6-preferred.
+
+**Resolution: W13 is a non-gap; no behavior change.** The dual-stack guarantee is pinned
+by a unit test, `carapace_net::endpoint::tests::binds_ipv6`
+(`crates/carapace-net/src/endpoint.rs`), which binds `[::1]:0` through `bind_on` and
+asserts an IPv6 socket appears in `Endpoint::bound_sockets()`.
+
+## Note — W5 §9.3.4 re-split is auto-started, not user-picked (deliberate deviation)
+
+§9.3.4 says the client MUST **prompt** the user to re-split when an unfriended party was a
+trustee, and frames the new trustee set as a **user choice** (§9.3.3(a)). Carapace instead
+**auto-starts** the re-split: `Daemon::unfriend` records a pending re-split for every
+recovery set the ex-friend was a trustee of, and `build_resplit` auto-selects the new set
+as **the old set minus the ex-friend** (threshold unchanged, slack 1 where there is room).
+The maintenance loop then drives it to completion under the destroy gate.
+
+This is deliberate, and the consent is not silent: the GUI's unfriend action is itself a
+two-step confirm (`FriendsView.svelte`), and on success it raises a prominent "Re-split
+required" panel naming the affected recovery sets and pointing at the Recovery view, where
+`/api/recovery/{rsid}/resplit-status` (and the aggregate `/api/status` `resplits` feed)
+report live per-friend progress. The user is therefore prompted before the unfriend and
+informed that a re-split is running, but does **not** hand-pick the new trustee set — the
+old-honest-set default is used so the re-split can proceed unattended without stranding the
+secret. Recruiting a fresh trustee set is a subsequent **manual** re-split
+(`/api/recovery/resplit`). The destroy-gating invariant is unaffected either way: the old
+shares are destroyed only once the new set is proven live (`≥ M + slack`), routed solely
+through `Resplit::share_destroy`.
+
+The trustee-side receiver of that destroy (§9.3 step 3c) binds the instruction to the
+share's owner: `ControlHandler::serve_share_destroy` requires the signer node to map to the
+**subject** owner (`owner_user_of_node(ds.by) == ds.subject`) AND the named `rsid` to be one
+held **for that subject** (`held_share_subjects`), so no current friend can destroy an
+unrelated owner's share by naming its rsid. The `FriendshipEnd` receiver likewise honors an
+end only when it names **us** (`end.user == self_user`) and rides the signer's own
+connection (`end.by == remote`). Regression coverage: `crates/carapaced/tests/unfriend.rs`.

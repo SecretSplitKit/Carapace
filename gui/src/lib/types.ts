@@ -7,9 +7,44 @@ export interface StatusSnapshot {
 	friends: { count: number; list: string[] };
 	vaults: { published: PublishedVault[]; held_replicas: string[] };
 	share_health: { recovery_sets_owned: number; shares_held: number };
+	// W5 (§9.3 step 4): open trustee re-splits after an unfriend, streamed live.
+	resplits: ResplitStatus[];
 	reachability: string;
 	relay_networks: number;
 	relay_diversity_warning: boolean;
+}
+
+/** One remaining friend's role + live reachability in a re-split (§9.3 step 4). */
+export interface ResplitFriend {
+	node: string;
+	/** 'new' gets a fresh share; 'old' gets a destroy instruction. */
+	role: 'new' | 'old';
+	online: boolean;
+	done: boolean;
+	/** 'done' | 'online' (reachable, step pending) | 'will_queue' (offline, queued). */
+	status: 'done' | 'online' | 'will_queue';
+}
+
+/** The §9.3 step-4 re-split surface for one unfriended trustee's recovery set. */
+export interface ResplitStatus {
+	old_rsid: number;
+	new_rsid: number;
+	ex_trustee: string;
+	/** 'awaiting_new_set' | 'ready_to_destroy' | 'complete'. */
+	phase: 'awaiting_new_set' | 'ready_to_destroy' | 'complete';
+	new_attested: number;
+	new_total: number;
+	/** True once the new set reached M+slack attestations (the destroy gate). */
+	new_set_live: boolean;
+	old_destroyed: number;
+	old_total: number;
+	remaining: ResplitFriend[];
+}
+
+export interface UnfriendResult {
+	was_friend: boolean;
+	resplit_triggered: boolean;
+	recovery_set_ids: number[];
 }
 
 export interface PublishedVault {
@@ -63,15 +98,18 @@ export interface ExtendResult {
 
 export interface CeremonyOpenResult {
 	ceremony_id: string;
-	phase: string;
+	open_hex: string;
+	fanout_reached: number;
 }
 
 export interface CeremonyApproveResult {
-	approvals: number;
+	approve_hex: string;
+	broadcast_reached: number;
 }
 
 export interface CeremonyAbortResult {
 	abort_hex: string;
+	broadcast_reached: number;
 }
 
 /** A shell-integrity plate (ShellHero.svelte). */

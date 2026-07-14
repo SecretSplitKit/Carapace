@@ -15,7 +15,9 @@ import type {
 	SplitResult,
 	StatusSnapshot,
 	Ticket,
-	RecoveryScope
+	RecoveryScope,
+	ResplitStatus,
+	UnfriendResult
 } from './types';
 
 /** Everything talks to the same origin the GUI was served from. */
@@ -99,6 +101,9 @@ export const api = {
 	issueTicket: () => post<Ticket>('/api/friends/ticket'),
 	addFriend: (ticket_hex: string, addrs?: string[], grant_bytes?: number) =>
 		post<AddFriendResult>('/api/friends', { ticket_hex, addrs, grant_bytes }),
+	unfriend: (user_pubkey: string) =>
+		post<UnfriendResult>(`/api/friends/${user_pubkey}/unfriend`),
+	resplitStatus: (rsid: number) => get<ResplitStatus>(`/api/recovery/${rsid}/resplit-status`),
 
 	recoverySplit: (
 		rsid: number,
@@ -117,10 +122,15 @@ export const api = {
 	recoveryExtend: (rsid: number, count: number, allow_over_cap?: boolean) =>
 		post<ExtendResult>('/api/recovery/extend', { rsid, count, allow_over_cap }),
 
-	ceremonyOpen: (open_hex: string, grant_hex: string) =>
-		post<CeremonyOpenResult>('/api/recovery/ceremony/open', { open_hex, grant_hex }),
-	ceremonyApprove: (approve_hex: string) =>
-		post<CeremonyApproveResult>('/api/recovery/ceremony/approve', { approve_hex }),
+	ceremonyOpen: (req: {
+		subject: string;
+		claimant_display: string;
+		ceremony_enc: string;
+		new_node: string;
+		reason: string;
+	}) => post<CeremonyOpenResult>('/api/recovery/ceremony/open', req),
+	ceremonyApprove: (ceremony_id: string) =>
+		post<CeremonyApproveResult>('/api/recovery/ceremony/approve', { ceremony_id }),
 	ceremonyAbort: (ceremony_id: string) =>
 		post<CeremonyAbortResult>('/api/recovery/ceremony/abort', { ceremony_id })
 };

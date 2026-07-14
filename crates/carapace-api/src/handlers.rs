@@ -16,7 +16,7 @@ use axum::{
 };
 use carapace_wire::messages::Message as _;
 use carapace_wire::{FileGrant, InviteTicket};
-use carapaced::{Daemon, RecoveryScope};
+use carapaced::{Daemon, RecoveryScope, ResplitStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -243,9 +243,36 @@ fn status_snapshot(d: &Daemon) -> Value {
         "recovery_grants": { "minted": grants, "held": held_grants },
         // W2 (§8.5): live recovery ceremonies + the anti-silent-takeover alarm.
         "ceremonies": ceremony_rows(d),
+        // W5 (§9.3 step 4): open trustee re-splits after an unfriend, with the live
+        // reachability of the remaining friends who get the new share / destroy step.
+        "resplits": d.resplit_statuses().iter().map(resplit_json).collect::<Vec<_>>(),
         "reachability": if relay_url.is_some() { "relay" } else { "direct" },
         "relay_networks": relay_networks,
         "relay_diversity_warning": relay_networks < 2,
+    })
+}
+
+/// One re-split's §9.3 step-4 prompt surface as JSON: phase, new-set liveness gate,
+/// old-set destroy progress, and each remaining friend's online/queued status.
+fn resplit_json(rs: &ResplitStatus) -> Value {
+    json!({
+        "old_rsid": rs.old_rsid,
+        "new_rsid": rs.new_rsid,
+        "ex_trustee": hexs(&rs.ex_trustee),
+        "phase": rs.phase,
+        // New set going live is the destroy gate (>= M + slack attested).
+        "new_attested": rs.new_attested,
+        "new_total": rs.new_total,
+        "new_set_live": rs.new_live,
+        "old_destroyed": rs.old_destroyed,
+        "old_total": rs.old_total,
+        "remaining": rs.remaining.iter().map(|f| json!({
+            "node": hexs(&f.node),
+            "role": f.role,
+            "online": f.online,
+            "done": f.done,
+            "status": if f.done { "done" } else if f.online { "online" } else { "will_queue" },
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -336,6 +363,41 @@ pub async fn add_friend(
 pub async fn list_friends(State(st): State<AppState>) -> Json<Value> {
     let list: Vec<String> = st.daemon.friend_ids().iter().map(|f| hexs(f)).collect();
     Json(json!({ "count": list.len(), "list": list }))
+}
+
+/// `POST /api/friends/{user_pubkey}/unfriend`: terminate a friendship (§9.3). Runs the
+/// full flow - `FriendshipEnd` + `DeleteRequest`s, delete-what-we-hold, re-place their
+/// replicas, and (if they were a trustee) begin a re-split - and reports whether a
+/// re-split was triggered plus the recovery-set ids so the GUI can raise the §9.3
+/// step-4 prompt and poll `/api/recovery/{rsid}/resplit-status`.
+pub async fn unfriend(
+    Path(user_hex): Path<String>,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let user = parse_hex32(&user_hex)?;
+    let outcome = st.daemon.unfriend(user).await?;
+    Ok(Json(json!({
+        "was_friend": outcome.was_friend,
+        "resplit_triggered": !outcome.resplit_rsids.is_empty(),
+        "recovery_set_ids": outcome.resplit_rsids,
+    })))
+}
+
+/// `GET /api/recovery/{rsid}/resplit-status`: the §9.3 step-4 re-split prompt surface for
+/// one open re-split (keyed by the old recovery-set id): phase, new-set attested count
+/// vs the destroy gate, old-set destroy-ack count, and each remaining friend's
+/// online/queued status. 404 if no re-split is tracked for that id.
+pub async fn resplit_status(
+    Path(rsid): Path<u64>,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    match st.daemon.resplit_status(rsid) {
+        Some(rs) => Ok(Json(resplit_json(&rs))),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no open re-split for recovery set {rsid}"),
+        )),
+    }
 }
 
 // ---- replicas ----------------------------------------------------------

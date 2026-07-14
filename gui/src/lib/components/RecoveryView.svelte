@@ -22,18 +22,36 @@
 	let extending = $state(false);
 	let extendShares = $state<string[] | null>(null);
 
-	let openHex = $state('');
-	let grantHex = $state('');
+	let subject = $state('');
+	let claimantDisplay = $state('');
+	let ceremonyEnc = $state('');
+	let newNode = $state('');
+	let reason = $state('');
 	let opening = $state(false);
-	let openResult = $state<{ ceremony_id: string; phase: string } | null>(null);
+	let openResult = $state<{ ceremony_id: string; open_hex: string; fanout_reached: number } | null>(
+		null
+	);
 
-	let approveHex = $state('');
+	let approveId = $state('');
 	let approving = $state(false);
-	let approveResult = $state<number | null>(null);
+	let approveResult = $state<{ approve_hex: string; broadcast_reached: number } | null>(null);
 
 	let abortId = $state('');
 	let aborting = $state(false);
 	let abortHex = $state<string | null>(null);
+
+	function phaseLabel(phase: string): string {
+		switch (phase) {
+			case 'awaiting_new_set':
+				return 'Standing up new set';
+			case 'ready_to_destroy':
+				return 'New set live - destroying old shares';
+			case 'complete':
+				return 'Complete';
+			default:
+				return phase;
+		}
+	}
 
 	async function copy(text: string, mark: (v: boolean) => void) {
 		if (await copyToClipboard(text)) {
@@ -75,7 +93,13 @@
 		opening = true;
 		openResult = null;
 		try {
-			openResult = await api.ceremonyOpen(openHex.trim(), grantHex.trim());
+			openResult = await api.ceremonyOpen({
+				subject: subject.trim(),
+				claimant_display: claimantDisplay.trim(),
+				ceremony_enc: ceremonyEnc.trim(),
+				new_node: newNode.trim(),
+				reason: reason.trim()
+			});
 		} finally {
 			opening = false;
 		}
@@ -85,7 +109,7 @@
 		approving = true;
 		approveResult = null;
 		try {
-			approveResult = (await api.ceremonyApprove(approveHex.trim())).approvals;
+			approveResult = await api.ceremonyApprove(approveId.trim());
 		} finally {
 			approving = false;
 		}
@@ -102,6 +126,8 @@
 	}
 
 	let sharesCopied = $state<Record<number, boolean>>({});
+	let openHexCopied = $state(false);
+	let approveHexCopied = $state(false);
 </script>
 
 <section>
@@ -120,6 +146,57 @@
 				{$status.share_health.shares_held} share(s) held here in trust for others
 			</p>
 		</div>
+	{/if}
+
+	{#if $status?.resplits?.length}
+		<h2 style="margin-top: 1.5rem">Trustee re-splits in progress</h2>
+		<p class="muted" style="font-size: var(--step--1)">
+			An unfriended trustee's share is being neutralized (§9.3 step 4). Both the old and new
+			recovery sets stay usable until the new set is live <em>and</em> the old shares are destroyed -
+			neither door closes early.
+		</p>
+		{#each $status.resplits as rs (rs.old_rsid)}
+			<div class="card resplit" style="margin-top: 1rem">
+				<div class="resplit-head">
+					<span class="mono">rsid {rs.old_rsid} → {rs.new_rsid}</span>
+					<span class="phase {rs.phase}">{phaseLabel(rs.phase)}</span>
+				</div>
+				<p class="muted" style="font-size: var(--step--1)">
+					ex-trustee {rs.ex_trustee.slice(0, 12)}…
+				</p>
+
+				<div class="gauges">
+					<div>
+						<div class="label muted">New set attested (destroy gate: M + slack)</div>
+						<p class="mono">
+							{rs.new_attested} / {rs.new_total}
+							{#if rs.new_set_live}<span class="healthy">· live</span>{:else}<span class="at-risk">· not live yet</span>{/if}
+						</p>
+					</div>
+					<div>
+						<div class="label muted">Old shares destroyed (ack)</div>
+						<p class="mono">
+							{rs.old_destroyed} / {rs.old_total}
+							{#if !rs.new_set_live}<span class="muted">· destroy refused until new set is live</span>{/if}
+						</p>
+					</div>
+				</div>
+
+				<div class="label muted" style="margin-top: 0.75rem">Remaining friends - live reachability</div>
+				<div class="reach">
+					{#each rs.remaining as fr (fr.node)}
+						<div class="reach-row">
+							<span class="dot {fr.status}" title={fr.status}></span>
+							<code class="mono">{fr.node.slice(0, 12)}…</code>
+							<span class="role {fr.role}">{fr.role === 'new' ? 'gets new share' : 'gets destroy step'}</span>
+							<span class="muted">
+								{#if fr.done}done{:else if fr.online}online - {fr.role === 'new' ? 'sending share' : 'sending destroy'}{:else}offline - queued{/if}
+							</span>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/each}
 	{/if}
 
 	{#if Object.keys($notes.recoverySets).length > 0}
@@ -226,24 +303,43 @@
 	</p>
 	<div class="grid">
 		<form class="card" onsubmit={(e) => (e.preventDefault(), runOpen())}>
-			<h3>Open</h3>
-			<label for="open-hex" class="muted">Recovery open (hex)</label>
-			<input id="open-hex" bind:value={openHex} />
-			<label for="grant-hex" class="muted">Share grant (hex)</label>
-			<input id="grant-hex" bind:value={grantHex} />
-			<button class="primary" type="submit" disabled={opening}>{opening ? 'Opening…' : 'Track ceremony'}</button>
+			<h3>Open (sponsor)</h3>
+			<label for="c-subject" class="muted">Subject user pubkey (hex) - you must hold their grant</label>
+			<input id="c-subject" bind:value={subject} />
+			<label for="c-display" class="muted">Claimant display name</label>
+			<input id="c-display" bind:value={claimantDisplay} />
+			<label for="c-enc" class="muted">Claimant ceremony pubkey (hex X25519)</label>
+			<input id="c-enc" bind:value={ceremonyEnc} />
+			<label for="c-node" class="muted">Claimant new device node id (hex)</label>
+			<input id="c-node" bind:value={newNode} />
+			<label for="c-reason" class="muted">Reason</label>
+			<input id="c-reason" bind:value={reason} />
+			<button class="primary" type="submit" disabled={opening}>{opening ? 'Opening…' : 'Open ceremony'}</button>
 			{#if openResult}
-				<p class="mono">id {openResult.ceremony_id.slice(0, 12)}… · phase <strong>{openResult.phase}</strong></p>
+				<p class="mono">id {openResult.ceremony_id.slice(0, 12)}… · fanned out to {openResult.fanout_reached} peer(s)</p>
+				<div class="label muted">Signed open - hand to the claimant</div>
+				<div class="share-row">
+					<code class="mono share-text">{openResult.open_hex}</code>
+					<button type="button" onclick={() => copy(openResult!.open_hex, (v) => (openHexCopied = v))}>
+						{openHexCopied ? 'Copied' : 'Copy'}
+					</button>
+				</div>
 			{/if}
 		</form>
 
 		<form class="card" onsubmit={(e) => (e.preventDefault(), runApprove())}>
 			<h3>Approve</h3>
-			<label for="approve-hex" class="muted">Ceremony approve (hex)</label>
-			<input id="approve-hex" bind:value={approveHex} />
+			<label for="approve-id" class="muted">Ceremony id (hex)</label>
+			<input id="approve-id" bind:value={approveId} />
 			<button class="primary" type="submit" disabled={approving}>{approving ? 'Recording…' : 'Record approval'}</button>
-			{#if approveResult !== null}
-				<p class="healthy">{approveResult} approval(s) recorded so far.</p>
+			{#if approveResult}
+				<p class="healthy">Approval broadcast to {approveResult.broadcast_reached} co-trustee(s).</p>
+				<div class="share-row">
+					<code class="mono share-text">{approveResult.approve_hex}</code>
+					<button type="button" onclick={() => copy(approveResult!.approve_hex, (v) => (approveHexCopied = v))}>
+						{approveHexCopied ? 'Copied' : 'Copy'}
+					</button>
+				</div>
 			{/if}
 		</form>
 
@@ -318,5 +414,76 @@
 	.grid input {
 		width: 100%;
 		margin-bottom: 0.5rem;
+	}
+
+	.resplit-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 1rem;
+		flex-wrap: wrap;
+	}
+
+	.phase {
+		font-size: var(--step--1);
+		padding: 0.2em 0.6em;
+		border-radius: 999px;
+		border: 1px solid var(--hairline);
+	}
+
+	.phase.complete {
+		color: var(--verdigris);
+		border-color: var(--verdigris);
+	}
+
+	.phase.ready_to_destroy {
+		color: var(--bronze-strong);
+		border-color: var(--bronze);
+	}
+
+	.gauges {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+		gap: 1rem;
+		margin-top: 0.75rem;
+	}
+
+	.reach {
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+		margin-top: 0.4rem;
+	}
+
+	.reach-row {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		flex-wrap: wrap;
+	}
+
+	.dot {
+		width: 0.6rem;
+		height: 0.6rem;
+		border-radius: 50%;
+		flex: none;
+		background: var(--muted);
+	}
+
+	.dot.done {
+		background: var(--verdigris);
+	}
+
+	.dot.online {
+		background: var(--bronze);
+	}
+
+	.dot.will_queue {
+		background: var(--muted);
+	}
+
+	.role {
+		font-size: var(--step--1);
+		color: var(--muted);
 	}
 </style>

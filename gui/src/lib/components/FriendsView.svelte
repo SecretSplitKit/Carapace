@@ -18,6 +18,11 @@
 	let addResult = $state<string | null>(null);
 	let uriCopied = $state(false);
 
+	// Per-friend unfriend (§9.3): two-step confirm, then POST the unfriend endpoint.
+	let confirming = $state<string | null>(null);
+	let removing = $state<string | null>(null);
+	let unfriendNote = $state<{ friend: string; resplit: boolean; rsids: number[] } | null>(null);
+
 	async function refresh() {
 		loading = true;
 		const res = await api.listFriends().catch(() => ({ count: 0, list: [] }));
@@ -68,6 +73,20 @@
 			adding = false;
 		}
 	}
+
+	async function unfriend(f: string) {
+		removing = f;
+		try {
+			const res = await api.unfriend(f);
+			confirming = null;
+			if (res.was_friend) {
+				unfriendNote = { friend: f, resplit: res.resplit_triggered, rsids: res.recovery_set_ids };
+			}
+			await refresh();
+		} finally {
+			removing = null;
+		}
+	}
 </script>
 
 <section>
@@ -113,6 +132,25 @@
 		</div>
 	</div>
 
+	{#if unfriendNote}
+		<div class="card {unfriendNote.resplit ? 'at-risk' : 'healthy'}" style="margin-top: 1.5rem">
+			{#if unfriendNote.resplit}
+				<h3>Re-split required</h3>
+				<p>
+					{unfriendNote.friend.slice(0, 12)}… was a trustee. A trustee re-split is now running for
+					recovery set{unfriendNote.rsids.length > 1 ? 's' : ''}
+					{unfriendNote.rsids.join(', ')}. Both the old and new sets stay usable until the new set is
+					live and the old shares are destroyed - track it under
+					<strong>Recovery &amp; trustees</strong>.
+				</p>
+			{:else}
+				<p>{unfriendNote.friend.slice(0, 12)}… removed. They held no recovery shares, so no re-split
+					was needed.</p>
+			{/if}
+			<button type="button" onclick={() => (unfriendNote = null)}>Dismiss</button>
+		</div>
+	{/if}
+
 	<h2 style="margin-top: 2rem">Your friends</h2>
 	{#if loading}
 		<p class="muted">Loading…</p>
@@ -130,6 +168,24 @@
 							storage limit not recorded here
 						{/if}
 					</span>
+					{#if confirming === f}
+						<span class="confirm">
+							<span class="muted">Remove this friend?</span>
+							<button
+								class="danger"
+								type="button"
+								disabled={removing === f}
+								onclick={() => unfriend(f)}
+							>
+								{removing === f ? 'Removing…' : 'Confirm unfriend'}
+							</button>
+							<button type="button" disabled={removing === f} onclick={() => (confirming = null)}>
+								Cancel
+							</button>
+						</span>
+					{:else}
+						<button type="button" onclick={() => (confirming = f)}>Unfriend</button>
+					{/if}
 				</div>
 			{/each}
 		</div>
@@ -184,5 +240,22 @@
 		align-items: center;
 		flex-wrap: wrap;
 		gap: 0.5rem;
+	}
+
+	.confirm {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	button.danger {
+		border-color: var(--coral);
+		color: var(--coral);
+	}
+
+	button.danger:hover {
+		background: var(--coral);
+		color: var(--ink);
 	}
 </style>
