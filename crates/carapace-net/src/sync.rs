@@ -141,6 +141,13 @@ impl DocStore {
         self.cards.get(signer)
     }
 
+    /// Every newest-per-signer card the store holds. Used by anti-entropy
+    /// store-and-forward (§6): a node re-serves the third-party cards it learned so
+    /// an owner's document reaches a friend-of-a-friend across the friendship graph.
+    pub fn cards(&self) -> impl Iterator<Item = &ContactCard> {
+        self.cards.values()
+    }
+
     /// The newest announce seen for `vid` (from any signer).
     pub fn announce_for_vid(&self, vid: &[u8; 32]) -> Option<&VaultAnnounce> {
         self.announces.values().find(|a| &a.vid == vid)

@@ -159,6 +159,22 @@ impl AttestTracker {
         Ok(())
     }
 
+    /// The enrolled trustee signing-keys (= their dialable node ids) the owner
+    /// challenges each round (§10.2). The daemon's maintenance loop resolves these to
+    /// addresses to run [`crate::AttestTracker`]-driven attestation rounds.
+    #[must_use]
+    pub fn trustees(&self) -> Vec<[u8; 32]> {
+        self.roster.keys().copied().collect()
+    }
+
+    /// The `M + slack` attested-live target the §10.2 invariant requires. Surfaced on
+    /// the status API alongside [`AttestTracker::live_count`] so the operator sees the
+    /// margin, not just the pass/fail verdict.
+    #[must_use]
+    pub fn target(&self) -> usize {
+        usize::from(self.m) + usize::from(self.slack)
+    }
+
     /// The number of distinct enrolled shares whose most recent verified attestation
     /// is within the freshness window at `now`. A share silent longer than the window
     /// (or never heard from) is not counted live (§10.2).

@@ -194,6 +194,21 @@ fn status_snapshot(d: &Daemon) -> Value {
         .collect();
     let held: Vec<String> = d.held_replica_vids().iter().map(|v| hexs(v)).collect();
     let (sets, shares) = d.share_health_counts();
+    // W4 (§10.2): per owned recovery set, the attested-live count, target, and drift
+    // recommendation (healthy / extend / resplit) the maintenance loop keeps current.
+    let recovery: Vec<Value> = d
+        .recovery_health()
+        .iter()
+        .map(|r| {
+            json!({
+                "rsid": r.rsid,
+                "live": r.live,
+                "target": r.target,
+                "recommendation": r.recommendation,
+                "needed": r.needed,
+            })
+        })
+        .collect();
     let relay_url = d.advertised_relay_url();
     // W4 (§6 MUST): warn when the usable relay set spans fewer than 2 distinct
     // networks - a single relay is a single point of failure and metadata choke.
@@ -204,7 +219,7 @@ fn status_snapshot(d: &Daemon) -> Value {
         "relay_url": relay_url,
         "friends": { "count": friends.len(), "list": friends },
         "vaults": { "published": vaults, "held_replicas": held },
-        "share_health": { "recovery_sets_owned": sets, "shares_held": shares },
+        "share_health": { "recovery_sets_owned": sets, "shares_held": shares, "recovery": recovery },
         "reachability": if relay_url.is_some() { "relay" } else { "direct" },
         "relay_networks": relay_networks,
         "relay_diversity_warning": relay_networks < 2,

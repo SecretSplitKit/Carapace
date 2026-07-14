@@ -27,7 +27,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use carapaced::Daemon;
+use carapaced::{Daemon, MaintenanceConfig, MaintenanceHandle};
 
 /// Shared handler state: the daemon and the per-session token.
 #[derive(Clone)]
@@ -45,6 +45,8 @@ pub struct ApiServer {
     /// The actual bound loopback address (the port is concrete even if 0 was asked).
     pub local_addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
+    /// The daemon's background maintenance loop (§10.1/§10.2), torn down with the API.
+    _maintenance: MaintenanceHandle,
 }
 
 impl ApiServer {
@@ -192,6 +194,12 @@ pub async fn serve(daemon: Arc<Daemon>, state_dir: &Path, port: u16) -> Result<A
     let url_path = state_dir.join("api-url");
     std::fs::write(&url_path, &url).with_context(|| format!("write {url_path:?}"))?;
 
+    // Start the daemon's background maintenance loop (§10.1 PoR+repair, §10.2
+    // attestation cadence + self-validation + drift) alongside the API. The API is
+    // the production entry point that already holds an `Arc<Daemon>`; the loop holds
+    // only a `Weak` and is torn down when this `ApiServer` drops.
+    let maintenance = Arc::clone(&daemon).run_maintenance(MaintenanceConfig::default());
+
     let state = AppState {
         daemon,
         token: Arc::from(token.as_str()),
@@ -208,6 +216,7 @@ pub async fn serve(daemon: Arc<Daemon>, state_dir: &Path, port: u16) -> Result<A
         token,
         local_addr,
         handle,
+        _maintenance: maintenance,
     })
 }
 

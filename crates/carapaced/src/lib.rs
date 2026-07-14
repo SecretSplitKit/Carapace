@@ -45,8 +45,9 @@ use carapace_recovery::{
 };
 use carapace_replica::{
     build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
-    Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
-    DEFAULT_RATE_REFILL_PER_SEC, MAX_REPLICA_BLOBS,
+    Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_POR_FAIL_LIMIT, DEFAULT_POR_INTERVAL_SECS,
+    DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY, DEFAULT_RATE_REFILL_PER_SEC, DEFAULT_WIDE_EVERY,
+    MAX_REPLICA_BLOBS,
 };
 use carapace_share::{
     answer_attest_challenge, build_attest_challenge, AttestTracker, Share, ShareAction,
@@ -70,7 +71,7 @@ use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -144,6 +145,65 @@ pub struct NetConfig {
     /// public DNS name or WAN address). Ignored when `run_relay` is `None`;
     /// falls back to the relay's bound address.
     pub relay_host: Option<String>,
+}
+
+/// Cadence knobs for the background maintenance loop ([`Daemon::run_maintenance`],
+/// §10.1/§10.2). Small values are injectable for bounded tests; the defaults are the
+/// production cadences. Each per-concern schedule (per-replica PoR jitter, daily
+/// attestation, continuous self-validation) is owned by its own injected-clock
+/// tracker, so the loop only needs a wake `tick` plus the PoR interval it stamps onto
+/// the audit schedule when it starts.
+#[derive(Clone, Copy, Debug)]
+pub struct MaintenanceConfig {
+    /// How often the loop wakes and runs one [`Daemon::maintenance_round`]. Each
+    /// tracker self-gates on its own cadence, so a tick finds most work not-yet-due
+    /// and is cheap; it need only be at least as frequent as the shortest cadence.
+    pub tick: Duration,
+    /// PoR retention-audit interval for owned vaults' replicas (§10.1), per-replica
+    /// jittered by the audit scheduler. Stamped onto the audit tracker when the loop
+    /// starts. Default: 6 h.
+    pub por_interval: Duration,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            // A minute is well under the shortest production cadence (hourly
+            // self-validation) yet idle-cheap, since each round is a no-op when
+            // nothing is due.
+            tick: Duration::from_secs(60),
+            por_interval: Duration::from_secs(DEFAULT_POR_INTERVAL_SECS),
+        }
+    }
+}
+
+/// What one [`Daemon::maintenance_round`] did (§10.1/§10.2). Returned for logging and
+/// tests; the loop discards it.
+#[derive(Clone, Debug, Default)]
+pub struct MaintenanceReport {
+    /// Per owned vault, the PoR audit round that ran (§10.1).
+    pub por: Vec<([u8; 32], PorRound)>,
+    /// Per owned recovery set, the drift decision surfaced this round (§10.2).
+    pub drift: Vec<(u64, ShareAction)>,
+    /// Per held share, the trustee self-validation verdict this round (§10.2).
+    pub self_validated: Vec<(u64, ShareHealth)>,
+    /// Non-fatal per-item errors (one bad vault/set does not abort the round).
+    pub errors: Vec<String>,
+}
+
+/// The §10.2 share-health surface for one owned recovery set, for the status API.
+#[derive(Clone, Copy, Debug)]
+pub struct RecoveryHealthReport {
+    /// The recovery-set id.
+    pub rsid: u64,
+    /// Distinct shares attested live within the freshness window right now.
+    pub live: usize,
+    /// The `M + slack` live target the §10.2 invariant requires.
+    pub target: usize,
+    /// The recommended action: `"healthy"`, `"extend"`, or `"resplit"` (§10.2/§8.3).
+    pub recommendation: &'static str,
+    /// For `"extend"`, how many replacement shares to issue; `0` otherwise.
+    pub needed: usize,
 }
 
 /// The outcome of one PoR audit round over a vault's replicas ([`Daemon::por_audit_round`]).
@@ -264,6 +324,15 @@ struct Shared {
     replica_members: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// Owner-side deny-list of peer node ids this daemon refuses to place on (S4).
     replica_deny: HashSet<[u8; 32]>,
+    /// Last-known dialable address per peer node id, recorded whenever this daemon
+    /// dials a friend it befriended or a replica it placed (§6 "addresses are
+    /// hints"). The background maintenance loop (§10.1/§10.2) resolves the node ids
+    /// in `members`/`share_sets` to addresses through this map to re-audit replicas
+    /// and challenge trustees without a discovery round-trip, falling back to a
+    /// node-id-only `EndpointAddr` (relay/hole-punch resolution) when a peer is not
+    /// recorded here. ponytail: grows one entry per distinct dialed peer; prune
+    /// alongside an unfriend/teardown path when W5 adds one.
+    peer_addrs: HashMap<[u8; 32], EndpointAddr>,
     /// Per-peer token buckets limiting how much a friend can push into our replica
     /// store per unit time (W1). Configured from [`ReplicaLimits`] at start.
     rate: RateLimiter,
@@ -370,6 +439,12 @@ struct ControlHandler {
     /// a friend's card learned on the accept path teaches this node how to dial
     /// them back by node id via hole-punch/relay (§6).
     hints: PeerHints,
+    /// Shared with the owning [`Daemon`]: the rollback-guarded store of documents
+    /// learned from peers (W2). `serve_docs` re-serves the third-party cards +
+    /// announces here so an owner's `VaultAnnounce` reaches a friend-of-a-friend
+    /// (anti-entropy store-and-forward, §6), and consults the newest stored self-card
+    /// so a revoked own device presenting an old self-card is refused (W7).
+    docs: Arc<Mutex<DocStore>>,
 }
 
 impl ControlHandler {
@@ -407,6 +482,13 @@ impl ControlHandler {
 
     /// Serve the document set iff the presented card authorizes the connection's
     /// authenticated remote node id (W5). Unauthorized dialers get only the Hello.
+    ///
+    /// Beyond this node's own cards/announces/grants, an authorized friend also
+    /// receives the third-party cards + announces this node learned from other
+    /// friends (anti-entropy store-and-forward, §6/W7): an owner's `VaultAnnounce`
+    /// reaches a trustee through any mutual friend, and a returning node re-syncs the
+    /// graph from any one friend. The forwarded set is version/epoch deduped and
+    /// rollback-guarded per signer by the receiver's own [`DocStore`].
     async fn serve_docs(
         &self,
         card: &ContactCard,
@@ -416,12 +498,24 @@ impl ControlHandler {
         write_msg(send, &self.hello).await?;
 
         let now = unix_now();
+        // Snapshot the forwardable third-party docs + newest stored self-card under the
+        // docs lock FIRST, then take the shared lock — never nested, matching
+        // `sync_impl`'s docs-before-shared order (no lock held across an `.await`).
+        let (fwd_cards, fwd_announces, newest_self) = {
+            let d = self.docs.lock().expect("docs lock");
+            (
+                d.cards().cloned().collect::<Vec<_>>(),
+                d.announces().cloned().collect::<Vec<_>>(),
+                d.card(&self.self_user).cloned(),
+            )
+        };
+
         let (authorized, cards, announces, grants) = {
             // W5: classify the dialer against its authenticated remote node id. On
             // success, record the classification so the blob-read gate can bind this
             // node's later raw iroh-blobs fetches to a verified identity (§7.4/D3).
             let mut s = self.shared.write().expect("shared lock");
-            match classify_dialer(&s, &self.self_user, card, remote, now) {
+            match classify_dialer(&s, &self.self_user, card, remote, now, newest_self.as_ref()) {
                 Some(auth) => {
                     s.blob_auth.insert(*remote, auth);
                     (true, s.cards.clone(), s.announces.clone(), s.grants.clone())
@@ -442,10 +536,18 @@ impl ControlHandler {
             send.finish()?;
             return Ok(());
         }
+        // Own docs first, then the learned third-party docs we re-serve. Overlap is
+        // harmless: the receiver dedups/rolls-back per signer.
         for card in &cards {
             write_msg(send, card).await?;
         }
+        for card in &fwd_cards {
+            write_msg(send, card).await?;
+        }
         for ann in &announces {
+            write_msg(send, ann).await?;
+        }
+        for ann in &fwd_announces {
             write_msg(send, ann).await?;
         }
         for grant in &grants {
@@ -757,6 +859,39 @@ impl Drop for VaultWatcher {
     }
 }
 
+/// Handle for the background maintenance loop started by [`Daemon::run_maintenance`]
+/// (§10.1/§10.2). Keep it alive to keep the loop running; drop it (or call
+/// [`MaintenanceHandle::stop`]) to tear the loop down.
+///
+/// The loop task holds only a [`Weak`] to the daemon and upgrades it per round, so it
+/// never keeps the daemon alive: once the last `Arc<Daemon>` is dropped the loop ends
+/// on its own. Drop aborts the task; this is cancel-safe because every maintenance
+/// action releases its locks before each `.await` (no lock is held across a network
+/// round-trip), so an abort mid-round only drops an in-flight future.
+pub struct MaintenanceHandle {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl MaintenanceHandle {
+    /// Stop the loop and await its full teardown, so the caller can then reclaim the
+    /// sole `Arc<Daemon>` (e.g. `Arc::try_unwrap` + [`Daemon::shutdown`]) with no
+    /// lingering strong reference held by an in-flight round.
+    pub async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for MaintenanceHandle {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 impl Daemon {
     /// Bind the endpoint from `state`, start serving the blob store and the
     /// `carapace/1` control protocol, and publish this device's `ContactCard`
@@ -858,6 +993,11 @@ impl Daemon {
             s.rate = RateLimiter::new(limits.rate_capacity, limits.rate_refill_per_sec);
         }
 
+        // The rollback-guarded document store, shared between the daemon's own pull
+        // path (`sync_from`) and the accept handler's `serve_docs` so learned docs are
+        // re-served during anti-entropy (store-and-forward, §6/W7).
+        let docs = Arc::new(Mutex::new(DocStore::new()));
+
         let hello = Hello {
             protocol: 1,
             card_version: 1,
@@ -873,6 +1013,7 @@ impl Daemon {
             default_grant_bytes: limits.quota_bytes,
             // Feed hints from friend cards learned on the accept path (§6).
             hints: ep.hints(),
+            docs: Arc::clone(&docs),
         };
         // §7.4 / D3 fetch authorization (closes S5 for owned granted content): the
         // blob store no longer answers `iroh_blobs::ALPN` fetches from any dialer.
@@ -901,7 +1042,6 @@ impl Daemon {
             .accept(ALPN, handler)
             .spawn();
 
-        let docs = Arc::new(Mutex::new(DocStore::new()));
         Ok(Self {
             ep,
             blobs,
@@ -1714,6 +1854,11 @@ impl Daemon {
         // `peer` carries no direct address (the NAT-blind, relay-only path).
         learn_ticket_hints(&self.ep.hints(), ticket).await;
 
+        // Record the acceptor's dialable address so the maintenance loop can later
+        // re-reach it (PoR probes, attestation challenges) without a discovery
+        // round-trip (§6). Captured before `peer` is consumed by the dial below.
+        let peer_addr = peer.clone();
+        let peer_node = *peer.id.as_bytes();
         let conn = self.ep.connect(peer, ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         write_msg(&mut send, &req).await?;
@@ -1748,6 +1893,7 @@ impl Daemon {
             // Agree the per-friend replica-storage grant at add-friend time.
             s.friend_grants
                 .insert(acceptor_user, grant_bytes.unwrap_or(DEFAULT_QUOTA_BYTES));
+            s.peer_addrs.insert(peer_node, peer_addr);
         }
         // §6: learn the acceptor's card hints (relay + direct addrs) for later
         // dials (anti-entropy, PoR probes) by node id.
@@ -2008,6 +2154,12 @@ impl Daemon {
             "replica acked {acked} of {} blobs",
             blobs.len()
         );
+        // §6: remember where this replica lives so the PoR loop can re-audit it by
+        // node id without a discovery round-trip.
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            s.peer_addrs.insert(node, peer.clone());
+        }
         Ok(Some(node))
     }
 
@@ -2212,7 +2364,7 @@ impl Daemon {
 
         let mut atts = Vec::new();
         for peer in trustees {
-            if let Some(att) = self.challenge_trustee(peer, &challenge).await? {
+            if let Some(att) = self.challenge_trustee(peer, &challenge).await {
                 atts.push(att);
             }
         }
@@ -2235,22 +2387,200 @@ impl Daemon {
     }
 
     /// Dial `peer`'s control stream, send `challenge`, and return its
-    /// `ShareAttestation` if it answers (a trustee holding no share, or refusing,
-    /// finishes without one).
+    /// `ShareAttestation` if it answers. A trustee that is unreachable, refuses, holds
+    /// no share, or answers with a malformed frame yields `None`: liveness ages out
+    /// through the freshness window, so a transiently-offline trustee is "not live"
+    /// this round, never a round-aborting error (mirrors the C1 unreachable handling
+    /// in `fetch_audit_samples`). The dial is bounded so an offline trustee fails fast
+    /// instead of stalling the round on the QUIC handshake timeout.
     async fn challenge_trustee(
         &self,
         peer: &EndpointAddr,
         challenge: &ShareAttestChallenge,
-    ) -> Result<Option<ShareAttestation>> {
-        let conn = self.ep.connect(peer.clone(), ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_msg(&mut send, challenge).await?;
-        let att = match read_frame_raw(&mut recv).await? {
-            Some((ShareAttestation::TYPE, body)) => Some(ShareAttestation::from_map(body)?),
+    ) -> Option<ShareAttestation> {
+        let conn = tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(peer.clone(), ALPN))
+            .await
+            .ok()?
+            .ok()?;
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        write_msg(&mut send, challenge).await.ok()?;
+        let att = match read_frame_raw(&mut recv).await.ok()? {
+            Some((ShareAttestation::TYPE, body)) => ShareAttestation::from_map(body).ok(),
             _ => None,
         };
-        send.finish()?;
-        Ok(att)
+        let _ = send.finish();
+        att
+    }
+
+    // ---- background maintenance loop (§10.1 + §10.2) -------------------
+
+    /// Run one round of background maintenance at `now` — the unit the loop ticks and
+    /// tests drive directly with an injected clock. In order:
+    ///
+    /// 1. PoR retention audits over each owned vault's replicas, repairing on
+    ///    confirmed loss (re-replicate + re-announce, §10.1);
+    /// 2. as owner, one attestation round per registered recovery set, folding
+    ///    responses into the attested-live count and surfacing the drift decision
+    ///    (§10.2);
+    /// 3. as trustee, continuous local CRC self-validation of each held share (§10.2).
+    ///
+    /// Each per-concern tracker self-gates on its own cadence against `now`, so a
+    /// round where nothing is due is cheap. One failing vault/set is recorded in the
+    /// report and skipped, never fatal. No lock is held across any network round-trip:
+    /// the work set + address book are snapshotted under a read lock, then acted on
+    /// off-lock (the called methods do their own lock-drop-before-await).
+    pub async fn maintenance_round(&self, now: u64) -> MaintenanceReport {
+        let mut report = MaintenanceReport::default();
+
+        let (owned_vaults, recovery_sets, held_rsids, peer_addrs) = {
+            let s = self.shared.read().expect("shared lock");
+            let owned: Vec<[u8; 32]> = s
+                .members
+                .keys()
+                .filter(|vid| s.vault_blobs.contains_key(*vid))
+                .copied()
+                .collect();
+            let sets: Vec<(u64, Vec<[u8; 32]>)> = s
+                .share_sets
+                .iter()
+                .map(|(rsid, t)| (*rsid, t.trustees()))
+                .collect();
+            let held: Vec<u64> = s.held_shares.keys().copied().collect();
+            (owned, sets, held, s.peer_addrs.clone())
+        };
+
+        // 1) PoR audits + repair over owned vaults with replicas (§10.1).
+        for vid in owned_vaults {
+            let member_ids = {
+                let s = self.shared.read().expect("shared lock");
+                s.members.get(&vid).cloned().unwrap_or_default()
+            };
+            let members: HashMap<[u8; 32], EndpointAddr> = member_ids
+                .iter()
+                .filter_map(|n| resolve_peer(&peer_addrs, n).map(|a| (*n, a)))
+                .collect();
+            // Repair candidates: known peers that are not already members of this
+            // vault (repair itself re-checks friendship + deny-list per candidate).
+            let candidates: Vec<EndpointAddr> = peer_addrs
+                .iter()
+                .filter(|(n, _)| !member_ids.contains(n))
+                .map(|(_, a)| a.clone())
+                .collect();
+            match self.por_audit_round(vid, &members, &candidates, now).await {
+                Ok(round) => report.por.push((vid, round)),
+                Err(e) => report
+                    .errors
+                    .push(format!("por audit {}: {e:#}", hex32(&vid))),
+            }
+        }
+
+        // 2) Owner attestation rounds + drift surfacing over owned recovery sets
+        //    (§10.2). The subject is this owner's user key.
+        let subject = self.user_id();
+        for (rsid, trustee_ids) in recovery_sets {
+            let trustees: Vec<EndpointAddr> = trustee_ids
+                .iter()
+                .filter_map(|n| resolve_peer(&peer_addrs, n))
+                .collect();
+            match self
+                .run_share_health_round(rsid, subject, &trustees, now)
+                .await
+            {
+                Ok(action) => report.drift.push((rsid, action)),
+                Err(e) => report.errors.push(format!("attest set {rsid}: {e:#}")),
+            }
+        }
+
+        // 3) Trustee self-validation over held shares (§10.2).
+        for rsid in held_rsids {
+            if let Some(h) = self.share_self_validate(rsid, now) {
+                report.self_validated.push((rsid, h));
+            }
+        }
+
+        report
+    }
+
+    /// Spawn the background maintenance loop (§10.1/§10.2) and return its handle.
+    ///
+    /// The loop wakes every `cfg.tick`, runs one [`Daemon::maintenance_round`] against
+    /// the wall clock, and self-gates each concern on its own cadence. It holds only a
+    /// [`Weak`] to the daemon (upgraded per round), so it never blocks shutdown; the
+    /// returned [`MaintenanceHandle`] tears it down on drop or
+    /// [`MaintenanceHandle::stop`]. Follows the same `Arc<Self>` + `Weak` pattern as
+    /// [`Daemon::watch_vault`]: the production entry point ([`carapace_api`]) already
+    /// holds an `Arc<Daemon>` and starts this once at boot.
+    ///
+    /// `cfg.por_interval` is stamped onto the audit schedule here (the loop owns the
+    /// PoR cadence), so a deployment or a bounded test tunes it through the config.
+    pub fn run_maintenance(self: Arc<Self>, cfg: MaintenanceConfig) -> MaintenanceHandle {
+        {
+            // The loop owns the PoR audit cadence: stamp it at start, before any audit
+            // runs, so no accumulated per-replica schedule is discarded mid-flight.
+            let mut s = self.shared.write().expect("shared lock");
+            s.por = AuditTracker::new(
+                cfg.por_interval.as_secs(),
+                DEFAULT_POR_FAIL_LIMIT,
+                DEFAULT_WIDE_EVERY,
+            );
+        }
+        let weak: Weak<Self> = Arc::downgrade(&self);
+        // Release this strong ref so the loop's Weak never keeps the daemon alive.
+        drop(self);
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(cfg.tick);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(daemon) = weak.upgrade() else {
+                    break;
+                };
+                let _ = daemon.maintenance_round(unix_now()).await;
+                // Drop the strong ref between ticks so a concurrent shutdown can
+                // reclaim the daemon; the loop ends once the last Arc is gone.
+                drop(daemon);
+            }
+        });
+        MaintenanceHandle { task: Some(task) }
+    }
+
+    /// The §10.2 share-health surface for the status API: per owned recovery set, its
+    /// attested-live count, `M + slack` target, and drift recommendation evaluated at
+    /// the current wall clock.
+    pub fn recovery_health(&self) -> Vec<RecoveryHealthReport> {
+        self.recovery_health_at(unix_now())
+    }
+
+    /// [`Daemon::recovery_health`] evaluated at an explicit `now` (injected clock for
+    /// deterministic tests).
+    pub fn recovery_health_at(&self, now: u64) -> Vec<RecoveryHealthReport> {
+        let s = self.shared.read().expect("shared lock");
+        s.share_sets
+            .iter()
+            .map(|(rsid, t)| {
+                let (recommendation, needed) = match t.decide(now) {
+                    ShareAction::Healthy => ("healthy", 0),
+                    ShareAction::Extend { needed } => ("extend", needed),
+                    ShareAction::ResplitLargerM => ("resplit", 0),
+                };
+                RecoveryHealthReport {
+                    rsid: *rsid,
+                    live: t.live_count(now),
+                    target: t.target(),
+                    recommendation,
+                    needed,
+                }
+            })
+            .collect()
+    }
+
+    /// The newest `VaultAnnounce` this daemon has learned for `vid` (its signer node
+    /// and epoch), from the rollback-guarded document store — including third-party
+    /// announces picked up via anti-entropy store-and-forward (§6/W7). `None` if none
+    /// is known.
+    pub fn known_announce(&self, vid: &[u8; 32]) -> Option<([u8; 32], u64)> {
+        let d = self.docs.lock().expect("docs lock");
+        d.announce_for_vid(vid).map(|a| (a.by, a.epoch))
     }
 
     /// Test-only: record `node` as a replica member of `vid` without pushing it the
@@ -2969,6 +3299,12 @@ fn select_targets(
     for ann in announces {
         // C1: the announce signer must be a delegated node of the vault owner.
         if !delegated.contains(&ann.by) {
+            // W7 store-and-forward (§6): an announce for a vault we do not own is not
+            // a reconstruction target, but store the signed doc (rollback-guarded per
+            // (signer, vid)) so this node re-serves it to its own friends — an owner's
+            // announce reaches a trustee through any mutual friend. A bad signature or
+            // a stale epoch is simply not stored; it never aborts the batch.
+            let _ = docs.offer_announce(ann);
             continue;
         }
         // A matching-epoch grant from a delegated node is required to open it.
@@ -3018,11 +3354,15 @@ fn card_delegates_node(card: &ContactCard, node_id: &[u8; 32], now: u64) -> bool
 /// daemon's own user or an established friend. Delegation is then checked as
 /// follows:
 ///
-/// - Self branch (`card.user == self_user`): the presented own-user card's
-///   delegations are trusted. ponytail (own-device limitation): we do not keep a
-///   rollback-guarded newest self-card here, so a removed own device presenting an
-///   old self-card still authorizes until the self-card store is versioned like
-///   `s.friends`. Friend-device revocation (the W2 target) is handled below.
+/// - Self branch (`card.user == self_user`, W7 `6-newest-card-delegations`): once a
+///   strictly-newer self-card is known (`newest_self`, the rollback-guarded newest
+///   card this user has signed, learned via anti-entropy into the [`DocStore`]), it is
+///   authoritative — a node absent from it (a revoked own device presenting an old
+///   self-card) is refused, per §6 "MUST NOT honor node delegations absent from the
+///   signer's newest card." Until a newer self-card exists (the same-version
+///   sibling-card case this build's one-node-per-device cards produce during normal
+///   multi-device sync), the presented self-card's own delegation is trusted, so a
+///   first-seen sibling device still authorizes.
 /// - Friend branch (W2): authorization uses the STORED newest friend card
 ///   (`s.friends`), never the delegations in the card the dialer presents. Once a
 ///   friend publishes a newer card dropping a device, a dialer presenting an old
@@ -3033,12 +3373,21 @@ fn classify_dialer(
     card: &ContactCard,
     remote: &[u8; 32],
     now: u64,
+    newest_self: Option<&ContactCard>,
 ) -> Option<BlobAuth> {
     if card.verify().is_err() {
         return None;
     }
     if card.user == *self_user {
-        return card_delegates_node(card, remote, now).then_some(BlobAuth::OwnDevice);
+        // A strictly-newer known self-card supersedes the presented one: honor only
+        // the nodes it still delegates (revocation takes effect). Otherwise fall back
+        // to the presented card, preserving same-version multi-device authorization.
+        return match newest_self {
+            Some(newest) if newest.version > card.version => {
+                card_delegates_node(newest, remote, now).then_some(BlobAuth::OwnDevice)
+            }
+            _ => card_delegates_node(card, remote, now).then_some(BlobAuth::OwnDevice),
+        };
     }
     match s.friends.get(&card.user) {
         Some(stored) if card_delegates_node(stored, remote, now) => {
@@ -3223,6 +3572,21 @@ async fn read_blob(recv: &mut RecvStream) -> Result<Vec<u8>> {
 /// strings (e.g. `"127.0.0.1:52345"`). An empty `addrs` yields an id-only address
 /// (usable only with a discovery service). A malformed node id or socket string is a
 /// hard error rather than a silently-dropped address.
+/// Resolve a peer node id to a dialable [`EndpointAddr`] for the maintenance loop:
+/// the last-known address if this node recorded one (from a prior befriend/placement
+/// dial), else a node-id-only addr that iroh resolves through injected hints and relay
+/// fallback (§6 "addresses are hints, not identities"). Returns `None` only if the
+/// node id is not a valid endpoint key.
+fn resolve_peer(
+    peer_addrs: &HashMap<[u8; 32], EndpointAddr>,
+    node: &[u8; 32],
+) -> Option<EndpointAddr> {
+    if let Some(addr) = peer_addrs.get(node) {
+        return Some(addr.clone());
+    }
+    EndpointId::from_bytes(node).ok().map(EndpointAddr::new)
+}
+
 fn endpoint_addr(node: [u8; 32], addrs: &[String]) -> Result<EndpointAddr> {
     let id = EndpointId::from_bytes(&node)
         .map_err(|e| anyhow::anyhow!("bad node id {}: {e}", hex32(&node)))?;
@@ -3699,13 +4063,53 @@ mod tests {
         let mut s = Shared::default();
         s.friends.insert(friend, v1.clone());
         // While v1 is newest, a dialer presenting v1 for node N is authorized.
-        assert!(classify_dialer(&s, &self_user, &v1, &n_id, NOW).is_some());
+        assert!(classify_dialer(&s, &self_user, &v1, &n_id, NOW, None).is_some());
 
         // Friend publishes v2 (drops N). A dialer still presenting v1 for N loses.
         s.friends.insert(friend, v2);
         assert!(
-            classify_dialer(&s, &self_user, &v1, &n_id, NOW).is_none(),
+            classify_dialer(&s, &self_user, &v1, &n_id, NOW, None).is_none(),
             "node N is revoked once the newer card dropping it is known (W2)"
+        );
+    }
+
+    // W7 (6-newest-card-delegations): own-device revocation takes effect once a newer
+    // self-card is known. This user's device X is delegated by self-card v1; the user
+    // then publishes v2 (a newer self-card) that drops X. Once v2 is the newest known
+    // self-card, X presenting its old v1 self-card is refused — §6 "MUST NOT honor
+    // node delegations absent from the signer's newest card." A device still present
+    // in v2 authorizes, and before any newer card exists the presented card is
+    // trusted (preserving same-version multi-device sync).
+    #[test]
+    fn w7_own_device_revocation_refused_after_newer_self_card() {
+        let self_user = kp(0x01);
+        let device_x = kp(0x02);
+        let device_y = kp(0x03);
+        let self_uid = self_user.verifying_key().to_bytes();
+        let x_id = device_x.verifying_key().to_bytes();
+        let y_id = device_y.verifying_key().to_bytes();
+
+        let v1 = card_with(&self_user, &device_x, 1); // self-card delegating X
+        let v2 = card_with(&self_user, &device_y, 2); // newer self-card: drops X, adds Y
+
+        let s = Shared::default();
+        // No newer self-card known yet: X presenting its own valid self-card is trusted
+        // (the same-version multi-device path this build relies on).
+        assert!(
+            classify_dialer(&s, &self_uid, &v1, &x_id, NOW, None).is_some(),
+            "own device authorizes on its own self-card before any newer card exists"
+        );
+
+        // Once v2 is the newest known self-card, X (absent from v2) is refused even
+        // though its old v1 card still delegates it.
+        assert!(
+            classify_dialer(&s, &self_uid, &v1, &x_id, NOW, Some(&v2)).is_none(),
+            "a revoked own device presenting an old self-card must NOT authorize (W7)"
+        );
+        // A device still present in the newest self-card authorizes.
+        assert!(
+            classify_dialer(&s, &self_uid, &v2, &y_id, NOW, Some(&v2)).is_some(),
+            "a device in the newest self-card still authorizes"
         );
     }
 

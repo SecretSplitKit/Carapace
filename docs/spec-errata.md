@@ -291,3 +291,30 @@ loser's *original single-device attribution captured before any VV join*; the co
 hash was chosen as the simpler order-independent key. Conflict filenames are local
 artifacts (the manifests/VVs are what sync), so this does not affect cross-client
 data interop. §11 should specify an order-independent conflict identity.
+
+## Note — attestations use a direct request/response channel, not versioned anti-entropy (§6, §10.2, W7)
+
+§6 lists "attestations (§10.2)" among the signed documents two friends "exchange
+and reconcile … by version number — simple anti-entropy," alongside contact cards
+and vault announces. In the implementation attestations are **not** folded into the
+versioned document store-and-forward. They are a live challenge/response liveness
+probe with per-round freshness, not a monotonic document:
+
+- The owner mints a `ShareAttestChallenge` carrying a fresh random nonce each round
+  and dials each trustee directly (`Daemon::run_share_health_round` →
+  `challenge_trustee`); the trustee answers with a `ShareAttestation` echoing that
+  nonce (`ControlHandler::serve_attest`). The owner verifies the echoed nonce and
+  folds the response into a per-recovery-set **freshness window** (`AttestTracker`):
+  liveness means "answered a recent challenge," which a stored, re-served,
+  version-deduped document cannot express (a replayed old attestation would forge
+  liveness; the nonce binding is exactly what prevents that).
+- Attestations therefore have no monotonic version/epoch line to reconcile and are
+  never rollback-guarded or forwarded like cards/announces. Store-and-forward
+  (W7) applies to cards and announces only.
+
+**Resolution: attestations legitimately use a direct request/response channel; §6's
+inclusion of them in the anti-entropy document list is the divergence.** Cards and
+announces are the versioned documents that flow (and now store-and-forward) across
+friendship edges; the attestation cadence is a separate §10.2 liveness protocol that
+must stay nonce-fresh. §6 should scope its anti-entropy list to cards + announces and
+cross-reference §10.2 for the attestation challenge/response cadence.
