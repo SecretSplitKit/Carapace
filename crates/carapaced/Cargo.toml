@@ -29,6 +29,7 @@ iroh-blobs = "0.103"
 blake3 = "1"
 zeroize = "1"
 getrandom = "0.2"
+notify = "8.2.0"
 
 [dev-dependencies]
 tempfile = "3"

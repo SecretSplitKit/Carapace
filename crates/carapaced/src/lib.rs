@@ -53,7 +53,8 @@ use carapace_share::{
     ShareHealth, ShareMonitor,
 };
 use carapace_vault::{
-    ingest_dir, new_vid, open_envelope, reconstruct, ChunkKeys, ChunkSecret, MemoryStore, VaultKeys,
+    ingest_dir, merge_manifests, new_vid, open_envelope, reconstruct, seal_manifest, vv_equal,
+    ChunkKeys, ChunkSecret, MemoryStore, VaultKeys,
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
@@ -89,6 +90,13 @@ const POR_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// unreachable peer's QUIC connect can hang for ~30 s, stalling the whole round;
 /// bounding it makes an offline peer fail fast to the "unreachable" path (C1).
 const POR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// §11 filesystem-watcher debounce: after a change under a watched vault source,
+/// re-ingest only once the directory has been quiet for this long. Coalesces a
+/// burst of editor/copy events into one publish and avoids re-ingesting a file
+/// mid-write. ponytail: fixed const; lift to `NetConfig`/`watch_vault` arg if a
+/// deployment needs per-vault tuning.
+pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(750);
 
 /// Tunable limits for the replica-store receive path (W1). Defaults come from the
 /// replica crate: a 1 GiB default per-friend storage grant and a 256 MiB /
@@ -214,6 +222,13 @@ struct Shared {
     /// Per-owned-vault blob source (digest + ChunkIDs) for replica placement. Holds
     /// only the CURRENT epoch's source (overwritten on republish).
     vault_blobs: HashMap<[u8; 32], VaultBlobs>,
+    /// The single authoritative working directory per vault (§11): the SAME tree is
+    /// the published source, the watched tree, AND the sync/reconstruct target. Set
+    /// at `publish_vault` time (to the caller's source) and on a first sync (to
+    /// `out_root/<vid>`), so a later sync reconstructs the merged result back into
+    /// the tree the watcher observes - which makes "absent from disk => tombstone"
+    /// sound (the working tree is always the full merged set, incl. conflict copies).
+    working_dirs: HashMap<[u8; 32], PathBuf>,
     /// Every ChunkID ever published for a vault this daemon OWNS, mapped to that
     /// vault's vid and RETAINED across epoch bumps (unlike `vault_blobs`). The
     /// blob-read gate ([`authorize_fetch`]) consults this so a superseded-epoch
@@ -697,6 +712,15 @@ pub struct Daemon {
     /// in-memory, so nothing survives a restart anyway; persist to disk here and
     /// in the blob store together if durable rollback across restarts is needed.
     docs: Arc<Mutex<DocStore>>,
+    /// Per-vault publish serialization (§11 / MAJOR 5). A vault's whole publish -
+    /// read-prev, ingest, commit - runs under its own async lock so the watcher's
+    /// background `publish_vault` and a sync's `publish_merged`/baseline-persist can
+    /// never interleave on the same vid (no lost update, no two digests at one
+    /// epoch, no re-ingest of a half-written merged tree). The outer `Mutex` only
+    /// guards the get-or-insert of the per-vid lock; it is never held across an
+    /// `.await`. ponytail: grows one entry per distinct owned/synced vid over the
+    /// daemon's life; prune alongside vault teardown if that is ever added.
+    publish_locks: Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
     /// Per-subject recovery-open rate limiter (§8.5): a forged/abusive `RecoveryOpen`
     /// cannot exhaust an honest subject's budget. Single long-lived limiter guarded by
     /// its own mutex so `ceremony_open` can charge it without touching `shared`.
@@ -708,6 +732,29 @@ pub struct Daemon {
     /// The embedded relay server, held to keep it running for the daemon's life.
     _relay: Option<CarapaceRelay>,
     _router: Router,
+}
+
+/// Handle for a live §11 filesystem watcher started by [`Daemon::watch_vault`].
+///
+/// Keep it alive to keep watching; drop it to stop. Drop halts the underlying
+/// `notify` watcher (closing the event channel) and aborts the debounce/re-ingest
+/// task, so shutdown is clean and cancel-safe (no lock is held across an `.await`
+/// in that task).
+pub struct VaultWatcher {
+    // Field order matters for Drop: the notify watcher is dropped first (below via
+    // the generated Drop glue after our explicit `drop` impl runs), closing the
+    // event channel. Held to keep fs events flowing while the handle lives.
+    _watcher: notify::RecommendedWatcher,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for VaultWatcher {
+    fn drop(&mut self) {
+        // Abort the re-ingest task; dropping `_watcher` afterwards closes the
+        // channel. Abort is safe here: publish_vault holds the `shared` lock only
+        // for synchronous critical sections, never across an `.await`.
+        self.task.abort();
+    }
 }
 
 impl Daemon {
@@ -863,6 +910,7 @@ impl Daemon {
             user_key,
             k_root,
             docs,
+            publish_locks: Mutex::new(HashMap::new()),
             // §8.5: at most 5 recovery opens per subject per 24 h window.
             recovery_limiter: Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)),
             advertised_relay,
@@ -887,31 +935,73 @@ impl Daemon {
         new_vid(&self.user_key.verifying_key().to_bytes())
     }
 
+    /// The per-vid publish lock (§11 / MAJOR 5), created on first use. Held across
+    /// the WHOLE of `publish_vault` and a sync's apply phase so those two paths
+    /// serialize on a vid and never clobber each other's read-prev -> commit.
+    fn publish_lock(&self, vid: [u8; 32]) -> Arc<tokio::sync::Mutex<()>> {
+        self.publish_locks
+            .lock()
+            .expect("publish_locks")
+            .entry(vid)
+            .or_default()
+            .clone()
+    }
+
     /// Ingest `src` into vault `vid`: (re-)chunk + seal every file, load the
     /// ciphertext + manifest envelope into the served blob store, seal a
     /// per-chunk access grant, and publish a freshly signed `VaultAnnounce` +
-    /// `FileGrant`. Bumps the vault's epoch on each call, so calling it again
-    /// after a local change republishes at a higher epoch. Returns the epoch.
+    /// `FileGrant`. Records `src` as this vault's authoritative working directory
+    /// (§11), so a later sync reconstructs the merged result back into the same
+    /// tree this ingest reads.
     ///
-    /// ponytail: no filesystem watcher; the caller triggers re-ingest on change.
-    /// ponytail: ingest + reconstruct run inline on the async worker (fine for a
-    /// demo); a production daemon would `spawn_blocking` the heavy CPU/IO path.
-    /// ponytail (S10): the epoch counter is bumped under one lock and committed
-    /// under another, so two *concurrent* publishes of the same vid could commit
-    /// out of counter order. The Phase 1 path is single-caller; hold a per-vid
-    /// lock across the whole publish if concurrent publishing ever becomes real.
+    /// Bumps the vault's epoch and republishes ONLY when the re-ingested tree
+    /// differs from the last published manifest. A no-op re-ingest (e.g. the
+    /// watcher firing on the daemon's own just-applied merge, whose files and
+    /// mtimes round-trip exactly) returns the current epoch WITHOUT a bump, so the
+    /// per-signer announce line stays monotonic and two devices converge instead of
+    /// ping-ponging epochs. Returns the vault's epoch.
+    ///
+    /// The whole read-prev -> ingest -> commit runs under the vid's publish lock so
+    /// it serializes with a concurrent sync `publish_merged` on the same vid
+    /// (MAJOR 5): no lost update, and never two different digests at one epoch.
+    ///
+    /// ponytail: ingest runs inline on the async worker (fine for a demo); a
+    /// production daemon would `spawn_blocking` the heavy CPU/IO path.
     pub async fn publish_vault(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
+        let lock = self.publish_lock(vid);
+        let _publish = lock.lock().await;
+
         let vkeys = VaultKeys::derive(&*self.k_root, vid);
-        let epoch = {
+        let (cur_epoch, prev) = {
             let mut s = self.shared.write().expect("shared lock");
-            let e = s.epochs.entry(vid).or_insert(0);
-            *e += 1;
-            *e
+            // §11: this source IS the vault's authoritative working directory
+            // (watched + sync target). A publish declares it, so overwrite any prior
+            // (e.g. a first-sync fallback) - a later sync reconstructs merges here.
+            s.working_dirs.insert(vid, src.to_path_buf());
+            let cur = *s.epochs.get(&vid).unwrap_or(&0);
+            // §11: carry the previously-published manifest so a re-ingest bumps
+            // this device's per-file version-vector component on real changes
+            // (and tombstones local deletions), making a concurrent edit on
+            // another owner device detectable at merge time.
+            let prev = s.vault_blobs.get(&vid).map(|vb| vb.manifest.clone());
+            (cur, prev)
         };
+        let epoch = cur_epoch + 1;
 
         // Ingest into a plain in-memory store, then mirror blobs into iroh.
         let mut mem = MemoryStore::new();
-        let ingest = ingest_dir(src, &self.node_key, &vkeys, epoch, &mut mem)?;
+        let ingest = ingest_dir(src, &self.node_key, &vkeys, epoch, prev.as_ref(), &mut mem)?;
+
+        // No-op guard: if the re-ingested file set is byte-for-byte identical to
+        // what we last published (same paths, hashes, mtimes, per-file VVs), there
+        // is nothing to propagate. Do NOT bump the epoch or republish - this is the
+        // watcher re-observing the daemon's own just-written merged/reconstructed
+        // tree, and republishing it would spuriously advance the announce line.
+        if let Some(prevm) = &prev {
+            if ingest.manifest.files == prevm.files {
+                return Ok(cur_epoch);
+            }
+        }
 
         let env_digest = self.blobs.add(&ingest.envelope.to_bytes()).await?;
         ensure!(
@@ -943,6 +1033,8 @@ impl Daemon {
         }
 
         let mut s = self.shared.write().expect("shared lock");
+        // Commit the bumped epoch (read-prev..commit is atomic under the vid lock).
+        s.epochs.insert(vid, epoch);
         // W2: retain every published ChunkID in the owner-gated set across epoch
         // bumps, so superseded chunks keep the §7.4 owner gate (see `owned_chunks`).
         for id in &chunk_ids {
@@ -975,6 +1067,77 @@ impl Daemon {
         s.grants.retain(|g| g.vid != vid);
         s.grants.push(grant);
         Ok(epoch)
+    }
+
+    /// §11 / W12: start a debounced filesystem watcher over `src` that re-ingests
+    /// vault `vid` (via [`Daemon::publish_vault`]) whenever files under it change,
+    /// giving Dropbox-like live sync (new chunks + epoch++ manifest, pushed and
+    /// announced to replicas and other owner devices).
+    ///
+    /// Consumes a cloned `Arc<Daemon>` and holds only a [`std::sync::Weak`] to it, so the
+    /// returned [`VaultWatcher`] never keeps the daemon alive — a caller can still
+    /// `Arc::try_unwrap` + [`Daemon::shutdown`]. Drop the [`VaultWatcher`] to stop
+    /// watching; that halts fs events and cancels the re-ingest task.
+    ///
+    /// ponytail: re-ingests the *whole* vault on any change (matches the existing
+    /// one-shot `publish_vault`); a large-vault deployment would want incremental,
+    /// per-file re-chunking driven off the event paths.
+    pub fn watch_vault(self: Arc<Self>, vid: [u8; 32], src: PathBuf) -> Result<VaultWatcher> {
+        use notify::{event::EventKind, recommended_watcher, RecursiveMode, Watcher};
+
+        // Unbounded but each item is zero-sized: an event storm costs bytes, and
+        // the debounce loop collapses the whole backlog into a single re-ingest.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                // Skip pure access/open events: only content-affecting changes
+                // (create/modify/remove/rename) should trigger a re-ingest.
+                if !matches!(ev.kind, EventKind::Access(_)) {
+                    let _ = tx.send(());
+                }
+            }
+        })
+        .context("create filesystem watcher")?;
+        watcher
+            .watch(&src, RecursiveMode::Recursive)
+            .with_context(|| format!("watch {}", src.display()))?;
+
+        // Hold only a Weak so the watcher task can't block daemon shutdown.
+        let weak = Arc::downgrade(&self);
+        drop(self);
+        let task = tokio::spawn(async move {
+            loop {
+                // Block until the first change of a new batch.
+                if rx.recv().await.is_none() {
+                    break; // watcher dropped -> channel closed
+                }
+                // Debounce: extend the window on every follow-up event; re-ingest
+                // only once `src` has been quiet for `WATCH_DEBOUNCE`.
+                loop {
+                    match tokio::time::timeout(WATCH_DEBOUNCE, rx.recv()).await {
+                        Ok(Some(())) => continue, // more churn, keep waiting
+                        Ok(None) => return,       // channel closed
+                        Err(_) => break,          // quiet period elapsed
+                    }
+                }
+                // Re-ingest once, sequentially — no unbounded fan-out. Upgrade the
+                // Weak only for the duration of the publish so shutdown can still
+                // reclaim the sole Arc.
+                let Some(daemon) = weak.upgrade() else {
+                    break; // daemon gone
+                };
+                if let Err(e) = daemon.publish_vault(&src, vid).await {
+                    eprintln!(
+                        "carapace watch: re-ingest of {} failed: {e:#}",
+                        src.display()
+                    );
+                }
+            }
+        });
+        Ok(VaultWatcher {
+            _watcher: watcher,
+            task,
+        })
     }
 
     /// Test-only: advertise a node-signed (hence delegation-passing) announce +
@@ -1090,7 +1253,14 @@ impl Daemon {
                     newer_cards.push(card.clone());
                 }
             }
-            let targets = select_targets(&mut docs, &self_user, &recv_announces, &grants, now);
+            let targets = select_targets(
+                &mut docs,
+                &self_user,
+                &recv_cards,
+                &recv_announces,
+                &grants,
+                now,
+            );
             (targets, newer_cards)
         };
 
@@ -1172,39 +1342,246 @@ impl Daemon {
         scratch.fetch(&bconn, ann.digest).await?;
         let env_bytes = scratch.get_bytes(ann.digest).await?;
         let envelope = ManifestEnvelope::from_bytes(&env_bytes)?;
-        let manifest = open_envelope(&envelope, &vkeys.k_manifest)?;
-        ensure!(&manifest.vid == vid, "envelope vid mismatch");
+        let incoming = open_envelope(&envelope, &vkeys.k_manifest)?;
+        ensure!(&incoming.vid == vid, "envelope vid mismatch");
         // S6: the AEAD aad already binds env.epoch to the manifest; also bind the
         // independently-signed announce epoch so a higher advertised epoch cannot
         // point at a lower-epoch envelope.
         ensure!(
-            manifest.epoch == ann.epoch,
+            incoming.epoch == ann.epoch,
             "manifest epoch != announce epoch"
         );
 
-        // Open the grant -> per-chunk secrets.
-        let keys = self.open_file_grant(grant, disclose_priv, *vid)?;
+        // Open the grant -> per-chunk secrets for the incoming manifest.
+        let incoming_keys = self.open_file_grant(grant, disclose_priv, *vid)?;
 
-        // Fetch every chunk into a plain store keyed by ChunkID.
+        // §11 / MAJOR 5: take the vid's publish lock BEFORE reading our local
+        // baseline and hold it through the reconstruct + commit below, so a
+        // concurrent `publish_vault` (e.g. the watcher firing on this same tree)
+        // cannot read-prev/commit in between - that would lose an update or ingest a
+        // half-written merged tree. The whole apply is serialized on the vid.
+        let publish_lock = self.publish_lock(*vid);
+        let _apply = publish_lock.lock().await;
+
+        // §11: if THIS device already published (or synced) a manifest for this
+        // vault, MERGE the two rather than blindly reconstructing the received one -
+        // otherwise the later reconstruct silently clobbers an earlier edit and
+        // drops its tombstones (W1/W12, the silent-data-loss hole). A first sync (no
+        // local manifest for this vid) reconstructs as-is and records a baseline.
+        let local = {
+            let s = self.shared.read().expect("shared lock");
+            s.vault_blobs.get(vid).map(|vb| {
+                (
+                    vb.manifest.clone(),
+                    s.vault_keys.get(vid).cloned().unwrap_or_default(),
+                )
+            })
+        };
+
+        let (manifest, keys, republish, first_sync) = match local {
+            // First sync: reconstruct the received manifest as-is, then persist it as
+            // this device's baseline (MAJOR 4) so a later local edit diffs against it.
+            None => (incoming, incoming_keys, false, true),
+            // Concurrent-owner sync: reconcile per §11.
+            Some((local_manifest, local_keys)) => {
+                let merged = merge_manifests(&local_manifest, &incoming);
+                // Only re-publish when the merge produced state we did not already
+                // hold; a converged (no-op) merge must not bump the epoch, or the two
+                // devices would ping-pong announces forever.
+                let changed = merged.files != local_manifest.files
+                    || !vv_equal(&merged.vv, &local_manifest.vv);
+                let epoch = if changed {
+                    local_manifest.epoch.max(incoming.epoch) + 1
+                } else {
+                    local_manifest.epoch
+                };
+                let mut authors = local_manifest.authors.clone();
+                for a in &incoming.authors {
+                    if !authors.contains(a) {
+                        authors.push(*a);
+                    }
+                }
+                let mut keys = local_keys;
+                keys.extend(incoming_keys);
+                let manifest = Manifest {
+                    vid: *vid,
+                    epoch,
+                    authors,
+                    files: merged.files,
+                    vv: merged.vv,
+                };
+                (manifest, keys, changed, false)
+            }
+        };
+
+        // Materialize every referenced chunk: chunks we already own come from our
+        // served store, the peer's (conflict-loser or dominant-remote) come from the
+        // blob peer. On a first sync all of them come from the peer.
         let mut store = MemoryStore::new();
         for f in &manifest.files {
             if f.deleted {
                 continue;
             }
             for (id, _len) in &f.chunks {
-                scratch.fetch(&bconn, *id).await?;
-                let ct = scratch.get_bytes(*id).await?;
+                if carapace_vault::ChunkStore::has(&store, id)? {
+                    continue;
+                }
+                let ct = match self.blobs.get_bytes(*id).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        scratch.fetch(&bconn, *id).await?;
+                        scratch.get_bytes(*id).await?
+                    }
+                };
                 carapace_vault::ChunkStore::put(&mut store, *id, ct)?;
             }
         }
 
-        let out_dir = out_root.join(hex32(vid));
+        // §11 (BLOCKER 1): reconstruct into the vault's ONE authoritative working
+        // directory - the same tree that is published and watched - so the merged
+        // set (winner at path, losers at sync-conflict names, tombstone deletions)
+        // lands where the watcher will re-observe it, keeping "absent => tombstone"
+        // sound. If this device has no working dir yet (a pure receiver's first
+        // sync), fall back to `out_root/<vid>` and adopt it as the working dir.
+        let out_dir = {
+            let mut s = self.shared.write().expect("shared lock");
+            s.working_dirs
+                .entry(*vid)
+                .or_insert_with(|| out_root.join(hex32(vid)))
+                .clone()
+        };
         reconstruct(&manifest, &store, &keys, &out_dir)?;
+        // §11: apply tombstone deletions so a propagated delete removes a file a
+        // prior reconstruct may have written into this working dir.
+        for f in &manifest.files {
+            if f.deleted && manifest_rel_is_safe(&f.path) {
+                let _ = std::fs::remove_file(out_dir.join(&f.path));
+            }
+        }
+
+        if republish {
+            // Re-publish the merged state so the other device(s) converge on it
+            // (eventual consistency, §7.3): this device now serves both versions and
+            // announces the reconciled manifest at a bumped epoch. Skipped on a no-op
+            // merge (see `changed`) to guarantee termination.
+            self.publish_merged(vid, &manifest, &keys, &store).await?;
+        } else if first_sync {
+            // MAJOR 4: record the reconstructed manifest + keys + epoch as this
+            // device's baseline WITHOUT announcing/serving, so a later local edit
+            // (or watcher re-ingest) diffs against the incoming state instead of
+            // re-minting every file as new and spawning a spurious conflict copy.
+            self.persist_sync_baseline(vid, &manifest, &keys, ann.digest);
+        }
+
         Ok(Reconstructed {
             vid: *vid,
-            epoch: ann.epoch,
+            epoch: manifest.epoch,
             out_dir,
         })
+    }
+
+    /// MAJOR 4: persist a first-sync reconstruction as this device's published
+    /// baseline for `vid` (manifest + per-chunk secrets + epoch) WITHOUT touching
+    /// announces/grants/owned_chunks - the device is a silent receiver until it
+    /// makes a local change. `publish_vault`'s prev-diff then works against the
+    /// incoming state, so an unchanged re-ingest is a no-op and a real local edit
+    /// bumps cleanly instead of re-minting every file as new.
+    fn persist_sync_baseline(
+        &self,
+        vid: &[u8; 32],
+        manifest: &Manifest,
+        keys: &ChunkKeys,
+        digest: [u8; 32],
+    ) {
+        let mut seen = HashSet::new();
+        let mut chunk_ids = Vec::new();
+        for f in &manifest.files {
+            for (id, _len) in &f.chunks {
+                if seen.insert(*id) {
+                    chunk_ids.push(*id);
+                }
+            }
+        }
+        let mut s = self.shared.write().expect("shared lock");
+        s.epochs.insert(*vid, manifest.epoch);
+        s.vault_keys.insert(*vid, keys.clone());
+        s.vault_blobs.insert(
+            *vid,
+            VaultBlobs {
+                digest,
+                chunk_ids,
+                manifest: manifest.clone(),
+            },
+        );
+    }
+
+    /// §11: adopt an already-merged manifest as this device's new published
+    /// baseline for `vid` so the reconciliation propagates. Adds every referenced
+    /// chunk - including the peer's just fetched into `store` - to the served blob
+    /// store, seals + node-signs a fresh envelope, builds a matching grant, and
+    /// replaces this vault's announce/grant/blob-source at the bumped epoch.
+    async fn publish_merged(
+        &self,
+        vid: &[u8; 32],
+        manifest: &Manifest,
+        keys: &ChunkKeys,
+        store: &MemoryStore,
+    ) -> Result<()> {
+        let vkeys = VaultKeys::derive(&*self.k_root, *vid);
+        let envelope = seal_manifest(manifest, &vkeys, &self.node_key)?;
+        let digest = self.blobs.add(&envelope.to_bytes()).await?;
+
+        // Load every referenced chunk into the served store so this device can serve
+        // the reconciled manifest to its peers (both its own and the peer's copies).
+        let mut seen = HashSet::new();
+        let mut chunk_ids = Vec::new();
+        for f in &manifest.files {
+            if f.deleted {
+                continue;
+            }
+            for (id, _len) in &f.chunks {
+                if !seen.insert(*id) {
+                    continue;
+                }
+                let ct = carapace_vault::ChunkStore::get(store, id)?
+                    .with_context(|| "merged chunk missing from store")?;
+                let h = self.blobs.add(&ct).await?;
+                ensure!(&h == id, "iroh blob hash != carapace ChunkID");
+                chunk_ids.push(*id);
+            }
+        }
+
+        let grant = self.build_file_grant(manifest, keys, *vid, manifest.epoch)?;
+
+        let mut s = self.shared.write().expect("shared lock");
+        s.epochs.insert(*vid, manifest.epoch);
+        for id in &chunk_ids {
+            s.owned_chunks.insert(*id, *vid);
+        }
+        s.vault_keys.insert(*vid, keys.clone());
+        let replicas = replica_list(self.node_id(), s.members.get(vid));
+        let mut ann = VaultAnnounce {
+            vid: *vid,
+            epoch: manifest.epoch,
+            replicas,
+            digest,
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        ann.sign(&self.node_key);
+        s.announces.retain(|a| a.vid != *vid);
+        s.announces.push(ann);
+        s.grants.retain(|g| g.vid != *vid);
+        s.grants.push(grant);
+        s.vault_blobs.insert(
+            *vid,
+            VaultBlobs {
+                digest,
+                chunk_ids,
+                manifest: manifest.clone(),
+            },
+        );
+        Ok(())
     }
 
     // ---- friendship (§9.2) ---------------------------------------------
@@ -2540,24 +2917,53 @@ fn replica_owner_device(
 ///
 /// Phase 1 is same-user two-device sync, so the vault owner is bound to *our own*
 /// user key: an announce signed by a node not delegated by our user is refused.
+/// Whether a manifest-supplied relative path is safe to delete under an out dir:
+/// no absolute root, no `..` escape, no backslash. Mirrors `carapace_vault`'s
+/// `safe_join` guard for the tombstone-deletion path (a manifest may be hostile;
+/// Phase 1 manifests are same-user-trusted, so this matches that crate's stance).
+fn manifest_rel_is_safe(rel: &str) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    rel.split('/').all(|p| p != ".." && !p.contains('\\'))
+}
+
 fn select_targets(
     docs: &mut DocStore,
     self_user: &[u8; 32],
+    recv_cards: &[ContactCard],
     announces: &[VaultAnnounce],
     grants: &HashMap<[u8; 32], FileGrant>,
     now: u64,
 ) -> Vec<([u8; 32], VaultAnnounce, FileGrant)> {
-    // The set of node ids our user currently delegates (per its newest card).
-    // Built once so the rollback offer below can borrow `docs` mutably.
-    let delegated: HashSet<[u8; 32]> = match docs.card(self_user) {
-        Some(card) => card
-            .nodes
-            .iter()
-            .filter(|n| card_delegates_node(card, &n.node_id, now))
-            .map(|n| n.node_id)
-            .collect(),
-        None => HashSet::new(),
-    };
+    // The set of node ids our user delegates. The `DocStore` keeps only ONE card per
+    // user, so with 3+ same-user devices that stored card alone names a single
+    // sibling and every other sibling's announce would be refused - silently
+    // dropping that device's edits (a §11 multi-device propagation gap). So also
+    // honor the delegation carried by each card presented in THIS batch: every
+    // announcing device presents its own user-signed card, and a forged card cannot
+    // fake a self_user delegation (it fails `card.verify()`), so trusting any node
+    // our own user validly delegates is safe. This matches the self-branch stance in
+    // `classify_dialer` (own-device revocation remains a separate documented TODO).
+    // Built fully before the rollback offer below borrows `docs` mutably.
+    let mut delegated: HashSet<[u8; 32]> = HashSet::new();
+    if let Some(card) = docs.card(self_user) {
+        for n in &card.nodes {
+            if card_delegates_node(card, &n.node_id, now) {
+                delegated.insert(n.node_id);
+            }
+        }
+    }
+    for card in recv_cards {
+        if &card.user != self_user {
+            continue;
+        }
+        for n in &card.nodes {
+            if card_delegates_node(card, &n.node_id, now) {
+                delegated.insert(n.node_id);
+            }
+        }
+    }
 
     let mut out = Vec::new();
     for ann in announces {
@@ -3133,6 +3539,7 @@ mod tests {
         let targets = select_targets(
             &mut docs,
             &self_user,
+            &[],
             &[announce(&node, vid, 1)],
             &one_grant(&node, vid, 1),
             NOW,
@@ -3147,6 +3554,7 @@ mod tests {
         let targets = select_targets(
             &mut docs,
             &self_user,
+            &[],
             &[announce(&rogue, vid, 1)],
             &one_grant(&rogue, vid, 1),
             NOW,
@@ -3154,6 +3562,47 @@ mod tests {
         assert!(
             targets.is_empty(),
             "undelegated signer must be refused (C1)"
+        );
+
+        // 3+ device propagation: a second sibling node our SAME user delegates -
+        // proven by the card that sibling presents in this batch - is accepted even
+        // though the stored card names only `node`. This is what lets a third
+        // device's edits reach us instead of being silently dropped.
+        let node2 = kp(0x77);
+        let card2 = build_card(&user, &node2, &[9; 32], None);
+        let mut docs = DocStore::new();
+        docs.offer_card(&card).unwrap(); // stored card delegates `node`, not node2
+        let targets = select_targets(
+            &mut docs,
+            &self_user,
+            &[card2],
+            &[announce(&node2, vid, 1)],
+            &one_grant(&node2, vid, 1),
+            NOW,
+        );
+        assert_eq!(
+            targets.len(),
+            1,
+            "a sibling our own user delegates (card in batch) must be accepted"
+        );
+
+        // A card signed by a DIFFERENT user cannot smuggle a delegation into our set
+        // (its user != self_user), so a rogue presenting one stays refused.
+        let rogue_user = kp(0x99);
+        let rogue_card = build_card(&rogue_user, &rogue, &[9; 32], None);
+        let mut docs = DocStore::new();
+        docs.offer_card(&card).unwrap();
+        let targets = select_targets(
+            &mut docs,
+            &self_user,
+            &[rogue_card],
+            &[announce(&rogue, vid, 1)],
+            &one_grant(&rogue, vid, 1),
+            NOW,
+        );
+        assert!(
+            targets.is_empty(),
+            "a foreign-user card cannot delegate into our trusted set"
         );
     }
 
@@ -3176,6 +3625,7 @@ mod tests {
         let targets = select_targets(
             &mut docs,
             &self_user,
+            &[],
             &[announce(&rogue, bad, 1), announce(&node, good, 1)],
             &grants,
             NOW,
@@ -3506,10 +3956,11 @@ mod tests {
         let mut docs = DocStore::new();
         docs.offer_card(&card).unwrap();
 
-        // sync 1: accept epoch 2
+        // sync 1: accept epoch 2 (delegation comes from the stored card)
         let t = select_targets(
             &mut docs,
             &self_user,
+            &[],
             &[announce(&node, vid, 2)],
             &one_grant(&node, vid, 2),
             NOW,
@@ -3521,6 +3972,7 @@ mod tests {
         let t = select_targets(
             &mut docs,
             &self_user,
+            &[],
             &[announce(&node, vid, 1)],
             &one_grant(&node, vid, 1),
             NOW,
@@ -3531,6 +3983,7 @@ mod tests {
         let t = select_targets(
             &mut docs,
             &self_user,
+            &[],
             &[announce(&node, vid, 2)],
             &one_grant(&node, vid, 2),
             NOW,

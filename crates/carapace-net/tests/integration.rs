@@ -101,7 +101,7 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
     let epoch = 1u64;
 
     let mut mem = MemoryStore::new();
-    let ingest = ingest_dir(src.path(), &server_node, &vkeys, epoch, &mut mem)?;
+    let ingest = ingest_dir(src.path(), &server_node, &vkeys, epoch, None, &mut mem)?;
 
     let server_ep = CarapaceEndpoint::bind(&server_node).await?;
     assert_eq!(

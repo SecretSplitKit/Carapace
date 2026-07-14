@@ -273,3 +273,21 @@ daemon-wide `Hello.protocol` enforcement.
   relay (bounded - the relay is a fallback hint, direct/hole-punched paths and
   other friends' relays still work). §6 should note the portmapper does not open
   the relay's TCP port.
+
+## E6 — §11 conflict-file identity uses content hash, not `<dev>` (winner tie-break too)
+
+§11 says a losing concurrent write is renamed `path.sync-conflict-<ts>-<dev>.<ext>`
+and the winner is chosen "by `(mtime, deviceID)`". Deriving `<dev>`/the deviceID
+tie-break from the (post-merge, joined) version vector is **order-dependent**: with
+3+ concurrent devices, different pairwise merge fold orders yield different winners
+and different conflict filenames, so devices permanently diverge (proven in the
+§11 audit: 3 concurrent edits produced different file sets per device). **Resolution:
+identity is derived from order-independent, content-intrinsic data instead** — the
+loser's `file_hash` gives the conflict suffix (`path.sync-conflict-<ts>-<hash>.<ext>`)
+and the winner tie-break is `(mtime, file_hash, size)`, `mtime` still primary per the
+spec. This converges identically on every device regardless of merge order. The
+literal `<dev>` (the device that authored the losing edit) is satisfiable via the
+loser's *original single-device attribution captured before any VV join*; the content
+hash was chosen as the simpler order-independent key. Conflict filenames are local
+artifacts (the manifests/VVs are what sync), so this does not affect cross-client
+data interop. §11 should specify an order-independent conflict identity.

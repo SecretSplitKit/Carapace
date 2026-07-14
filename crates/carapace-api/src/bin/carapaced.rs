@@ -1,7 +1,7 @@
 //! `carapaced` CLI: bind the daemon endpoint and start the loopback control API.
 //!
 //! Usage:
-//!   carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>] [--api-port <PORT>]
+//!   carapaced run --state-dir <PATH> [--publish <DIR> [--watch] --vid <64-hex>] [--api-port <PORT>]
 //!
 //! `run` loads/generates the device state, starts the daemon (serving the blob
 //! store + `carapace/1` control protocol), optionally publishes a vault, starts the
@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
 async fn run(rest: Vec<String>) -> Result<()> {
     let mut state_dir: Option<PathBuf> = None;
     let mut publish: Option<PathBuf> = None;
+    let mut watch = false;
     let mut vid_hex: Option<String> = None;
     let mut api_port: u16 = 0;
     let mut bind: Option<SocketAddr> = None;
@@ -47,6 +48,8 @@ async fn run(rest: Vec<String>) -> Result<()> {
                 state_dir = Some(it.next().context("--state-dir needs a value")?.into())
             }
             "--publish" => publish = Some(it.next().context("--publish needs a value")?.into()),
+            // §11 live sync: keep re-ingesting the published dir on local changes.
+            "--watch" => watch = true,
             "--vid" => vid_hex = Some(it.next().context("--vid needs a value")?),
             "--api-port" => {
                 api_port = it
@@ -113,6 +116,11 @@ async fn run(rest: Vec<String>) -> Result<()> {
         println!("relay_url: {url}");
     }
 
+    // Held for the process lifetime when `--watch` is set; dropping it stops the
+    // §11 filesystem watcher. Must be dropped before `Arc::try_unwrap` below so the
+    // watcher's Weak doesn't outlive its intent (it never blocks unwrap, but drop
+    // it explicitly so watching stops the moment we begin shutdown).
+    let mut vault_watcher = None;
     if let Some(dir) = publish {
         let vid = match vid_hex {
             Some(h) => parse_vid(&h)?,
@@ -120,6 +128,12 @@ async fn run(rest: Vec<String>) -> Result<()> {
         };
         let epoch = daemon.publish_vault(&dir, vid).await?;
         println!("published vid {} at epoch {epoch}", hex(&vid));
+        if watch {
+            vault_watcher = Some(Arc::clone(&daemon).watch_vault(vid, dir.clone())?);
+            println!("watching {} for changes", dir.display());
+        }
+    } else if watch {
+        bail!("--watch requires --publish <DIR>");
     }
 
     let api = carapace_api::serve(Arc::clone(&daemon), &state_dir, api_port).await?;
@@ -131,6 +145,7 @@ async fn run(rest: Vec<String>) -> Result<()> {
 
     println!("serving; press Ctrl-C to stop");
     tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
+    drop(vault_watcher); // stop the §11 watcher before reclaiming the daemon Arc
     api.shutdown();
     match Arc::try_unwrap(daemon) {
         Ok(d) => d.shutdown().await,

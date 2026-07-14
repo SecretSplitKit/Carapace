@@ -78,7 +78,7 @@ fn full_roundtrip_memory_store() {
 
     let (keys, node_key) = setup();
     let mut store = MemoryStore::new();
-    let ingest = ingest_dir(src.path(), &node_key, &keys, 1, &mut store).unwrap();
+    let ingest = ingest_dir(src.path(), &node_key, &keys, 1, None, &mut store).unwrap();
 
     // The big file must have been cut into more than one chunk.
     let big = ingest
@@ -125,7 +125,7 @@ fn envelope_seal_open_verify_and_digest() {
     write_tree(src.path());
     let (keys, node_key) = setup();
     let mut store = MemoryStore::new();
-    let ingest = ingest_dir(src.path(), &node_key, &keys, 7, &mut store).unwrap();
+    let ingest = ingest_dir(src.path(), &node_key, &keys, 7, None, &mut store).unwrap();
 
     // Node signature verifies and digest is BLAKE3 of the envelope bytes.
     assert!(ingest.envelope.verify().is_ok());
@@ -158,7 +158,7 @@ fn full_roundtrip_fs_store() {
 
     let (keys, node_key) = setup();
     let mut store = FsStore::open(blobs.path()).unwrap();
-    let ingest = ingest_dir(src.path(), &node_key, &keys, 1, &mut store).unwrap();
+    let ingest = ingest_dir(src.path(), &node_key, &keys, 1, None, &mut store).unwrap();
 
     reconstruct(&ingest.manifest, &store, &ingest.keys, out.path()).unwrap();
     for (rel, data) in &originals {

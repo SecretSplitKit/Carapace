@@ -8,7 +8,7 @@ unit-tested but never wired to the daemon control stream or a background loop**
 
 | # | Item | Sev | Crates | Status |
 |---|------|-----|--------|--------|
-| W1 | §11 version vectors + conflict-keep + tombstones + manifest merge (silent data loss today) | BLOCKER | vault, wire, net/sync, daemon | TODO |
+| W1 | §11 version vectors + conflict-keep + tombstones + manifest merge (silent data loss today) | BLOCKER | vault, wire, net/sync, daemon | DONE |
 | W2 | Recovery ceremony wired end-to-end (§8.5/§8.4: transport, fan-out/alarm, delay-gated release, claimant recover+re-sign, max-epoch fetch) | BLOCKER | recovery, daemon, api | TODO |
 | W3 | ShareGrant minting/delivery/ref-refresh (§8, §7.3 propagate to trustees) | MAJOR | recovery, daemon | TODO |
 | W4 | Background maintenance loops (§10.1 PoR+repair, §10.2 attestation cadence, self-validate, drift) | MAJOR | daemon, share, recovery | TODO |
@@ -19,7 +19,7 @@ unit-tested but never wired to the daemon control stream or a background loop**
 | W9 | Suite/version rejection: validate Hello.protocol==1, drop mismatch (§2 MUST) | MAJOR | net/sync, wire | DONE |
 | W10 | Relay diversity warning surfaced in GUI (§6 MUST warn <2 networks) | MAJOR | gui, daemon | DONE |
 | W11 | Cross-client golden vectors (KDF tree, chunk-boundary, (vid,P)→ct+ChunkID) + pin FastCDC normalization (§4/§5) | MAJOR | content, kdf, docs, wire | DONE |
-| W12 | §11 filesystem watcher for Dropbox-like live sync | MAJOR | daemon | TODO |
+| W12 | §11 filesystem watcher for Dropbox-like live sync | MAJOR | daemon | DONE |
 | W13 | IPv6 bind/verify (unverifiable — may already dual-stack) | MINOR | net | TODO |
 | W14 | Default initial split N0 = M+1 when caller doesn't override (§12) | MINOR | recovery | DONE |
 | W15 | Paper-card export/print route + GUI action (§10.2 backstop) | MINOR | api, gui | TODO |

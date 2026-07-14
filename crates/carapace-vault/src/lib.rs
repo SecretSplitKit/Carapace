@@ -12,8 +12,13 @@
 //! Every cryptographic primitive routes through `carapace-crypto`; every wire
 //! encoding routes through `carapace-wire`. Nothing is re-implemented here.
 
+pub mod merge;
 mod store;
 
+pub use merge::{
+    bump, canon_vv, concurrent, dominates, merge_entries, merge_manifests, merge_vv, vv_equal,
+    MergedManifest,
+};
 pub use store::{ChunkStore, FsStore, MemoryStore, StoreError};
 
 use carapace_crypto::content::{self, chunk_ranges};
@@ -22,7 +27,7 @@ use carapace_wire::{FileEntry, Manifest, ManifestEnvelope, Vv};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use zeroize::Zeroizing;
@@ -48,6 +53,10 @@ pub enum VaultError {
     FileHashMismatch(String),
     /// A manifest path was absolute or escaped the output root (`..`).
     UnsafePath(String),
+    /// A file's name was not valid UTF-8, so it cannot round-trip through the
+    /// manifest's `String` path without a lossy collapse that could alias it onto
+    /// a distinct file. Rejected rather than silently merged.
+    NonUtf8Path(String),
     /// System clock / metadata could not produce a valid mtime.
     BadMtime,
     /// The system CSPRNG failed.
@@ -66,6 +75,7 @@ impl std::fmt::Display for VaultError {
             VaultError::MissingKey(_) => write!(f, "no key for referenced chunk"),
             VaultError::FileHashMismatch(p) => write!(f, "file hash mismatch for {p}"),
             VaultError::UnsafePath(p) => write!(f, "unsafe manifest path: {p}"),
+            VaultError::NonUtf8Path(p) => write!(f, "non-UTF8 file path: {p}"),
             VaultError::BadMtime => write!(f, "invalid file mtime"),
             VaultError::Rng => write!(f, "system RNG failed"),
         }
@@ -177,17 +187,29 @@ pub struct Ingest {
 ///
 /// Files are visited in sorted path order for a deterministic manifest. Each
 /// file's chunks are FastCDC-cut, sealed with `aad = vid`, and stored under
-/// their ChunkID. The per-file and manifest version vectors are keyed by the
-/// signing node's pubkey at `epoch`.
+/// their ChunkID.
+///
+/// Per-file version vectors follow §11. Pass the device's previously-published
+/// [`Manifest`] as `prev` (or `None` for a first ingest): a file that *changed*
+/// (or is new, or resurrects a tombstone) bumps this node's component so a
+/// concurrent edit on another device is later detectable; an *unchanged* file
+/// carries its prior vector forward untouched; a file that *disappeared* from
+/// disk becomes a tombstone with this node's component bumped, so the delete
+/// propagates.
 pub fn ingest_dir<S: ChunkStore>(
     dir: &Path,
     node_key: &SigningKey,
     keys: &VaultKeys,
     epoch: u64,
+    prev: Option<&Manifest>,
     store: &mut S,
 ) -> Result<Ingest, VaultError> {
     let node_pub = node_key.verifying_key().to_bytes();
-    let vv: Vv = vec![(node_pub, epoch)];
+
+    // Prior per-path entries, for VV carry-forward / bump and tombstoning.
+    let prev_by_path: HashMap<&str, &FileEntry> = prev
+        .map(|m| m.files.iter().map(|f| (f.path.as_str(), f)).collect())
+        .unwrap_or_default();
 
     let mut rel_paths = Vec::new();
     collect_files(dir, dir, &mut rel_paths)?;
@@ -195,6 +217,7 @@ pub fn ingest_dir<S: ChunkStore>(
 
     let mut files = Vec::with_capacity(rel_paths.len());
     let mut key_map: ChunkKeys = HashMap::new();
+    let mut on_disk: HashSet<String> = HashSet::with_capacity(rel_paths.len());
 
     for rel in &rel_paths {
         let full = dir.join(rel);
@@ -214,18 +237,62 @@ pub fn ingest_dir<S: ChunkStore>(
             });
         }
 
+        let path = rel_to_slash(rel)
+            .ok_or_else(|| VaultError::NonUtf8Path(rel.to_string_lossy().into_owned()))?;
+        let version = match prev_by_path.get(path.as_str()) {
+            // Unchanged live file: carry the prior vector forward untouched.
+            Some(p) if !p.deleted && p.file_hash == file_hash => p.version.clone(),
+            // Changed file, or a resurrection of a prior tombstone: bump us.
+            Some(p) => bump(&p.version, &node_pub),
+            // Brand-new file: {node: 1}.
+            None => bump(&Vv::new(), &node_pub),
+        };
+        on_disk.insert(path.clone());
+
         files.push(FileEntry {
-            path: rel_to_slash(rel),
+            path,
             mode: file_mode(&meta),
             mtime: file_mtime(&meta)?,
             size: data.len() as u64,
             chunks: chunk_refs,
             file_hash,
-            version: vv.clone(),
+            version,
             deleted: false,
         });
     }
 
+    // Tombstones for prior paths no longer on disk.
+    if let Some(prevm) = prev {
+        for f in &prevm.files {
+            if on_disk.contains(&f.path) {
+                continue;
+            }
+            if f.deleted {
+                // Persist the existing tombstone so the delete keeps propagating.
+                files.push(f.clone());
+            } else {
+                // Newly deleted -> fresh tombstone with our component bumped.
+                files.push(FileEntry {
+                    path: f.path.clone(),
+                    mode: f.mode,
+                    mtime: f.mtime,
+                    size: 0,
+                    chunks: Vec::new(),
+                    file_hash: [0u8; 32],
+                    version: bump(&f.version, &node_pub),
+                    deleted: true,
+                });
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Manifest-level vector: prior state joined with this node at this epoch.
+    let vv = merge_vv(
+        &prev.map(|m| m.vv.clone()).unwrap_or_default(),
+        &vec![(node_pub, epoch)],
+    );
     let manifest = Manifest {
         vid: keys.vid,
         epoch,
@@ -350,7 +417,48 @@ pub fn reconstruct<S: ChunkStore>(
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&dest, &bytes)?;
+        write_file_with_meta(&dest, &bytes, entry)?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `dest`, then restore the entry's `mtime` (and, on unix, its
+/// `mode`) so that a subsequent [`ingest_dir`] of this tree round-trips to the
+/// identical [`FileEntry`].
+///
+/// This is what makes reconstructing INTO a watched working directory stable
+/// (§11): the daemon's re-ingest of the just-written tree reads back the same
+/// mtime/mode and content, so it produces the same per-file version vectors and is
+/// a no-op instead of a spurious change - which otherwise ping-pongs metadata
+/// between devices (mtime/mode feed conflict resolution) and never converges. The
+/// existing file is removed first so a restored read-only mode from a prior round
+/// does not block the overwrite.
+///
+/// ponytail: writes in place (remove + create + write), NOT a temp-file + atomic
+/// rename, so a reader (or the working-dir watcher) that peeks mid-write can see a
+/// truncated/partial file; the daemon's per-vid publish lock + debounce cover its
+/// OWN re-ingest, but a concurrent external reader has no such guard. Upgrade path:
+/// write to `dest.tmp` then `fs::rename` for atomic replace (and fsync the dir) if
+/// external mid-write reads ever matter.
+fn write_file_with_meta(dest: &Path, bytes: &[u8], entry: &FileEntry) -> Result<(), VaultError> {
+    use std::io::Write;
+    let _ = fs::remove_file(dest);
+    let mut f = fs::File::create(dest)?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    let mtime = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(entry.mtime))
+        .ok_or(VaultError::BadMtime)?;
+    // Restore mtime after the write (which would otherwise stamp "now").
+    f.set_modified(mtime)?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            dest,
+            fs::Permissions::from_mode((entry.mode & 0o7777) as u32),
+        )?;
     }
     Ok(())
 }
@@ -376,14 +484,18 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
     Ok(())
 }
 
-fn rel_to_slash(rel: &Path) -> String {
-    rel.components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+/// Join a relative path's normal components with `/`, returning `None` if any
+/// component is not valid UTF-8. A lossy collapse (`to_string_lossy` -> U+FFFD)
+/// could map two distinct filenames onto one manifest path and silently merge
+/// their content, so a non-UTF8 name is refused at the source instead.
+fn rel_to_slash(rel: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        if let Component::Normal(s) = c {
+            parts.push(s.to_str()?.to_string());
+        }
+    }
+    Some(parts.join("/"))
 }
 
 #[cfg(unix)]
