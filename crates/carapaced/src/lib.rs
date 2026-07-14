@@ -40,8 +40,8 @@ use carapace_net::{
     DocStore, IrohBlobStore, PeerHints, RelayAccessPolicy,
 };
 use carapace_recovery::{
-    extend_split, share_to_json, split_root, split_vault, CeremonyState, PolicyWarning,
-    RecoveryRateLimiter,
+    build_share_grant, extend_split, share_to_json, split_root, split_vault, verify_share_grant,
+    CeremonyState, PolicyWarning, RecoveryRateLimiter,
 };
 use carapace_replica::{
     build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
@@ -59,10 +59,10 @@ use carapace_vault::{
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
-    CeremonyAbort, CeremonyApprove, ContactCard, FileGrant, FriendAccept, FriendRequest,
-    Friendship, GrantBody, GrantChunk, GrantFile, Hello, InviteTicket, Manifest, ManifestEnvelope,
-    NodeEntry, Offers, RecoveryOpen, ReplicaAccept, ReplicaInvite, Sealed, ShareAttestChallenge,
-    ShareAttestation, ShareGrant, Signed, VaultAnnounce,
+    AnnounceRef, CeremonyAbort, CeremonyApprove, CoTrustee, ContactCard, FileGrant, FriendAccept,
+    FriendRequest, Friendship, GrantBody, GrantChunk, GrantFile, Hello, InviteTicket, Manifest,
+    ManifestEnvelope, NodeEntry, Offers, RecoveryOpen, ReplicaAccept, ReplicaInvite, Sealed,
+    ShareAttestChallenge, ShareAttestation, ShareGrant, Signed, VaultAnnounce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -187,8 +187,42 @@ pub struct MaintenanceReport {
     pub drift: Vec<(u64, ShareAction)>,
     /// Per held share, the trustee self-validation verdict this round (§10.2).
     pub self_validated: Vec<(u64, ShareHealth)>,
+    /// Recovery-set ids whose trustees' grants were re-issued with fresh announce
+    /// refs this round (W3, §7.3): the owner published a new vault epoch (or a prior
+    /// delivery was outstanding), so trustees were pushed current manifest pointers.
+    pub refreshed_grants: Vec<u64>,
     /// Non-fatal per-item errors (one bad vault/set does not abort the round).
     pub errors: Vec<String>,
+}
+
+/// Outcome of an owner-side split-and-grant (§8, W3): which trustees were reached and
+/// hold a fresh grant, plus any §8.3 issuance policy warnings.
+#[derive(Clone, Debug, Default)]
+pub struct GrantSplitReport {
+    /// The recovery-set id the split was recorded under.
+    pub rsid: u64,
+    /// Trustee USER pubkeys that acknowledged storing their grant this round.
+    pub delivered: Vec<[u8; 32]>,
+    /// Trustee USER pubkeys that were minted a grant but could not be reached /
+    /// declined; the maintenance refresh round retries them.
+    pub undelivered: Vec<[u8; 32]>,
+    /// §8.3 issuance policy warnings surfaced by the split.
+    pub warnings: Vec<PolicyWarning>,
+}
+
+/// The W3 grant surface for one owned recovery set, for the status/`/api/recovery`
+/// view: which trustees hold a grant and how fresh their announce refs are.
+#[derive(Clone, Debug)]
+pub struct RecoveryGrantReport {
+    /// The recovery-set id.
+    pub rsid: u64,
+    /// The subject user whose secret is split (this owner).
+    pub subject: [u8; 32],
+    /// Per trustee: its user pubkey and whether its last grant delivery succeeded.
+    pub trustees: Vec<([u8; 32], bool)>,
+    /// The announce refs currently carried in the trustees' grants: `(vid, epoch)`
+    /// per referenced vault. Advances as the owner publishes new epochs (§10.2).
+    pub refs: Vec<([u8; 32], u64)>,
 }
 
 /// The §10.2 share-health surface for one owned recovery set, for the status API.
@@ -373,7 +407,56 @@ struct Shared {
     /// Recovery ceremonies this device tracks (§8.5), keyed by ceremony id. The GUI
     /// drives approve/abort against these; `phase`/`can_release` read from them.
     ceremonies: HashMap<[u8; 16], carapace_recovery::CeremonyState>,
+    /// Trustee-side: the full verified `ShareGrant`s this daemon holds for other
+    /// owners (W3, §8), keyed by the subject user pubkey whose secret was split. Held
+    /// verbatim (roster + recovery_delay + announce refs), so at ceremony time the
+    /// quorum has the co-trustee set to reach and the latest manifest pointers to
+    /// fetch - unlike a bare `Share`, which locates nothing without a live owner. The
+    /// embedded share is ALSO stored in `held_shares` for the attestation cadence.
+    held_grants: HashMap<[u8; 32], ShareGrant>,
+    /// Owner-side: the grants this daemon minted per recovery set (W3, §8), keyed by
+    /// recovery-set id. Retains each trustee's share + hints and the last-delivered
+    /// announce refs so the maintenance loop can re-issue refreshed grants pointing at
+    /// the latest manifest as new vault epochs publish (§10.2, §7.3).
+    granted: HashMap<u64, OwnerGrants>,
 }
+
+/// Owner-side record of the [`ShareGrant`]s minted for one recovery set (§8), so the
+/// maintenance loop can refresh the announce refs in each trustee's grant as the
+/// owner publishes new vault epochs (§10.2, §7.3).
+struct OwnerGrants {
+    /// The subject user whose secret is split (this owner's user key).
+    subject: [u8; 32],
+    /// The owner's chosen abort window carried in every grant (§8.5, default 72 h).
+    recovery_delay: u64,
+    /// One entry per trustee that was minted a grant.
+    trustees: Vec<GrantedTrustee>,
+    /// The announce refs last delivered in these grants. The refresh round re-issues
+    /// only when the current owned-vault refs differ from these (an epoch advanced).
+    refs: Vec<AnnounceRef>,
+}
+
+/// One trustee holding an owner-minted grant: its identity + node hints (for the
+/// co-trustee roster and delivery dial) plus its own share, re-signed into a
+/// refreshed grant when the refs advance. The share is a secret kept in memory
+/// beside `k_root`/`vault_keys`; no weaker than already holding the split source.
+struct GrantedTrustee {
+    user: [u8; 32],
+    node: [u8; 32],
+    relay_url: Option<String>,
+    share: Share,
+    /// Whether the last delivery to this trustee succeeded (surfaced on the status
+    /// view so an operator sees which trustees actually hold a current grant).
+    delivered: bool,
+}
+
+/// One trustee's inputs to a grant refresh: its roster entry, resolved dial address,
+/// its own share (re-signed into the refreshed grant), and its prior delivery flag.
+type TrusteeJob = (CoTrustee, Option<EndpointAddr>, Share, bool);
+
+/// One recovery set's grant-refresh job, snapshotted off-lock:
+/// `(rsid, subject, recovery_delay, fresh announce refs, per-trustee jobs)`.
+type RefreshJob = (u64, [u8; 32], u64, Vec<AnnounceRef>, Vec<TrusteeJob>);
 
 /// One owner-side recovery split: the scope it splits (identity `K_root` or a scoped
 /// `K_vaultroot(vid)`) and the open Chela [`SplitState`] to extend from.
@@ -469,6 +552,10 @@ impl ControlHandler {
             Some((ShareAttestChallenge::TYPE, body)) => {
                 let ch = ShareAttestChallenge::from_map(body)?;
                 self.serve_attest(ch, &remote, &mut send).await?;
+            }
+            Some((ShareGrant::TYPE, body)) => {
+                let grant = ShareGrant::from_map(body)?;
+                self.serve_grant(grant, &remote, &mut send).await?;
             }
             // Unknown/legacy first frame (or a bare Hello): reveal only the Hello.
             _ => {
@@ -775,6 +862,67 @@ impl ControlHandler {
             if let Ok(att) = answer_attest_challenge(&self.node_key, &ch, &share) {
                 write_msg(send, &att).await?;
             }
+        }
+        send.finish()?;
+        Ok(())
+    }
+
+    /// Trustee half of grant delivery (§8, W3): receive a `ShareGrant` an owner
+    /// minted for us and, if it is authentic, store the FULL grant (roster +
+    /// recovery_delay + announce refs) keyed by its subject user - not a bare share,
+    /// which locates nothing without a live owner. Two independent checks must pass:
+    ///
+    /// - the grant's own signature verifies AND its embedded share decodes (the
+    ///   words' CRC self-validates), via [`verify_share_grant`]; and
+    /// - the connection's authenticated peer signed the grant (`grant.by == remote`)
+    ///   and is an established friend (or our own device) - so only a friend we chose
+    ///   as our owner can plant a grant on us (delegation gate, mirrors `serve_attest`).
+    ///
+    /// On success the embedded share is ALSO recorded in `held_shares` so the existing
+    /// attestation cadence + local self-validation keep working. A grant that fails
+    /// either check is dropped with no ack frame (a silent decline). The owner learns
+    /// delivery succeeded from the ack.
+    async fn serve_grant(
+        &self,
+        grant: ShareGrant,
+        remote: &[u8; 32],
+        send: &mut SendStream,
+    ) -> Result<()> {
+        let now = unix_now();
+        // Signature + embedded-share (CRC) verification. A tampered grant or a
+        // corrupt share is rejected here before anything is stored.
+        let share = match verify_share_grant(&grant) {
+            Ok(share) => share,
+            Err(_) => {
+                send.finish()?; // decline: no ack frame
+                return Ok(());
+            }
+        };
+        let rsid = u64::from(share.recovery_set_id);
+
+        let stored = {
+            let mut s = self.shared.write().expect("shared lock");
+            // Delegation gate: the owner node that signed the grant must be the
+            // connection's authenticated peer AND an established friend (or ours).
+            let authorized =
+                grant.by == *remote && node_is_authorized(&s, &self.self_user, remote, now);
+            if !authorized {
+                false
+            } else {
+                let subject = grant.subject;
+                s.held_grants.insert(subject, grant);
+                // Keep the existing share self-validation + attestation-answer path
+                // working: the embedded share is the authoritative object the words
+                // carry. Preserve any existing monitor's cadence state.
+                s.held_shares
+                    .entry(rsid)
+                    .and_modify(|(sh, _)| *sh = share.clone())
+                    .or_insert_with(|| (share.clone(), ShareMonitor::new()));
+                true
+            }
+        };
+        if stored {
+            write_u64(send, 1).await?; // ack: the grant is held
         }
         send.finish()?;
         Ok(())
@@ -2498,6 +2646,11 @@ impl Daemon {
             }
         }
 
+        // 4) Owner grant ref-refresh (W3, §10.2/§7.3): re-issue trustees' grants with
+        //    the latest announce refs whenever a vault epoch has advanced (or a prior
+        //    delivery is still outstanding), so trustees hold current manifest pointers.
+        report.refreshed_grants = self.refresh_grants_round().await;
+
         report
     }
 
@@ -3027,6 +3180,292 @@ impl Daemon {
         Ok(shares.iter().map(share_to_json).collect())
     }
 
+    /// Split a recovery secret `M`-of-`N` (N = `trustees.len()`) and mint + deliver one
+    /// signed [`ShareGrant`] per trustee over the `carapace/1` control stream (§8, W3).
+    /// Each grant wraps that trustee's `chela.share` JSON, the co-trustee roster (every
+    /// OTHER trustee's user + node + relay, from its established-friend card), the
+    /// owner's `recovery_delay` abort window (§8.5, default 72 h), and the latest
+    /// [`AnnounceRef`]s for this owner's published vaults - so a quorum can locate the
+    /// current manifest + a live replica at ceremony time without the owner present.
+    ///
+    /// Records the extendable split-state, an owner-side share-health tracker (§10.2),
+    /// and the grant set (for the maintenance refresh + status view), all under `rsid`
+    /// (overwriting any prior record - this is also the re-split path). Every trustee
+    /// MUST be an established friend whose card names a node; that is where the roster
+    /// identity and the delivery address come from. A trustee that is unreachable /
+    /// declines is recorded as undelivered and retried by the refresh round; it does
+    /// not abort the split (the words are already committed to the polynomial).
+    pub async fn recovery_split_grant(
+        &self,
+        rsid: u64,
+        scope: RecoveryScope,
+        m: u8,
+        trustees: &[[u8; 32]],
+        recovery_delay: u64,
+        allow_over_cap: bool,
+    ) -> Result<GrantSplitReport> {
+        ensure!(
+            !trustees.is_empty(),
+            "a recovery split needs at least one trustee"
+        );
+        let n = u8::try_from(trustees.len()).context("too many trustees (max 32)")?;
+        let subject = self.user_id();
+
+        // Resolve each trustee's roster identity (user + primary node + relay) from its
+        // established-friend card, plus a dialable address for delivery. A trustee that
+        // is not a friend, or whose card names no node, fails loudly - we cannot build
+        // a roster entry or deliver to it.
+        let resolved = {
+            let s = self.shared.read().expect("shared lock");
+            let mut out: Vec<(CoTrustee, Option<EndpointAddr>)> =
+                Vec::with_capacity(trustees.len());
+            for user in trustees {
+                let card = s.friends.get(user).with_context(|| {
+                    format!("trustee {} is not an established friend", hex32(user))
+                })?;
+                let node = card
+                    .nodes
+                    .first()
+                    .with_context(|| format!("trustee {} card names no node", hex32(user)))?;
+                let ct = CoTrustee {
+                    user: *user,
+                    node: node.node_id,
+                    relay_url: node.relay_url.clone(),
+                };
+                out.push((ct, resolve_peer(&s.peer_addrs, &node.node_id)));
+            }
+            out
+        };
+
+        // Split M-of-N and record the extendable state. One share per trustee.
+        let (shares, state, warnings) = match scope {
+            RecoveryScope::Root => split_root(&self.k_root, m, Some(n), allow_over_cap),
+            RecoveryScope::Vault(vid) => {
+                split_vault(&self.k_root, &vid, m, Some(n), allow_over_cap)
+            }
+        }
+        .map_err(|e| anyhow::anyhow!("recovery split failed: {e:?}"))?;
+        ensure!(
+            shares.len() == resolved.len(),
+            "split produced {} shares for {} trustees",
+            shares.len(),
+            resolved.len()
+        );
+
+        // The latest announce refs over this owner's published vaults - the pointers a
+        // recovering quorum follows to the current manifest + a live replica (§7.3).
+        let refs = {
+            let s = self.shared.read().expect("shared lock");
+            current_announce_refs(&s)
+        };
+
+        // Mint one grant per trustee (roster excludes the recipient) and deliver it.
+        let mut report = GrantSplitReport {
+            rsid,
+            warnings,
+            ..Default::default()
+        };
+        let mut trustee_records = Vec::with_capacity(resolved.len());
+        let mut roster: HashMap<[u8; 32], u64> = HashMap::new();
+        for (i, (ct, addr)) in resolved.iter().enumerate() {
+            let share = &shares[i];
+            let cotrustees: Vec<CoTrustee> = resolved
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, (o, _))| o.clone())
+                .collect();
+            let grant = build_share_grant(
+                &self.node_key,
+                subject,
+                share,
+                recovery_delay,
+                cotrustees,
+                refs.clone(),
+            );
+            let delivered = match addr {
+                Some(a) => self.deliver_grant(a, &grant).await.unwrap_or(false),
+                None => false,
+            };
+            if delivered {
+                report.delivered.push(ct.user);
+            } else {
+                report.undelivered.push(ct.user);
+            }
+            roster.insert(ct.node, u64::from(share.x));
+            trustee_records.push(GrantedTrustee {
+                user: ct.user,
+                node: ct.node,
+                relay_url: ct.relay_url.clone(),
+                share: share.clone(),
+                delivered,
+            });
+        }
+
+        // Record owner-side: the extendable split state, the share-health tracker
+        // (§10.2 attestation cadence), and the grant set (refresh + status).
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            s.split_states.insert(rsid, RecoverySet { scope, state });
+            s.share_sets
+                .insert(rsid, AttestTracker::new(m, shares.len(), roster));
+            s.granted.insert(
+                rsid,
+                OwnerGrants {
+                    subject,
+                    recovery_delay,
+                    trustees: trustee_records,
+                    refs,
+                },
+            );
+        }
+        Ok(report)
+    }
+
+    /// Dial `peer`'s control stream and send a `ShareGrant` (§8, W3). Returns `true`
+    /// iff the trustee acknowledged storing it (a verified + delegated grant). A
+    /// trustee that is unreachable, declines (bad delegation), or answers with no ack
+    /// frame yields `false` - the caller records it undelivered and the refresh round
+    /// retries. The dial is bounded so an offline trustee fails fast.
+    ///
+    /// Public so an owner (or a conformance test) can push a single grant directly; the
+    /// trustee independently re-verifies signature + delegation on receipt.
+    pub async fn deliver_grant(&self, peer: &EndpointAddr, grant: &ShareGrant) -> Result<bool> {
+        let conn = tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(peer.clone(), ALPN))
+            .await
+            .context("grant delivery dial timed out")?
+            .context("grant delivery dial failed")?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, grant).await?;
+        // The trustee acks with a single u64 (== 1) on success, or finishes the stream
+        // with no bytes (decline). A short read is therefore a decline, not an error.
+        let acked = matches!(read_u64(&mut recv).await, Ok(1));
+        let _ = send.finish();
+        Ok(acked)
+    }
+
+    /// Owner-side refresh round (§10.2 attestation cycle, §7.3): for each recovery set
+    /// this owner minted grants for, if the current announce refs over its published
+    /// vaults differ from what the trustees last received (a new epoch published),
+    /// re-mint each trustee's grant with the fresh refs and re-deliver it, so trustees
+    /// always hold current manifest pointers. A trustee that was previously
+    /// undelivered is retried every round regardless. No lock is held across a dial.
+    ///
+    /// Returns the rsids whose grants were refreshed this round (for the report/tests).
+    pub async fn refresh_grants_round(&self) -> Vec<u64> {
+        // Snapshot the work set + current refs under a read lock, act off-lock.
+        let jobs: Vec<RefreshJob> = {
+            let s = self.shared.read().expect("shared lock");
+            let cur_refs = current_announce_refs(&s);
+            s.granted
+                .iter()
+                .filter_map(|(rsid, g)| {
+                    let stale = g.refs != cur_refs;
+                    let any_undelivered = g.trustees.iter().any(|t| !t.delivered);
+                    if !stale && !any_undelivered {
+                        return None;
+                    }
+                    let ts: Vec<TrusteeJob> = g
+                        .trustees
+                        .iter()
+                        .map(|t| {
+                            (
+                                CoTrustee {
+                                    user: t.user,
+                                    node: t.node,
+                                    relay_url: t.relay_url.clone(),
+                                },
+                                resolve_peer(&s.peer_addrs, &t.node),
+                                t.share.clone(),
+                                t.delivered,
+                            )
+                        })
+                        .collect();
+                    Some((*rsid, g.subject, g.recovery_delay, cur_refs.clone(), ts))
+                })
+                .collect()
+        };
+
+        let mut refreshed = Vec::new();
+        for (rsid, subject, delay, refs, ts) in jobs {
+            let mut new_records = Vec::with_capacity(ts.len());
+            for (i, (ct, addr, share, _was)) in ts.iter().enumerate() {
+                let cotrustees: Vec<CoTrustee> = ts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, (o, _, _, _))| o.clone())
+                    .collect();
+                let grant = build_share_grant(
+                    &self.node_key,
+                    subject,
+                    share,
+                    delay,
+                    cotrustees,
+                    refs.clone(),
+                );
+                let delivered = match addr {
+                    Some(a) => self.deliver_grant(a, &grant).await.unwrap_or(false),
+                    None => false,
+                };
+                new_records.push(GrantedTrustee {
+                    user: ct.user,
+                    node: ct.node,
+                    relay_url: ct.relay_url.clone(),
+                    share: share.clone(),
+                    delivered,
+                });
+            }
+            // Commit the refreshed refs + delivery flags for this set.
+            let mut s = self.shared.write().expect("shared lock");
+            if let Some(g) = s.granted.get_mut(&rsid) {
+                g.trustees = new_records;
+                g.refs = refs;
+            }
+            refreshed.push(rsid);
+        }
+        refreshed
+    }
+
+    /// The W3 grant surface for the status / `/api/recovery` view: per recovery set
+    /// this owner minted grants for, which trustees hold a grant and how fresh their
+    /// announce refs are.
+    pub fn recovery_grants(&self) -> Vec<RecoveryGrantReport> {
+        let s = self.shared.read().expect("shared lock");
+        s.granted
+            .iter()
+            .map(|(rsid, g)| RecoveryGrantReport {
+                rsid: *rsid,
+                subject: g.subject,
+                trustees: g.trustees.iter().map(|t| (t.user, t.delivered)).collect(),
+                refs: g.refs.iter().map(|r| (r.vid, r.epoch)).collect(),
+            })
+            .collect()
+    }
+
+    /// Trustee-side: the full [`ShareGrant`] this daemon holds for `subject` (the owner
+    /// whose secret was split), if any (§8, W3). Carries the co-trustee roster, the
+    /// recovery delay, and the latest announce refs - what a ceremony needs.
+    pub fn held_grant(&self, subject: &[u8; 32]) -> Option<ShareGrant> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .held_grants
+            .get(subject)
+            .cloned()
+    }
+
+    /// Trustee-side: the subject user pubkeys this daemon holds a grant for (W3).
+    pub fn held_grant_subjects(&self) -> Vec<[u8; 32]> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .held_grants
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Begin tracking an inbound recovery ceremony (§8.5) from a signed `RecoveryOpen`
     /// gated by a signed `ShareGrant`. Verifies both, derives roster/`M`/delay from the
     /// grant, charges the per-subject rate limit, and records the ceremony. Returns the
@@ -3482,6 +3921,25 @@ fn friend_storage_grant(s: &Shared, node: &[u8; 32], now: u64) -> u64 {
         }
     }
     DEFAULT_QUOTA_BYTES
+}
+
+/// The latest [`AnnounceRef`]s over this owner's published vaults (W3, §7.3): one
+/// `(vid, epoch, digest)` per owned-vault announce, sorted by vid so the set is
+/// order-stable (a refresh only re-issues on a real epoch change, not on map
+/// iteration order). Third-party announces live in the doc store, not `s.announces`,
+/// so this is exactly the owner's own vaults.
+fn current_announce_refs(s: &Shared) -> Vec<AnnounceRef> {
+    let mut refs: Vec<AnnounceRef> = s
+        .announces
+        .iter()
+        .map(|a| AnnounceRef {
+            vid: a.vid,
+            epoch: a.epoch,
+            digest: a.digest,
+        })
+        .collect();
+    refs.sort_by_key(|r| r.vid);
+    refs
 }
 
 /// The announce `replicas` list: this device first, then the accepted members.

@@ -10,7 +10,7 @@ unit-tested but never wired to the daemon control stream or a background loop**
 |---|------|-----|--------|--------|
 | W1 | §11 version vectors + conflict-keep + tombstones + manifest merge (silent data loss today) | BLOCKER | vault, wire, net/sync, daemon | DONE |
 | W2 | Recovery ceremony wired end-to-end (§8.5/§8.4: transport, fan-out/alarm, delay-gated release, claimant recover+re-sign, max-epoch fetch) | BLOCKER | recovery, daemon, api | TODO |
-| W3 | ShareGrant minting/delivery/ref-refresh (§8, §7.3 propagate to trustees) | MAJOR | recovery, daemon | TODO |
+| W3 | ShareGrant minting/delivery/ref-refresh (§8, §7.3 propagate to trustees) | MAJOR | recovery, daemon | DONE |
 | W4 | Background maintenance loops (§10.1 PoR+repair, §10.2 attestation cadence, self-validate, drift) | MAJOR | daemon, share, recovery | DONE |
 | W5 | Unfriend + trustee re-split flow wired (§9.3: FriendshipEnd, delete reqs, gated destroy sequence, re-split prompt) | BLOCKER | friend, daemon, api, replica, gui | TODO |
 | W6 | Relay reachability lifecycle: dialback verify, advertise-on-success/withdraw-on-loss, self-elect, relay-TCP port mapping (§6) | BLOCKER | net, daemon | TODO |

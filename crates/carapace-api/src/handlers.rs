@@ -209,6 +209,26 @@ fn status_snapshot(d: &Daemon) -> Value {
             })
         })
         .collect();
+    // W3 (§8, §7.3): per owned recovery set, which trustees hold a minted ShareGrant
+    // and the announce-ref freshness (vid + epoch) the maintenance loop keeps current.
+    let grants: Vec<Value> = d
+        .recovery_grants()
+        .iter()
+        .map(|g| {
+            json!({
+                "rsid": g.rsid,
+                "subject": hexs(&g.subject),
+                "trustees": g.trustees.iter()
+                    .map(|(u, delivered)| json!({ "user": hexs(u), "delivered": delivered }))
+                    .collect::<Vec<_>>(),
+                "refs": g.refs.iter()
+                    .map(|(vid, epoch)| json!({ "vid": hexs(vid), "epoch": epoch }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    // W3 trustee side: subject users whose grants this daemon holds for others.
+    let held_grants: Vec<String> = d.held_grant_subjects().iter().map(|u| hexs(u)).collect();
     let relay_url = d.advertised_relay_url();
     // W4 (§6 MUST): warn when the usable relay set spans fewer than 2 distinct
     // networks - a single relay is a single point of failure and metadata choke.
@@ -220,6 +240,7 @@ fn status_snapshot(d: &Daemon) -> Value {
         "friends": { "count": friends.len(), "list": friends },
         "vaults": { "published": vaults, "held_replicas": held },
         "share_health": { "recovery_sets_owned": sets, "shares_held": shares, "recovery": recovery },
+        "recovery_grants": { "minted": grants, "held": held_grants },
         "reachability": if relay_url.is_some() { "relay" } else { "direct" },
         "relay_networks": relay_networks,
         "relay_diversity_warning": relay_networks < 2,
@@ -430,36 +451,77 @@ fn to_scope(s: &ScopeReq) -> Result<RecoveryScope, ApiError> {
     })
 }
 
+/// Default owner abort window carried in a `ShareGrant` when the caller does not
+/// override it (§8.5): 72 hours in seconds.
+const DEFAULT_RECOVERY_DELAY_SECS: u64 = 72 * 3600;
+
 #[derive(Deserialize)]
 pub struct SplitReq {
     rsid: u64,
     scope: ScopeReq,
     m: u8,
-    n: u8,
+    /// Total shares to issue when splitting to bare words (no `trustees` given).
+    n: Option<u8>,
+    /// W3: when present, mint + deliver one signed `ShareGrant` per trustee (each a
+    /// hex user pubkey of an established friend) instead of returning bare words.
+    /// `N` is the trustee count.
+    trustees: Option<Vec<String>>,
+    /// Owner abort window for the minted grants (§8.5); defaults to 72 h.
+    recovery_delay: Option<u64>,
     allow_over_cap: Option<bool>,
 }
 
-fn do_split(st: &AppState, req: &SplitReq) -> Result<Json<Value>, ApiError> {
+async fn do_split(st: &AppState, req: &SplitReq) -> Result<Json<Value>, ApiError> {
     let scope = to_scope(&req.scope)?;
-    let (shares, warnings) = st.daemon.recovery_split(
-        req.rsid,
-        scope,
-        req.m,
-        req.n,
-        req.allow_over_cap.unwrap_or(false),
-    )?;
+    let allow_over_cap = req.allow_over_cap.unwrap_or(false);
+
+    // W3 grant path: split to trustees and deliver signed grants over the control
+    // stream, so trustees hold the roster + delay + announce refs a ceremony needs.
+    if let Some(trustee_hex) = &req.trustees {
+        let trustees: Vec<[u8; 32]> = trustee_hex
+            .iter()
+            .map(|h| parse_hex32(h))
+            .collect::<Result<_, _>>()?;
+        let report = st
+            .daemon
+            .recovery_split_grant(
+                req.rsid,
+                scope,
+                req.m,
+                &trustees,
+                req.recovery_delay.unwrap_or(DEFAULT_RECOVERY_DELAY_SECS),
+                allow_over_cap,
+            )
+            .await?;
+        return Ok(Json(json!({
+            "rsid": report.rsid,
+            "delivered": report.delivered.iter().map(|u| hexs(u)).collect::<Vec<_>>(),
+            "undelivered": report.undelivered.iter().map(|u| hexs(u)).collect::<Vec<_>>(),
+            "warnings": report.warnings.iter().map(|w| format!("{w:?}")).collect::<Vec<_>>(),
+        })));
+    }
+
+    // Bare-words path (no trustee set): return each share's JSON carrier.
+    let n = req
+        .n
+        .ok_or_else(|| bad("split requires either `n` or `trustees`"))?;
+    let (shares, warnings) = st
+        .daemon
+        .recovery_split(req.rsid, scope, req.m, n, allow_over_cap)?;
     Ok(Json(json!({
         "shares": shares,
         "warnings": warnings.iter().map(|w| format!("{w:?}")).collect::<Vec<_>>(),
     })))
 }
 
-/// `POST /api/recovery/split`: split `K_root` or `K_vaultroot(vid)` M-of-N.
+/// `POST /api/recovery/split`: split `K_root` or `K_vaultroot(vid)` M-of-N. With a
+/// `trustees` list, mints + delivers a signed `ShareGrant` to each (W3); otherwise
+/// returns the bare share words.
 pub async fn recovery_split(
     State(st): State<AppState>,
     Json(req): Json<SplitReq>,
 ) -> Result<Json<Value>, ApiError> {
-    do_split(&st, &req)
+    do_split(&st, &req).await
 }
 
 /// `POST /api/recovery/resplit`: re-split at (typically larger) M (§8.3). Same
@@ -468,7 +530,7 @@ pub async fn recovery_resplit(
     State(st): State<AppState>,
     Json(req): Json<SplitReq>,
 ) -> Result<Json<Value>, ApiError> {
-    do_split(&st, &req)
+    do_split(&st, &req).await
 }
 
 #[derive(Deserialize)]
