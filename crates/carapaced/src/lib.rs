@@ -73,7 +73,7 @@ use carapace_wire::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{EndpointAddr, EndpointId};
+use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -391,6 +391,13 @@ struct Shared {
     /// Per-peer token buckets limiting how much a friend can push into our replica
     /// store per unit time (W1). Configured from [`ReplicaLimits`] at start.
     rate: RateLimiter,
+    /// Embedded-relay reachability lifecycle state (§6/W6). Tracks the URL our own
+    /// card currently advertises (`None` when the relay is down/withdrawn or we run
+    /// none), the local URL peer-dialback matches, and the last dialback time.
+    /// Driven by the maintenance loop's liveness probe; the own card's `relay_url`
+    /// is kept in lockstep with `advertised_url` (each change bumps the card
+    /// version, the monotonic rollback counter).
+    relay_health: RelayHealth,
     /// Owner-side PoR bookkeeping (§10.1): per-`(replica, vid)` audit schedule,
     /// round counter, and consecutive-failure streak against an injected clock.
     /// Single-writer per vault: only the vault owner's `por_audit_round` mutates it.
@@ -489,6 +496,42 @@ struct Shared {
     /// re-placed immediately - treated as confirmed lost NOW (no 24 h grace), via a
     /// `Health::Unfriended` repair. Drained by `replace_unfriended_replicas`.
     unfriended_nodes: HashSet<[u8; 32]>,
+}
+
+/// Consecutive failed liveness probes required before withdrawing an advertised
+/// relay (W6 hysteresis).
+///
+/// The probe is a 2 s loopback TCP connect; under load a single connect can time
+/// out on a perfectly healthy relay, and each spurious withdraw costs two card
+/// re-issues (withdraw plus re-advertise). Requiring three consecutive failures
+/// rides out a transient stall while still catching a genuinely dead listener
+/// within a few maintenance rounds.
+const RELAY_PROBE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Embedded-relay reachability lifecycle state (§6/W6).
+///
+/// §6 requires a node's advertised relay to be dialback-verified and to be
+/// *advertised on success, withdrawn on loss* - never advertised unconditionally
+/// at startup. This tracks:
+/// - `advertised_url`: the relay URL currently folded into this node's own card
+///   (`None` when the relay is down/withdrawn, or when it runs no relay). The own
+///   card's `NodeEntry.relay_url` is kept exactly equal to this; every change is a
+///   card re-issue with a bumped (monotonic) version.
+/// - `local_url`: the URL our own endpoint registers on and reaches the relay at
+///   (loopback-substituted), which is also the URL an inbound relayed QUIC path
+///   carries - so peer-dialback matches an inbound relay path against it.
+/// - `verified_at`: the last time a friend was observed reaching us *through* our
+///   relay (peer-dialback, §6). Surfaced for the operator; see the module note on
+///   why it confirms rather than gates advertising.
+#[derive(Default)]
+struct RelayHealth {
+    advertised_url: Option<String>,
+    local_url: Option<RelayUrl>,
+    verified_at: Option<u64>,
+    /// Number of consecutive failed liveness probes since the last success (W6
+    /// hysteresis). Reset to 0 on any successful probe; a withdraw fires only
+    /// when it reaches [`RELAY_PROBE_FAILURE_THRESHOLD`].
+    consecutive_failures: u32,
 }
 
 /// Owner-side record of the [`ShareGrant`]s minted for one recovery set (§8), so the
@@ -813,6 +856,10 @@ struct ControlHandler {
 impl ControlHandler {
     async fn serve(&self, conn: Connection) -> Result<()> {
         let remote = *conn.remote_id().as_bytes();
+        // W6/§6 peer-dialback: if this friend reached us over our own advertised
+        // relay, that is external proof the relay is reachable. Recorded here, at
+        // accept time, before iroh upgrades a relayed path to a direct one.
+        self.note_relay_dialback(&conn);
         let (mut send, mut recv) = conn.accept_bi().await?;
 
         match read_frame_raw(&mut recv).await? {
@@ -869,6 +916,38 @@ impl ControlHandler {
         }
         conn.closed().await;
         Ok(())
+    }
+
+    /// W6/§6 peer-dialback verification: if this inbound connection has a relay
+    /// path whose relay is *our* advertised relay, a peer reached us through it, so
+    /// record the time as external-reachability confirmation. iroh labels an inbound
+    /// relayed path with the relay URL we received on (a relay in our own set), so a
+    /// match against `relay_health.local_url` attributes it to our relay
+    /// specifically. No-op when we run no relay.
+    ///
+    /// ponytail (known ceiling): iroh promotes a relayed path to a direct one as
+    /// soon as hole-punching succeeds, so this catches inbound connections that are
+    /// still (or only ever) relayed - which is exactly the population for which the
+    /// relay matters. It is confirmation, not a gate (see `drive_relay_health`).
+    fn note_relay_dialback(&self, conn: &Connection) {
+        let local = {
+            let s = self.shared.read().expect("shared lock");
+            s.relay_health.local_url.clone()
+        };
+        let Some(local) = local else {
+            return;
+        };
+        let via_our_relay = conn
+            .paths()
+            .iter()
+            .any(|p| matches!(p.remote_addr(), TransportAddr::Relay(u) if *u == local));
+        if via_our_relay {
+            self.shared
+                .write()
+                .expect("shared lock")
+                .relay_health
+                .verified_at = Some(unix_now());
+        }
     }
 
     /// Serve the document set iff the presented card authorizes the connection's
@@ -1550,12 +1629,15 @@ pub struct Daemon {
     /// per race. ponytail: one global re-split lock; split per-rsid only if re-split
     /// throughput ever matters (it is a rare unfriend-triggered path).
     resplit_lock: tokio::sync::Mutex<()>,
-    /// This node's own advertised relay URL, set iff it runs the embedded relay
-    /// (§6). Populated into its ContactCard `NodeEntry.relay_url` and issued
-    /// tickets' `relay_urls` so friends learn a relay through which to reach it.
-    advertised_relay: Option<RelayUrl>,
-    /// The embedded relay server, held to keep it running for the daemon's life.
-    _relay: Option<CarapaceRelay>,
+    /// The embedded relay server (§6), held to keep it running for the daemon's
+    /// life. `Some` iff this node runs a relay. Its liveness is probed each
+    /// maintenance round to drive the advertise/withdraw lifecycle (W6); its mapped
+    /// WAN address (when the NAT port-mapper resolves one) is what friends advertise.
+    relay: Option<CarapaceRelay>,
+    /// Public DNS name / WAN address to advertise for the relay instead of its
+    /// mapped/bound address (§6), from [`NetConfig::relay_host`]. Preferred over the
+    /// port-mapper's external address when set (an operator's stable DDNS name).
+    relay_host: Option<String>,
     _router: Router,
 }
 
@@ -1671,19 +1753,25 @@ impl Daemon {
                     self_user,
                     self_node,
                 });
-                Some(CarapaceRelay::start(bind, access).await?)
+                // Skip the NAT port-mapper when the operator has a configured
+                // relay host (stable WAN name + manual forward): UPnP/NAT-PMP/PCP
+                // is redundant there and only adds SSDP traffic / firewall prompts.
+                Some(CarapaceRelay::start(bind, access, cfg.relay_host.is_some()).await?)
             }
             None => None,
         };
-        let advertised_relay = match &relay {
-            Some(r) => Some(relay_advert_url(r, cfg.relay_host.as_deref())?),
-            None => None,
-        };
+        // The URL our OWN endpoint registers on and reaches the relay at
+        // (loopback-substituted, so it works without NAT hairpinning). This is NOT
+        // the WAN URL we advertise to friends: that is computed per health round
+        // from the relay host / mapped external address (W6). Keeping registration
+        // on the local URL guarantees our endpoint stays a client of its own relay,
+        // which is what lets friends relay *to* us.
+        let local_relay_url = relay.as_ref().map(|r| r.local_url());
 
-        // The endpoint's usable relay set: friends' relays plus our own (so we
-        // register on it and advertise it as our home relay).
+        // The endpoint's usable relay set: friends' relays plus our own local URL
+        // (so we register on it and can be reached through it).
         let mut relays = cfg.relays.clone();
-        if let Some(url) = &advertised_relay {
+        if let Some(url) = &local_relay_url {
             if !relays.contains(url) {
                 relays.push(url.clone());
             }
@@ -1702,18 +1790,29 @@ impl Daemon {
         let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await?;
         let blobs = IrohBlobStore::new();
 
-        // This device's ContactCard: one node entry, user-signed delegation, and
-        // (if we run a relay) our advertised relay URL so friends learn it (§6).
-        let card = build_card(
-            &user_key,
-            &node_key,
-            &k_root,
-            advertised_relay.as_ref().map(|u| u.to_string()),
-        );
+        // This device's ContactCard starts WITHOUT a relay URL (W6/§6: a relay is
+        // never advertised unconditionally at startup). The advertise happens only
+        // after a liveness probe confirms the relay is up - the initial
+        // `drive_relay_health` below, then every maintenance round. `relay_url`
+        // stays in lockstep with `relay_health.advertised_url`, so each
+        // advertise/withdraw is a card re-issue with a bumped monotonic version.
+        let mut card = build_card(&user_key, &node_key, &k_root, None);
+        // W6 rollback survival: seed the OWN card's initial version from a
+        // wall-clock floor (unix seconds) rather than 1. All state is in-memory,
+        // so a restart would otherwise re-issue at v1 and every relay flap the
+        // prior run made (each +1) would leave friends' DocStore rejecting the
+        // fresh card as a rollback (§6). A later restart's base (a larger
+        // timestamp) exceeds the prior run's flap-bumped versions in the common
+        // case (elapsed seconds >> number of flaps); the residual (rapid restart
+        // under heavy flapping) needs a persisted counter, deferred with the rest
+        // of in-memory-state persistence (see docs/spec-errata.md, W6).
+        card.version = unix_now();
+        card.sign(&user_key);
         {
             let mut s = shared.write().expect("shared lock");
             s.cards.push(card);
             s.rate = RateLimiter::new(limits.rate_capacity, limits.rate_refill_per_sec);
+            s.relay_health.local_url = local_relay_url;
         }
 
         // The rollback-guarded document store, shared between the daemon's own pull
@@ -1765,7 +1864,7 @@ impl Daemon {
             .accept(ALPN, handler)
             .spawn();
 
-        Ok(Self {
+        let daemon = Self {
             ep,
             blobs,
             shared,
@@ -1777,10 +1876,21 @@ impl Daemon {
             // §8.5: at most 5 recovery opens per subject per 24 h window.
             recovery_limiter: Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)),
             resplit_lock: tokio::sync::Mutex::new(()),
-            advertised_relay,
-            _relay: relay,
+            relay,
+            relay_host: cfg.relay_host,
             _router: router,
-        })
+        };
+
+        // W6/§6: elect the relay only after a liveness probe confirms it is up -
+        // never unconditionally at startup. On success this re-issues the card at
+        // version 2 carrying the relay URL; if the relay is not (yet) alive the card
+        // stays relay-less and the maintenance loop advertises it once it comes up.
+        if daemon.relay.is_some() {
+            let alive = daemon.probe_relay_alive().await;
+            daemon.drive_relay_health(alive);
+        }
+
+        Ok(daemon)
     }
 
     /// This device's node id (= iroh endpoint id).
@@ -2535,11 +2645,17 @@ impl Daemon {
     pub fn issue_ticket(&self) -> Result<InviteTicket> {
         let now = unix_now();
         // §6: advertise our self-hosted relay in the ticket's relay set, so the
-        // redeemer can reach us via relay fallback without our direct address.
+        // redeemer can reach us via relay fallback without our direct address. Only
+        // a currently-advertised (health-verified, W6) relay is included; a
+        // down/withdrawn relay is omitted rather than handed out as a dead hint.
         let relay_urls: Vec<String> = self
-            .advertised_relay
+            .shared
+            .read()
+            .expect("shared lock")
+            .relay_health
+            .advertised_url
             .iter()
-            .map(|u| u.to_string())
+            .cloned()
             .collect();
         let ticket = build_ticket(
             &self.user_key,
@@ -3679,6 +3795,15 @@ impl Daemon {
         self.drive_pending_delete_sends().await;
         self.advance_resplits().await;
 
+        // 6) §6/W6 relay reachability lifecycle: probe the embedded relay's liveness
+        //    and advertise-on-success / withdraw-on-loss, re-issuing our own card
+        //    (version bumped) whenever the advertised relay URL changes. No-op when
+        //    we run no relay.
+        if self.relay.is_some() {
+            let alive = self.probe_relay_alive().await;
+            self.drive_relay_health(alive);
+        }
+
         report
     }
 
@@ -4054,11 +4179,30 @@ impl Daemon {
         }
     }
 
-    /// This node's own advertised relay URL as a string, iff it runs the embedded
-    /// relay (§6). Surfaced on the status + ticket API so the operator can see (and
-    /// share) the relay friends will use to reach this node.
+    /// This node's own advertised relay URL as a string, iff it *currently*
+    /// advertises the embedded relay (§6/W6): `None` when it runs no relay or when
+    /// the relay is down/withdrawn. Surfaced on the status + ticket API so the
+    /// operator sees exactly what friends will use to reach this node right now.
     pub fn advertised_relay_url(&self) -> Option<String> {
-        self.advertised_relay.as_ref().map(|u| u.to_string())
+        self.shared
+            .read()
+            .expect("shared lock")
+            .relay_health
+            .advertised_url
+            .clone()
+    }
+
+    /// W6/§6: the last time a friend was observed reaching us *through* our
+    /// advertised relay (peer-dialback), in unix seconds, or `None` if never. This
+    /// is external-reachability evidence surfaced for the operator; see
+    /// [`Daemon::drive_relay_health`] for why it confirms rather than gates
+    /// advertising.
+    pub fn relay_verified_at(&self) -> Option<u64> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .relay_health
+            .verified_at
     }
 
     /// W4: number of distinct networks in this node's usable relay set (§6/§14) -
@@ -4067,15 +4211,19 @@ impl Daemon {
     /// drops below 2, since a single relay network is both a single point of
     /// failure for reachability and a single metadata choke point.
     ///
+    /// Only a *currently-advertised* own relay counts (W6): once the relay is
+    /// withdrawn on a health loss it stops contributing to diversity, exactly as a
+    /// friend would see it.
+    ///
     /// ponytail: "distinct network" == distinct URL host (DNS name or IP literal),
     /// lowercased. Upgrade to IP-subnet/ASN grouping if two friends behind the
     /// same host must count as one network more precisely.
     pub fn relay_network_count(&self) -> usize {
         let mut urls: Vec<String> = Vec::new();
-        if let Some(u) = &self.advertised_relay {
-            urls.push(u.to_string());
-        }
         let s = self.shared.read().expect("shared lock");
+        if let Some(u) = &s.relay_health.advertised_url {
+            urls.push(u.clone());
+        }
         for card in s.friends.values() {
             for n in &card.nodes {
                 if let Some(url) = &n.relay_url {
@@ -4090,6 +4238,115 @@ impl Daemon {
     /// 2 distinct networks (§6 normative MUST). Surfaced on the status API.
     pub fn relay_diversity_warning(&self) -> bool {
         self.relay_network_count() < 2
+    }
+
+    /// W6/§6: probe whether our embedded relay's TCP listener is alive and
+    /// accepting. `false` when we run no relay. The result drives the
+    /// advertise/withdraw lifecycle via [`Daemon::drive_relay_health`].
+    async fn probe_relay_alive(&self) -> bool {
+        match &self.relay {
+            Some(r) => r.is_alive().await,
+            None => false,
+        }
+    }
+
+    /// W6/§6: the WAN relay URL to advertise to friends, or `None` if we run no
+    /// relay. Precedence: a configured relay host (the operator's stable DDNS/WAN
+    /// name) > the NAT port-mapper's mapped external address > the relay's local
+    /// (loopback/bound) URL. The last is only WAN-reachable on a public bind or for
+    /// same-host use; when a home node has no host override and no mapping yet, the
+    /// maintenance loop re-advertises with the mapped address once it resolves.
+    fn advertised_url_for(&self) -> Option<String> {
+        let relay = self.relay.as_ref()?;
+        // Pick a candidate WAN URL by precedence. The local_url fallback is only
+        // WAN-safe for an EXPLICIT loopback bind (same-host / test): with the
+        // default 0.0.0.0 home-relay bind, local_url folds a 127.0.0.1 (or a LAN
+        // 192.168/10.x) address into the signed card sent to friends, advertising
+        // an unreachable relay and inflating the diversity count. For a
+        // 0.0.0.0/unspecified or private-LAN bind we stay withdrawn until a
+        // globally-routable address exists (a relay host or a routable mapping).
+        let candidate = if let Some(host) = &self.relay_host {
+            format!("http://{}:{}", host, relay.http_addr().port())
+        } else if let Some(ext) = relay.external_addr() {
+            format!("http://{ext}")
+        } else if relay.http_addr().ip().is_loopback() {
+            relay.local_url().to_string()
+        } else {
+            return None;
+        };
+        // Only fold a URL iroh can actually parse as a RelayUrl into the card; a
+        // malformed relay_host would otherwise emit a signed card with a garbage
+        // relay_url. Treat an unparseable candidate as "no advertised relay".
+        if candidate.parse::<RelayUrl>().is_ok() {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    /// W6/§6: reconcile the embedded relay's advertised state with a liveness
+    /// observation, re-issuing this node's own card whenever the advertised relay
+    /// URL changes.
+    ///
+    /// When `alive` the desired advertised URL is [`Daemon::advertised_url_for`];
+    /// when not, a withdraw is applied only after
+    /// [`RELAY_PROBE_FAILURE_THRESHOLD`] consecutive failed probes (hysteresis, so
+    /// a transient 2 s connect timeout under load does not flap a healthy relay);
+    /// a single success resets the streak and re-advertises. If the desired URL
+    /// differs from what the card currently
+    /// carries, the own card is re-issued with the new `relay_url` and its version
+    /// BUMPED (§6 rollback rule: a re-issue MUST advance the monotonic per-signer
+    /// version so peers accept it over the one they hold). The new card propagates
+    /// through the existing anti-entropy doc path (`serve_docs` re-serves
+    /// `shared.cards`, and the receiver's `DocStore` accepts the higher version).
+    ///
+    /// Advertising is gated on liveness, not on peer-dialback: gating the *initial*
+    /// advertise on dialback would deadlock (friends can only reach us via the relay
+    /// once they have learned it from our card), and dialback silence cannot be
+    /// distinguished from "no friend has dialed lately," so it must not withdraw a
+    /// live relay. Dialback (`relay_health.verified_at`) is therefore recorded and
+    /// surfaced as external-reachability confirmation, not used as a withdraw
+    /// trigger. Full active withdraw-on-unreachability needs a cooperating external
+    /// prober, which is out of scope (see docs/spec-errata.md, W6).
+    #[doc(hidden)]
+    pub fn drive_relay_health(&self, alive: bool) {
+        let mut s = self.shared.write().expect("shared lock");
+        // W6 hysteresis: a single failed probe does not withdraw. A success
+        // resets the failure streak and (re-)advertises immediately; a failure
+        // increments the streak and only withdraws once it reaches the
+        // threshold. Below the threshold the desired URL is left equal to the
+        // current advertisement, so the tentative failure is a no-op (no
+        // re-issue, no version churn). `advertised_url_for` reads only
+        // `self.relay`/`self.relay_host`, never the `shared` lock, so calling it
+        // here while holding the write guard is safe.
+        let want = if alive {
+            s.relay_health.consecutive_failures = 0;
+            self.advertised_url_for()
+        } else {
+            s.relay_health.consecutive_failures =
+                s.relay_health.consecutive_failures.saturating_add(1);
+            if s.relay_health.consecutive_failures >= RELAY_PROBE_FAILURE_THRESHOLD {
+                None
+            } else {
+                s.relay_health.advertised_url.clone()
+            }
+        };
+        if want == s.relay_health.advertised_url {
+            return;
+        }
+        s.relay_health.advertised_url = want.clone();
+        let Some(cur) = s.cards.first() else {
+            return;
+        };
+        let mut card = cur.clone();
+        card.version += 1;
+        let advertised = want.is_some();
+        if let Some(node) = card.nodes.first_mut() {
+            node.relay_url = want;
+        }
+        card.offers.relay = advertised;
+        card.sign(&self.user_key);
+        *s.cards.first_mut().expect("own card present") = card;
     }
 
     /// Wait until the endpoint has registered with at least one relay, so it is
@@ -6068,18 +6325,6 @@ fn endpoint_addr(node: [u8; 32], addrs: &[String]) -> Result<EndpointAddr> {
     Ok(ea)
 }
 
-/// Build the relay URL to advertise for a running embedded relay: `relay_host`
-/// (a public DNS name or WAN IP) on the relay's bound port, or the relay's own
-/// bound `http://addr` when no host override is given (§6).
-fn relay_advert_url(relay: &CarapaceRelay, host: Option<&str>) -> Result<RelayUrl> {
-    match host {
-        Some(h) => format!("http://{}:{}", h, relay.http_addr().port())
-            .parse::<RelayUrl>()
-            .map_err(|e| anyhow::anyhow!("advertised relay url for host {h:?}: {e}")),
-        None => Ok(relay.relay_url()),
-    }
-}
-
 /// Feed a friend's ContactCard addressing hints into the live endpoint (§6): for
 /// each node entry, inject an `EndpointAddr` (id + direct addrs + relay url) so it
 /// can be dialed by node id, and add its relay to our usable relay set. A
@@ -7461,5 +7706,190 @@ mod tests {
             s.held.contains(&other),
             "another owner's replica is untouched"
         );
+    }
+
+    // ---- W6: relay reachability lifecycle (§6) --------------------------------
+
+    /// This node's own card: `(version, advertised relay_url)`.
+    fn own_card_relay(d: &Daemon) -> (u64, Option<String>) {
+        let s = d.shared.read().expect("shared lock");
+        let c = s.cards.first().expect("own card");
+        (c.version, c.nodes.first().and_then(|n| n.relay_url.clone()))
+    }
+
+    /// A clone of this node's own card, as a friend would learn it via anti-entropy.
+    fn own_card(d: &Daemon) -> ContactCard {
+        d.shared
+            .read()
+            .expect("shared lock")
+            .cards
+            .first()
+            .expect("own card")
+            .clone()
+    }
+
+    /// W6/§6: a node running the embedded relay elects it only after a liveness
+    /// check (never unconditionally at startup), withdraws it from its card on a
+    /// health loss and re-advertises on recovery, and BUMPS the monotonic card
+    /// version on every such re-issue so peers accept the new card over the one they
+    /// hold (rollback rule). The W4 diversity count tracks the current advertise
+    /// state throughout.
+    #[tokio::test]
+    async fn w6_relay_advertise_withdraw_reissues_card_monotonically() -> Result<()> {
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let daemon = Daemon::start_on(
+            State::from_seeds([0x77; 32], [0x88; 32]),
+            ReplicaLimits::default(),
+            NetConfig {
+                bind: Some(loopback),
+                run_relay: Some(loopback),
+                ..NetConfig::default()
+            },
+        )
+        .await?;
+
+        // Startup: the relay-less card is built at a wall-clock version floor
+        // (unix seconds, for rollback survival across restarts, W6); the initial
+        // health check then elected the live relay, re-issuing WITH the URL at the
+        // next version. We assert monotonicity and a sane floor, not exact values.
+        let (v_adv, url_adv) = own_card_relay(&daemon);
+        assert!(
+            v_adv >= 2,
+            "elected after a health check, version past the floor"
+        );
+        assert!(url_adv.is_some(), "live relay is advertised in the card");
+        assert_eq!(daemon.advertised_relay_url(), url_adv);
+        assert_eq!(
+            daemon.relay_network_count(),
+            1,
+            "own live relay = 1 network"
+        );
+        assert!(daemon.relay_diversity_warning(), "one network is still < 2");
+        let card_adv = own_card(&daemon);
+
+        // A repeat healthy observation is idempotent: no re-issue, no version churn.
+        daemon.drive_relay_health(true);
+        assert_eq!(own_card_relay(&daemon).0, v_adv, "no bump without a change");
+
+        // Withdraw on loss requires N consecutive failed probes (W6 hysteresis):
+        // the first two failures are tentative and do NOT re-issue the card; only
+        // the third withdraws the relay URL, bumps the version, and drops it from
+        // the diversity count.
+        daemon.drive_relay_health(false);
+        assert_eq!(
+            own_card_relay(&daemon).0,
+            v_adv,
+            "1st failed probe is tentative, no re-issue"
+        );
+        daemon.drive_relay_health(false);
+        assert_eq!(
+            own_card_relay(&daemon).0,
+            v_adv,
+            "2nd failed probe is tentative, no re-issue"
+        );
+        daemon.drive_relay_health(false);
+        let (v_wd, url_wd) = own_card_relay(&daemon);
+        assert!(
+            url_wd.is_none(),
+            "down relay withdrawn after the 3rd failure"
+        );
+        assert!(v_wd > v_adv, "withdraw bumps the version exactly once");
+        assert_eq!(daemon.advertised_relay_url(), None);
+        assert_eq!(
+            daemon.relay_network_count(),
+            0,
+            "withdrawn relay not counted"
+        );
+        let card_wd = own_card(&daemon);
+
+        // Idempotent while down.
+        daemon.drive_relay_health(false);
+        assert_eq!(own_card_relay(&daemon).0, v_wd, "no bump while still down");
+
+        // Re-advertise on recovery: same URL returns, version bumped again.
+        daemon.drive_relay_health(true);
+        let (v_re, url_re) = own_card_relay(&daemon);
+        assert_eq!(url_re, url_adv, "the same relay URL is re-advertised");
+        assert!(v_re > v_wd, "re-advertise bumps the version again");
+        assert_eq!(daemon.relay_network_count(), 1);
+        let card_re = own_card(&daemon);
+
+        // Strictly monotonic across the whole advertise/withdraw/re-advertise cycle.
+        assert!(v_adv < v_wd && v_wd < v_re, "versions strictly increase");
+
+        // §6 rollback rule end-to-end: a friend's DocStore accepts each successive
+        // re-issue as newer, and rejects a replay of an earlier one as a rollback.
+        let mut store = DocStore::new();
+        assert!(store.offer_card(&card_adv).is_ok());
+        assert!(
+            store.offer_card(&card_wd).expect("newer"),
+            "withdraw accepted"
+        );
+        assert!(
+            store.offer_card(&card_re).expect("newer"),
+            "re-advertise accepted"
+        );
+        assert!(
+            store.offer_card(&card_adv).is_err(),
+            "replaying the first card is a rollback and is rejected"
+        );
+
+        daemon.shutdown().await;
+        Ok(())
+    }
+
+    /// W6 probe hysteresis: a transient probe failure must not flap a healthy
+    /// relay. Two consecutive failed probes leave the advertised card untouched;
+    /// the third withdraws (one version bump). A success anywhere in a streak
+    /// resets the counter, so a later pair of failures is again tentative.
+    #[tokio::test]
+    async fn w6_relay_probe_hysteresis() -> Result<()> {
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let daemon = Daemon::start_on(
+            State::from_seeds([0x91; 32], [0x92; 32]),
+            ReplicaLimits::default(),
+            NetConfig {
+                bind: Some(loopback),
+                run_relay: Some(loopback),
+                ..NetConfig::default()
+            },
+        )
+        .await?;
+
+        // Startup elected the live relay.
+        let (v0, url0) = own_card_relay(&daemon);
+        assert!(url0.is_some(), "live loopback relay advertised at startup");
+
+        // Two tentative failures: no re-issue.
+        daemon.drive_relay_health(false);
+        daemon.drive_relay_health(false);
+        assert_eq!(own_card_relay(&daemon).0, v0, "2 failures do not withdraw");
+        assert!(own_card_relay(&daemon).1.is_some(), "still advertised");
+
+        // A success resets the streak.
+        daemon.drive_relay_health(true);
+        assert_eq!(
+            own_card_relay(&daemon).0,
+            v0,
+            "success after <threshold is a no-op"
+        );
+
+        // Two more failures are once again only tentative (counter was reset).
+        daemon.drive_relay_health(false);
+        daemon.drive_relay_health(false);
+        assert_eq!(
+            own_card_relay(&daemon).0,
+            v0,
+            "streak reset: still no withdraw"
+        );
+
+        // The third consecutive failure withdraws, bumping the version once.
+        daemon.drive_relay_health(false);
+        let (v_wd, url_wd) = own_card_relay(&daemon);
+        assert!(url_wd.is_none(), "3rd consecutive failure withdraws");
+        assert_eq!(v_wd, v0 + 1, "withdraw bumps the version exactly once");
+
+        daemon.shutdown().await;
+        Ok(())
     }
 }

@@ -196,7 +196,10 @@ Phase-N audit of the embedded relay + endpoint wiring. C1 (open unauthenticated
 relay) and W1 (undelegated hint injection) are fixed in code (`carapace-net::relay`
 friend-gate + per-client rate cap; `carapaced::learn_card_hints` delegation gate),
 W4 (relay-diversity warning) is implemented on the status surface
-(`relay_network_count` / `relay_diversity_warning`). The two below are settled
+(`relay_network_count` / `relay_diversity_warning`), and W6 (relay reachability
+lifecycle: health-gated advertise/withdraw with monotonic card re-issue, TCP
+port-mapping, and peer-dialback confirmation) is implemented in code - the W6 bullets
+below record what landed and the residuals that remain errata. W2 (below) is settled
 here rather than in code.
 
 - **W2 (accepted metadata exposure): the embedded relay is plain HTTP.** The
@@ -258,21 +261,114 @@ integration tests. The **daemon** does not register `SyncHandler`; it registers
 daemon handshake check - stated here so the ledger's DONE is not mistaken for
 daemon-wide `Hello.protocol` enforcement.
 
-- **W3 (deferred feature): advertised relay is not dialback-verified.** A node run
-  with `--relay` advertises its relay URL in its ContactCard and issued tickets
-  unconditionally at startup; §6's "peer-dialback verification; advertise on
-  success, withdraw on loss" is not implemented, and there is no card re-issue when
-  the relay dies. Compounding it, iroh's portmapper maps only the single iroh
-  **endpoint UDP port**, never the relay's HTTP/TCP port, so a home-NAT node's
-  advertised relay is unreachable from the WAN unless the operator manually
-  port-forwards or fronts it with DDNS. **Resolution: documented, implementation
-  deferred.** Full dialback needs a cooperating external prober and an
-  event-driven advertise/withdraw + card-bump path (a new subsystem), out of scope
-  for this pass. Until then: a home node's relay port needs a manual
-  port-forward/DDNS, and friends may waste dials on an unreachable advertised
-  relay (bounded - the relay is a fallback hint, direct/hole-punched paths and
-  other friends' relays still work). §6 should note the portmapper does not open
-  the relay's TCP port.
+- **W6 (implemented): relay reachability lifecycle - advertise on health, withdraw
+  on loss, with monotonic card re-issue.** §6's "advertise on success, withdraw on
+  loss" is now a real subsystem, not a startup one-shot. The relay is NO longer
+  advertised unconditionally at startup: the own card is built relay-less, and
+  the relay URL is folded in only after a liveness probe confirms the listener is up
+  (`CarapaceRelay::is_alive`, an active TCP connect to the relay's own loopback
+  socket - the iroh-relay `Server` handle exposes no non-blocking task-liveness
+  accessor, only a blocking `join`, the bound address, and metrics). The maintenance
+  loop (`maintenance_round`) probes every round and reconciles: on a health loss the
+  own card is re-issued WITHOUT the relay URL, on recovery WITH it; every such change
+  BUMPS the monotonic card version (§6 rollback rule) and propagates through the
+  existing anti-entropy doc path (`serve_docs` re-serves `shared.cards`; a peer's
+  `DocStore::offer_card` accepts the higher version and rejects a replay). `W4`
+  diversity counting and issued tickets track the *current* advertised state, so a
+  withdrawn relay stops counting and is not handed out as a dead hint. Covered by
+  `w6_relay_advertise_withdraw_reissues_card_monotonically`.
+  - **Probe hysteresis (implemented).** `is_alive` is a 2 s loopback TCP connect;
+    under load a single connect can time out on a perfectly healthy relay, and
+    each spurious withdraw costs two card re-issues (withdraw + re-advertise).
+    `drive_relay_health` now requires `RELAY_PROBE_FAILURE_THRESHOLD` (3)
+    consecutive failed probes before withdrawing - the first two are tentative
+    and do not re-issue - and resets the streak on the first success (which
+    re-advertises). Covered by `w6_relay_probe_hysteresis`.
+  - **Own-card version rollback survival across restart (implemented, with a
+    residual).** All daemon state (including the own card and its flap-bumped
+    version) is in-memory, so a naive restart would re-issue the card at v1;
+    friends who already hold a higher-versioned card from the prior run's relay
+    flaps would reject the fresh one as a rollback (`DocStore`), stranding the
+    node. The own card's *initial* version is therefore seeded from a wall-clock
+    floor (`unix_now()`, unix seconds) rather than 1, and the existing
+    `version += 1` re-issue logic rides on top. A later restart's base (a larger
+    timestamp) exceeds the prior run's flap-bumped versions in the common case
+    (elapsed seconds >> number of flaps). **Residual:** a pathological
+    rapid-restart under heavy flapping (elapsed wall-clock seconds < number of
+    flaps in the prior run) can still re-issue below a version a friend holds.
+    The complete fix is a persisted monotonic counter, folded into the same
+    in-memory-state persistence deferral as the rest of `Shared` (the maintenance
+    round counter, the friend/replica set, etc.; see the persistence note above):
+    when `Shared` gains on-disk durability, persist the own card's last-issued
+    version alongside it and seed from `max(persisted + 1, unix_now())`.
+
+- **W6 (implemented): the relay's TCP/HTTP port is now NAT-mapped.** The earlier
+  errata that "iroh's portmapper maps only the endpoint UDP port, never the relay's
+  TCP port" is resolved: `CarapaceRelay` drives its own `portmapper::Client` (the
+  same crate iroh uses, `Protocol::Tcp`, UPnP/NAT-PMP/PCP) for the relay's TCP listen
+  port on a routable bind, and advertises the mapped WAN address
+  (`external_addr`) - precedence: configured relay host (DDNS) > mapped external
+  address > local/bound URL. Registration stays on the loopback URL (never the WAN
+  URL, which a home router may not hairpin) so our own endpoint always remains a
+  client of its own relay, which is what lets friends relay *to* us. **Residual
+  errata:** port-mapping is best effort - with no UPnP/NAT-PMP/PCP-speaking gateway
+  the mapping never establishes and a home node still needs a manual port-forward or
+  a stable relay host (`--relay-host` / DDNS), exactly as before. iroh's endpoint UDP
+  portmapper is unchanged and independent.
+  - **Only globally-routable addresses are advertised (implemented).** Three
+    guards close the "signed card advertises an unreachable relay" gap: (1)
+    `external_addr` filters the port-mapper's reported WAN address through
+    `is_globally_routable_v4`, rejecting a mapping in RFC1918 private, CGNAT
+    (100.64.0.0/10), loopback, link-local, unspecified, broadcast, or
+    documentation space (a double-NAT / carrier-grade-NAT gateway can hand back
+    such an "external" address). (2) `advertised_url_for` no longer falls back to
+    the loopback-substituted `local_url` for a `0.0.0.0`/private-LAN bind - that
+    fallback is used only for an EXPLICIT loopback bind (the same-host / test
+    case); with the default `0.0.0.0` home-relay bind and no routable host or
+    mapping the node stays withdrawn rather than fold `http://127.0.0.1:PORT` (or
+    a LAN `192.168`/`10.x` address) into the card and inflate the diversity count.
+    (3) The composed URL (including a `--relay-host` value) must parse as an iroh
+    `RelayUrl` before it is folded into the card; a malformed relay host yields no
+    advertised relay rather than a signed card with a garbage `relay_url`.
+  - **Port-mapper skipped when a relay host is configured (implemented).** With a
+    stable `--relay-host` (DDNS/WAN name) and a manual port-forward, UPnP/NAT-PMP/
+    PCP is redundant, so `CarapaceRelay::start` takes a `skip_portmap` flag (set
+    when `relay_host` is present) and does not spawn `portmapper::Client` there -
+    avoiding the SSDP/PCP traffic and firewall prompts. Loopback binds skip it as
+    before.
+
+- **W6 (partial - external-prober dialback remains errata): peer-dialback confirms,
+  it does not gate/withdraw.** iroh *does* expose the path a connection arrived on
+  (`Connection::paths()` -> `Path::is_relay()` + `remote_addr()` =
+  `TransportAddr::Relay(url)`; an inbound relayed datagram is labelled with the relay
+  URL we received it on), so when a friend reaches us through our own relay we record
+  it (`relay_health.verified_at`, surfaced via `relay_verified_at`) as genuine
+  external-reachability proof. But advertising is gated on *local* liveness, not on
+  dialback, for two honest reasons: (1) gating the initial advertise on dialback
+  deadlocks - a friend can only reach us via the relay after learning it from our
+  card; (2) dialback silence cannot be distinguished from "no friend has dialed
+  lately," so it must not withdraw a live relay. **Resolution: dialback is
+  confirmation, not a gate.** Actively withdrawing a relay that is up locally but
+  unreachable from the WAN needs a cooperating external prober (a third party that
+  dials our relay URL from outside our NAT and reports back), which is out of scope
+  for this pass. Consequence (bounded): a relay that is locally healthy but
+  WAN-unreachable (e.g. no port-forward, no working port-mapper) stays advertised, so
+  friends may waste dials on it - direct/hole-punched paths and other friends' relays
+  still carry the connection. A second honest ceiling: iroh upgrades a relayed path
+  to direct as soon as hole-punching succeeds, so `note_relay_dialback` (checked at
+  accept time) catches connections that are still-or-only relayed - which is exactly
+  the population the relay serves.
+
+- **W6 (known ceilings, out of scope for this pass).** Two smaller residuals are
+  documented rather than fixed: (1) `is_alive` proves the relay's TCP *listener
+  accepts a connection*, not that the relay's forwarding/registration logic is
+  actually healthy - a wedged server that still accepts would probe alive. A true
+  liveness check would register a client and round-trip a relayed datagram; the
+  active-connect probe is the concrete signal the iroh-relay `Server` handle
+  makes available. (2) `Hello.card_version` is hardcoded to `1` on the control
+  handshake and no reader consumes it (card freshness is reconciled via the
+  versioned `DocStore`/anti-entropy path, not the `Hello` field), so it carries no
+  meaning today; wire it to the real own-card version if a reader ever needs it.
 
 ## E6 — §11 conflict-file identity uses content hash, not `<dev>` (winner tie-break too)
 

@@ -348,8 +348,9 @@ async fn relay_fallback_connects_and_roundtrips() -> Result<()> {
         a_key.verifying_key().to_bytes(),
         b_key.verifying_key().to_bytes(),
     ]));
-    let relay = CarapaceRelay::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), access).await?;
-    let relay_url = relay.relay_url();
+    let relay =
+        CarapaceRelay::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), access, false).await?;
+    let relay_url = relay.local_url();
     assert_eq!(
         relay_url.scheme(),
         "http",

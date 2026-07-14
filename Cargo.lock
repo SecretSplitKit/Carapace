@@ -531,6 +531,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "iroh-relay",
+ "portmapper",
  "tempfile",
  "tokio",
 ]

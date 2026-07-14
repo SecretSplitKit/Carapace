@@ -12,12 +12,16 @@ carapace-wire = { path = "../carapace-wire" }
 carapace-crypto = { path = "../carapace-crypto" }
 carapace-vault = { path = "../carapace-vault" }
 ed25519-dalek = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
 anyhow = "1"
 iroh = "1.0.2"
 # The embedded self-hosted relay (§6) lives behind iroh-relay's `server`
 # feature, which `iroh` itself does not enable. Pull it in directly.
 iroh-relay = { version = "1.0.2", features = ["server"] }
+# W6 (§6): map the embedded relay's TCP/HTTP listen port through the NAT
+# (UPnP/NAT-PMP/PCP). iroh's endpoint portmapper opens only the UDP/QUIC port;
+# this is the same crate iroh uses, driven directly for the relay's TCP port.
+portmapper = "0.19"
 iroh-blobs = "0.103"
 blake3 = "1"
 
