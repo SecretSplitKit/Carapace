@@ -104,6 +104,9 @@ export const api = {
 	unfriend: (user_pubkey: string) =>
 		post<UnfriendResult>(`/api/friends/${user_pubkey}/unfriend`),
 	resplitStatus: (rsid: number) => get<ResplitStatus>(`/api/recovery/${rsid}/resplit-status`),
+	// §9.3.4: start the re-split the PROMPT was raised for; omit trustees to use the suggested set.
+	resplitStart: (rsid: number, trustees?: string[]) =>
+		post<ResplitStatus>(`/api/recovery/${rsid}/resplit-start`, trustees ? { trustees } : undefined),
 
 	recoverySplit: (
 		rsid: number,

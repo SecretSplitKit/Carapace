@@ -468,12 +468,23 @@ struct Shared {
     /// shares are NEVER destroyed until [`Resplit`] proves the new set live (`>= M +
     /// slack`), and the daemon routes destruction only through `Resplit::share_destroy`.
     resplits: HashMap<u64, OpenResplit>,
-    /// §9.3 W5: re-splits an unfriend DETECTED (the ex-friend was a trustee of this
-    /// old recovery set) but has not begun yet, `old_rsid -> ex-friend user`. The
-    /// synchronous unfriend teardown records them here because beginning a re-split
-    /// needs `k_root`; the maintenance loop / the initiating `unfriend` then calls
-    /// `begin_resplit` (which holds `k_root`) to stand each one up into `resplits`.
-    pending_resplits: HashMap<u64, [u8; 32]>,
+    /// §9.3.4 W5: re-splits an unfriend DETECTED (the ex-friend was a trustee of this
+    /// old recovery set) but that the user has NOT yet chosen to start, `old_rsid ->
+    /// [`PendingResplit`]`. §9.3.4 requires the client to PROMPT the user before
+    /// re-splitting a trustee out, so the unfriend teardown only records the pending
+    /// prompt here (with the suggested new trustee set = old honest set); nothing stands
+    /// up until the user hits `POST /api/recovery/{rsid}/resplit-start`
+    /// ([`Daemon::start_pending_resplit`]), which holds `k_root`. Durable across
+    /// maintenance ticks so the prompt persists until the user acts.
+    pending_resplits: HashMap<u64, PendingResplit>,
+    /// §9.3.1 W5: outbound `DeleteRequest` batches queued by the RECEIVE side of an
+    /// unfriend (an inbound `FriendshipEnd`, handled in the control handler, has no
+    /// endpoint to dial out). Each side MUST send DeleteRequests for everything IT placed
+    /// on the other; the initiator sends inline in [`Daemon::unfriend`], but the receiver
+    /// defers to the maintenance loop ([`Daemon::drive_pending_delete_sends`]), which
+    /// drains this. Sending a DeleteRequest never triggers a FriendshipEnd, so there is
+    /// no unfriend loop.
+    pending_delete_sends: Vec<(Vec<EndpointAddr>, Placement)>,
     /// §9.3 W5: node ids of unfriended peers whose replicas of OUR vaults must be
     /// re-placed immediately - treated as confirmed lost NOW (no 24 h grace), via a
     /// `Health::Unfriended` repair. Drained by `replace_unfriended_replicas`.
@@ -499,6 +510,7 @@ struct OwnerGrants {
 /// co-trustee roster and delivery dial) plus its own share, re-signed into a
 /// refreshed grant when the refs advance. The share is a secret kept in memory
 /// beside `k_root`/`vault_keys`; no weaker than already holding the split source.
+#[derive(Clone)]
 struct GrantedTrustee {
     user: [u8; 32],
     node: [u8; 32],
@@ -517,6 +529,18 @@ struct ResplitPeer {
     /// New-set members carry the grant to deliver; old-set members carry `None`. Dialed
     /// by node id via `resolve_peer` (last-known address, else relay/hole-punch).
     grant: Option<ShareGrant>,
+}
+
+/// §9.3.4 W5: a re-split an unfriend detected but has NOT started, awaiting the user's
+/// prompt. Records the ex-trustee to strand and a pre-filled SUGGESTED new trustee set
+/// (the old honest set, as user pubkeys) that `POST .../resplit-start` defaults to.
+#[derive(Clone)]
+struct PendingResplit {
+    /// The unfriended trustee whose retained old share a re-split would strand.
+    ex_trustee: [u8; 32],
+    /// The pre-filled default new trustee set (old set minus the ex-trustee), as user
+    /// pubkeys. The start endpoint uses these unless the caller overrides them.
+    suggested: Vec<[u8; 32]>,
 }
 
 /// A §9.3 step-3 re-split the daemon is driving to completion, guarded by [`Resplit`].
@@ -540,16 +564,57 @@ struct OpenResplit {
     old_peers: Vec<ResplitPeer>,
     /// New-set nodes whose grant has already been delivered + acked, so it is not re-pushed.
     delivered: HashSet<[u8; 32]>,
+    /// §9.3 step 4: what the new set needs to become the ACTIVE recovery set once the
+    /// re-split completes (old set destroyed) - the owner-side grant records, the
+    /// attestation-tracker roster (node -> card number), the reconstruction threshold, the
+    /// abort window, the announce refs, the split scope, and the open [`SplitState`]
+    /// (moved out on registration). Populated by [`build_resplit`], consumed once in
+    /// [`Daemon::drive_resplit`]'s completion branch.
+    new_records: Vec<GrantedTrustee>,
+    roster: HashMap<[u8; 32], u64>,
+    m: u8,
+    recovery_delay: u64,
+    refs: Vec<AnnounceRef>,
+    scope: RecoveryScope,
+    new_state: Option<carapace_recovery::SplitState>,
+    /// Whether the new set has already been registered active (one-shot on `Complete`).
+    registered: bool,
+}
+
+/// §9.3.4 W5: the pending-re-split prompt surface for the GUI. One row per re-split an
+/// unfriend detected but the user has not yet started: the ex-trustee, and the suggested
+/// new trustee set with each member's live reachability (§9.3.4 "who is online now").
+#[derive(Clone, Debug)]
+pub struct PendingResplitStatus {
+    /// The old (ex-friend's) recovery-set id awaiting a re-split.
+    pub old_rsid: u64,
+    /// The unfriended trustee whose retained share a re-split would strand.
+    pub ex_trustee: [u8; 32],
+    /// The pre-filled default new trustee set + each member's liveness.
+    pub suggested: Vec<PendingTrustee>,
+}
+
+/// One suggested new-set trustee in a [`PendingResplitStatus`] (§9.3.4): the friend's
+/// user pubkey, its resolved node (if still a known friend), and whether it is online now.
+#[derive(Clone, Debug)]
+pub struct PendingTrustee {
+    /// The trustee's user pubkey.
+    pub user: [u8; 32],
+    /// Its primary node from the current friend card, if it is still a friend.
+    pub node: Option<[u8; 32]>,
+    /// Reachable now: answered us within the freshness window.
+    pub online: bool,
 }
 
 /// The outcome of [`Daemon::unfriend`] (§9.3): whether the party was actually a friend,
-/// and the recovery-set ids for which a re-split was triggered (they were a trustee).
+/// and the recovery-set ids a re-split is now PENDING for (they were a trustee).
 #[derive(Clone, Debug, Default)]
 pub struct UnfriendOutcome {
     /// Whether an established friendship (or friend card) actually existed to end.
     pub was_friend: bool,
-    /// Old recovery-set ids a re-split was started for (the ex-friend was a trustee).
-    /// Empty when the ex-friend held no share of ours (`resplit_triggered == false`).
+    /// Old recovery-set ids a re-split is pending for (the ex-friend was a trustee). §9.3.4:
+    /// the re-split is NOT started - the client prompts the user, who starts it via
+    /// `POST /api/recovery/{rsid}/resplit-start`. Empty when they held no share of ours.
     pub resplit_rsids: Vec<u64>,
 }
 
@@ -1295,9 +1360,10 @@ impl ControlHandler {
     /// friend graph, delete everything we hold OF them, queue their replicas of our
     /// vaults for immediate re-placement, and mark a pending re-split for every
     /// recovery set they were a trustee of. The network follow-through (re-placement +
-    /// re-split delivery/destroy) is driven by the maintenance loop, which holds
-    /// `k_root`. We send nothing back here (the initiator already sent its
-    /// `FriendshipEnd` + `DeleteRequest`s); a redundant echo would only risk a loop.
+    /// re-split prompt + our own reciprocal `DeleteRequest`s) is driven by the maintenance
+    /// loop, which holds `k_root` and an endpoint. We do NOT echo a `FriendshipEnd` back
+    /// (that would loop); we DO queue our own `DeleteRequest`s for everything WE placed on
+    /// them (§9.3.1: each side deletes what it placed on the other), sent from the loop.
     async fn serve_friendship_end(
         &self,
         end: FriendshipEnd,
@@ -1319,7 +1385,16 @@ impl ControlHandler {
                 .filter(|u| *u != self.self_user)
             {
                 if s.friends.contains_key(&ex_user) || s.friendships.contains_key(&ex_user) {
-                    teardown_unfriended_state(&mut s, ex_user);
+                    let td = teardown_unfriended_state(&mut s, ex_user);
+                    // §9.3.1: WE must send OUR DeleteRequests for everything WE placed on
+                    // the ex-friend (our replicas on them, our shares/grants). This is our
+                    // own data, not an echo of theirs. The control handler has no endpoint
+                    // to dial out, so defer the send to the maintenance loop. A DeleteRequest
+                    // never triggers a FriendshipEnd, so this cannot loop.
+                    let placed = !td.placement.replica_vids.is_empty() || td.placement.held_shares;
+                    if placed && !td.ex_addrs.is_empty() {
+                        s.pending_delete_sends.push((td.ex_addrs, td.placement));
+                    }
                 }
             }
         }
@@ -2028,6 +2103,16 @@ impl Daemon {
         }
         send.finish()?;
 
+        // §9.3.4 liveness: a completed doc pull is a real live-reachability signal for the
+        // peer(s) we just synced with (unlike a cached address). The re-split status surface
+        // reads `peer_last_seen` to show "who is online now".
+        {
+            let seen = unix_now();
+            let mut s = self.shared.write().expect("shared lock");
+            s.peer_last_seen.insert(*doc_peer.id.as_bytes(), seen);
+            s.peer_last_seen.insert(*blob_peer.id.as_bytes(), seen);
+        }
+
         // ---- verify (C1 delegation) + rollback (W2), under the doc lock ----
         let now = unix_now();
         let self_user = self.user_key.verifying_key().to_bytes();
@@ -2553,16 +2638,19 @@ impl Daemon {
 
     // ---- unfriend + trustee re-split (§9.3, W5) ------------------------
 
-    /// Terminate a friendship unilaterally and run the full §9.3 flow. Synchronously
-    /// tears down local state (drop them from the friend graph, delete everything we
-    /// hold OF them, queue their replicas of our vaults for immediate re-placement, and
-    /// mark a pending re-split for every recovery set they were a trustee of); then,
-    /// best-effort over the control stream, signs + sends a [`FriendshipEnd`] (effective
-    /// for us on send) and one [`DeleteRequest`] per placement we made on them (§9.3
-    /// step 1); re-places the vaults they replicated for us treating them as lost NOW
-    /// (§9.3 step 2, no 24 h grace); and begins + advances any trustee re-split (§9.3
-    /// step 3). Idempotent-ish: unfriending a non-friend returns `was_friend = false`
-    /// and does nothing.
+    /// Terminate a friendship unilaterally and run the §9.3 flow. Synchronously tears down
+    /// local state (drop them from the friend graph, delete everything we hold OF them,
+    /// queue their replicas of our vaults for immediate re-placement, and record a PENDING
+    /// re-split for every recovery set they were a trustee of); then, best-effort over the
+    /// control stream, signs + sends a [`FriendshipEnd`] (effective for us on send) and one
+    /// [`DeleteRequest`] per placement we made on them (§9.3 step 1); re-places the vaults
+    /// they replicated for us treating them as lost NOW (§9.3 step 2, no 24 h grace); and
+    /// drives any already-open re-split forward. Idempotent-ish: unfriending a non-friend
+    /// returns `was_friend = false` and does nothing.
+    ///
+    /// §9.3.4: a trustee re-split is NOT auto-started here - it is recorded pending (with a
+    /// suggested new set) so the client can prompt the user, who starts it via
+    /// [`Daemon::start_pending_resplit`]. `resplit_rsids` names those pending sets.
     ///
     /// The catastrophic-key-loss invariant holds throughout: a re-split's OLD shares are
     /// only ever destroyed through [`Resplit::share_destroy`], which refuses until the
@@ -2591,7 +2679,8 @@ impl Daemon {
         }
 
         // §9.3 step 2: re-place the vaults they replicated for us, treating them as lost
-        // now (no grace). §9.3 step 3: begin + drive any trustee re-split forward.
+        // now (no grace). Drive any ALREADY-OPEN re-split forward; a NEW trustee re-split is
+        // left pending for the user to start (§9.3.4 prompt), not auto-started here.
         self.replace_unfriended_replicas().await;
         self.advance_resplits().await;
 
@@ -2682,40 +2771,17 @@ impl Daemon {
         s.unfriended_nodes.retain(|n| !nodes.contains(n));
     }
 
-    /// Begin (`k_root`-holding) any re-split an unfriend detected, then drive every open
-    /// re-split forward one step (§9.3 step 3). Called from the initiating `unfriend`
-    /// and from the maintenance loop. Beginning is synchronous (a fresh split + grants,
-    /// no network); driving delivers new grants, challenges the new set, and - ONLY once
-    /// [`Resplit`] reports the new set live - sends the old set its destroy instruction.
+    /// Drive every OPEN re-split forward one step (§9.3 step 3). Called from the initiating
+    /// `unfriend` and from the maintenance loop. It does NOT stand up PENDING re-splits:
+    /// §9.3.4 requires the user to be prompted first, so a pending re-split becomes open
+    /// only through [`Daemon::start_pending_resplit`]. Driving delivers new grants,
+    /// challenges the new set, and - ONLY once [`Resplit`] reports the new set live - sends
+    /// the old set its destroy instruction.
     async fn advance_resplits(&self) {
-        // Serialize the whole stand-up + drive: the initiating `unfriend` and the
-        // maintenance loop both call this, and two concurrent runs would each begin the
-        // same pending re-split (two fresh splits, one discarded). Held across the network
-        // drive too, which only ever serializes a rare unfriend-triggered path.
+        // Serialize the drive: two concurrent runs of the same open re-split would
+        // double-deliver / double-challenge. Held across the network drive; only ever
+        // serializes the rare unfriend-triggered path.
         let _guard = self.resplit_lock.lock().await;
-
-        // 1) Stand up pending re-splits into live `Resplit` machines.
-        let to_begin: Vec<(u64, [u8; 32])> = {
-            let s = self.shared.read().expect("shared lock");
-            s.pending_resplits
-                .iter()
-                .filter(|(rsid, _)| !s.resplits.contains_key(rsid))
-                .map(|(rsid, user)| (*rsid, *user))
-                .collect()
-        };
-        for (old_rsid, ex_user) in to_begin {
-            let built = self.begin_resplit(old_rsid, ex_user);
-            let mut s = self.shared.write().expect("shared lock");
-            // Whether it stood up or is structurally impossible (e.g. too few remaining
-            // trustees, or a 1-of-N the re-split cannot neutralize), it leaves the
-            // pending queue - a failure is surfaced for a manual re-split, not spun on.
-            s.pending_resplits.remove(&old_rsid);
-            if let Ok(open) = built {
-                s.resplits.entry(old_rsid).or_insert(open);
-            }
-        }
-
-        // 2) Drive each open re-split one step.
         let open: Vec<u64> = {
             self.shared
                 .read()
@@ -2727,6 +2793,82 @@ impl Daemon {
         };
         for old_rsid in open {
             self.drive_resplit(old_rsid).await;
+        }
+    }
+
+    /// §9.3.4 W5: start a re-split the user was prompted about (`POST
+    /// /api/recovery/{rsid}/resplit-start`). Stands up the pending re-split for `old_rsid`
+    /// into an open one (using `k_root`), removes it from the pending queue, and drives it
+    /// one step (delivering the new set's grants). `new_trustees`, when given, overrides the
+    /// suggested new set (each a user pubkey of an established friend or an old trustee);
+    /// otherwise the suggested set (old honest set) is used.
+    ///
+    /// Idempotent-ish: if the re-split is already open it just drives it. Errors if no
+    /// pending re-split is recorded for `old_rsid`, or if the chosen set cannot form a
+    /// working set. The destroy-gate invariant is untouched - this only stands up the NEW
+    /// set; old shares are still destroyed only through [`Resplit::share_destroy`].
+    pub async fn start_pending_resplit(
+        &self,
+        old_rsid: u64,
+        new_trustees: Option<Vec<[u8; 32]>>,
+    ) -> Result<ResplitStatus> {
+        let _guard = self.resplit_lock.lock().await;
+
+        // Already open (a prior start, or a re-drive): just drive it.
+        let already_open = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .resplits
+            .contains_key(&old_rsid);
+        if !already_open {
+            let pending = self
+                .shared
+                .read()
+                .expect("shared lock")
+                .pending_resplits
+                .get(&old_rsid)
+                .cloned()
+                .with_context(|| format!("no pending re-split for recovery set {old_rsid}"))?;
+            let chosen = new_trustees.unwrap_or(pending.suggested);
+            let open = {
+                let s = self.shared.read().expect("shared lock");
+                build_resplit(
+                    &self.node_key,
+                    &self.k_root,
+                    &s,
+                    old_rsid,
+                    pending.ex_trustee,
+                    &chosen,
+                )?
+            };
+            let mut s = self.shared.write().expect("shared lock");
+            s.pending_resplits.remove(&old_rsid);
+            s.resplits.entry(old_rsid).or_insert(open);
+        }
+
+        self.drive_resplit(old_rsid).await;
+        self.resplit_status(old_rsid)
+            .with_context(|| format!("re-split for recovery set {old_rsid} vanished"))
+    }
+
+    /// §9.3.1 W5: drain the receive-side outbound `DeleteRequest` queue. Each entry is a
+    /// batch queued by [`ControlHandler::serve_friendship_end`] (our own DeleteRequests for
+    /// everything WE placed on an ex-friend that unfriended US). Sends each to the
+    /// ex-friend's last-known addresses, best-effort. A DeleteRequest never triggers a
+    /// FriendshipEnd, so this cannot loop back into another unfriend.
+    async fn drive_pending_delete_sends(&self) {
+        let batches: Vec<(Vec<EndpointAddr>, Placement)> = {
+            let mut s = self.shared.write().expect("shared lock");
+            std::mem::take(&mut s.pending_delete_sends)
+        };
+        for (addrs, placement) in batches {
+            let reqs = build_delete_requests(&self.node_key, &placement);
+            for addr in &addrs {
+                for req in &reqs {
+                    let _ = self.send_delete_request(addr, req).await;
+                }
+            }
         }
     }
 
@@ -2853,17 +2995,20 @@ impl Daemon {
                         }
                     }
                 }
+                // §9.3 step 4: once every old honest trustee has destroy-acked the
+                // re-split is Complete - register the NEW set as the active recovery set.
+                {
+                    let mut s = self.shared.write().expect("shared lock");
+                    register_completed_resplit(&mut s, old_rsid);
+                }
             }
-            ResplitPhase::Complete => {}
+            ResplitPhase::Complete => {
+                // A re-drive after completion (e.g. an ack arrived late): ensure the new
+                // set is registered. Idempotent - a no-op once `registered` is set.
+                let mut s = self.shared.write().expect("shared lock");
+                register_completed_resplit(&mut s, old_rsid);
+            }
         }
-    }
-
-    /// Stand up the re-split for `old_rsid` (the ex-friend was a trustee of it) into an
-    /// [`OpenResplit`], using this owner's `k_root`. Synchronous (no network). See
-    /// [`build_resplit`] for the trustee-set choice and the M/slack policy.
-    fn begin_resplit(&self, old_rsid: u64, ex_user: [u8; 32]) -> Result<OpenResplit> {
-        let s = self.shared.read().expect("shared lock");
-        build_resplit(&self.node_key, &self.k_root, &s, old_rsid, ex_user)
     }
 
     /// The §9.3 step-4 re-split status surface for the GUI prompt: one row per open
@@ -2874,6 +3019,44 @@ impl Daemon {
         s.resplits
             .values()
             .map(|o| resplit_status_of(&s, o))
+            .collect()
+    }
+
+    /// §9.3.4 W5: the PENDING re-split prompts - re-splits an unfriend detected but the
+    /// user has not yet started. One row per pending re-split, each with the suggested new
+    /// trustee set and its members' live reachability, so the GUI can render the prompt and
+    /// let the user start it via `POST /api/recovery/{rsid}/resplit-start`.
+    pub fn pending_resplit_statuses(&self) -> Vec<PendingResplitStatus> {
+        let s = self.shared.read().expect("shared lock");
+        let now = unix_now();
+        s.pending_resplits
+            .iter()
+            .map(|(rsid, p)| {
+                let suggested = p
+                    .suggested
+                    .iter()
+                    .map(|user| {
+                        let node = s
+                            .friends
+                            .get(user)
+                            .and_then(|c| c.nodes.first())
+                            .map(|n| n.node_id);
+                        let online = node
+                            .map(|n| online_within_window(s.peer_last_seen.get(&n).copied(), now))
+                            .unwrap_or(false);
+                        PendingTrustee {
+                            user: *user,
+                            node,
+                            online,
+                        }
+                    })
+                    .collect();
+                PendingResplitStatus {
+                    old_rsid: *rsid,
+                    ex_trustee: p.ex_trustee,
+                    suggested,
+                }
+            })
             .collect()
     }
 
@@ -3137,10 +3320,12 @@ impl Daemon {
             blobs.len()
         );
         // §6: remember where this replica lives so the PoR loop can re-audit it by
-        // node id without a discovery round-trip.
+        // node id without a discovery round-trip. §9.3.4: a completed placement is also a
+        // live-reachability signal for this peer.
         {
             let mut s = self.shared.write().expect("shared lock");
             s.peer_addrs.insert(node, peer.clone());
+            s.peer_last_seen.insert(node, unix_now());
         }
         Ok(Some(node))
     }
@@ -3491,6 +3676,7 @@ impl Daemon {
         //    shares. Begins any re-split an inbound `FriendshipEnd` queued but could not
         //    stand up itself (no `k_root` in the control handler).
         self.replace_unfriended_replicas().await;
+        self.drive_pending_delete_sends().await;
         self.advance_resplits().await;
 
         report
@@ -4258,8 +4444,15 @@ impl Daemon {
                     delivered,
                 });
             }
-            // Commit the refreshed refs + delivery flags for this set.
+            // Commit the refreshed refs + delivery flags for this set. §9.3.4: a trustee
+            // that acked a delivery answered us, so it is online now (liveness signal).
+            let seen = unix_now();
             let mut s = self.shared.write().expect("shared lock");
+            for r in &new_records {
+                if r.delivered {
+                    s.peer_last_seen.insert(r.node, seen);
+                }
+            }
             if let Some(g) = s.granted.get_mut(&rsid) {
                 g.trustees = new_records;
                 g.refs = refs;
@@ -5072,12 +5265,29 @@ fn teardown_unfriended_state(s: &mut Shared, ex_user: [u8; 32]) -> UnfriendTeard
         .filter(|(_, members)| members.iter().any(|m| ex_nodes.contains(m)))
         .map(|(vid, _)| *vid)
         .collect();
-    let resplit_rsids: Vec<u64> = s
+    // Recovery sets the ex-friend was a trustee of, each paired with the SUGGESTED new
+    // set (the old honest trustees, as user pubkeys) the §9.3.4 prompt pre-fills.
+    let pending: Vec<(u64, PendingResplit)> = s
         .granted
         .iter()
         .filter(|(_, g)| g.trustees.iter().any(|t| t.user == ex_user))
-        .map(|(rsid, _)| *rsid)
+        .map(|(rsid, g)| {
+            let suggested = g
+                .trustees
+                .iter()
+                .filter(|t| t.user != ex_user)
+                .map(|t| t.user)
+                .collect();
+            (
+                *rsid,
+                PendingResplit {
+                    ex_trustee: ex_user,
+                    suggested,
+                },
+            )
+        })
         .collect();
+    let resplit_rsids: Vec<u64> = pending.iter().map(|(rsid, _)| *rsid).collect();
     let held_shares_placed = !resplit_rsids.is_empty();
 
     // Delete everything we HOLD of them: replicas we store for them, and any share/grant
@@ -5102,9 +5312,10 @@ fn teardown_unfriended_state(s: &mut Shared, ex_user: [u8; 32]) -> UnfriendTeard
         s.unfriended_nodes.insert(*n);
     }
 
-    // Queue a re-split for each recovery set they were a trustee of (§9.3 step 3).
-    for rsid in &resplit_rsids {
-        s.pending_resplits.insert(*rsid, ex_user);
+    // Record a PENDING re-split (§9.3.4: prompt, do NOT auto-start) for each recovery set
+    // they were a trustee of, with the suggested new set pre-filled.
+    for (rsid, p) in pending {
+        s.pending_resplits.insert(rsid, p);
     }
 
     UnfriendTeardown {
@@ -5171,24 +5382,33 @@ fn apply_delete_request(s: &mut Shared, req: &DeleteRequest, owner_user: &[u8; 3
 
 /// Stand up the §9.3 step-3 re-split for `old_rsid`, whose trustee `ex_user` was just
 /// unfriended, into an [`OpenResplit`]. Re-splits the SAME secret (a fresh
-/// recovery-set id) among the remaining honest old trustees, keeping the old threshold
-/// `M`; the ex-friend is excluded, so once the new set is live and the old honest shares
-/// are destroyed the ex-friend's retained old share is stranded below `M`.
+/// recovery-set id) among `new_trustee_users`, keeping the old threshold `M`; the
+/// ex-friend is excluded from the OLD honest set that is told to destroy, so once the new
+/// set is live and the old honest shares are destroyed the ex-friend's retained old share
+/// is stranded below `M`.
 ///
-/// Policy: the new trustee set is the old set minus the ex-friend (`N_new = N_old - 1`),
-/// threshold unchanged, slack 1 when there is room else 0. This needs `N_new >= M`
-/// (enough honest trustees left to form a working set) and `M >= 2` (a 1-of-N trustee is
-/// a full key holder no re-split can neutralize). It errors when either does not hold -
-/// surfaced for a manual re-split with freshly recruited trustees rather than silently
-/// producing a broken set. The new grants stand up via [`Resplit::begin`], so (like the
-/// primitive) they carry no co-trustee roster / announce refs yet; the destroy of the
-/// old set is gated by [`Resplit::share_destroy`] regardless.
+/// `new_trustee_users` is the chosen new set (§9.3.4: the user's choice, defaulting to the
+/// old honest set). Each must be a still-known trustee or an established friend so its
+/// roster identity + dial node resolve; a stranger fails loudly. `N_new = len` must be
+/// `>= M`, and `M >= 2` (a 1-of-N trustee is a full key holder no re-split can
+/// neutralize); slack is 1 when there is room else 0. It errors otherwise - surfaced for a
+/// manual re-split rather than a silently broken set.
+///
+/// §8: each new grant carries the co-trustee roster (pubkeys + node hints, the recipient
+/// excluded) and the latest announce refs, mirroring the original split's grants
+/// ([`Daemon::recovery_split_grant`]). The destroy of the old set is gated by
+/// [`Resplit::share_destroy`] regardless.
+///
+/// ponytail: re-split only supports Root-scoped sets (the inner circle) - [`Resplit::begin`]
+/// splits `k_root`. A Vault-scoped old set errors here rather than silently splitting the
+/// wrong secret; wire `K_vaultroot` through `begin` to lift this.
 fn build_resplit(
     node_key: &SigningKey,
     k_root: &[u8; 32],
     s: &Shared,
     old_rsid: u64,
     ex_user: [u8; 32],
+    new_trustee_users: &[[u8; 32]],
 ) -> Result<OpenResplit> {
     let g = s
         .granted
@@ -5205,20 +5425,84 @@ fn build_resplit(
         m >= 2,
         "cannot neutralize a {m}-of-N trustee by re-split: one share already recovers"
     );
-    let remaining: Vec<[u8; 32]> = g
+
+    // Root-only: the re-split splits `k_root`. Refuse a Vault-scoped set rather than split
+    // the wrong secret. Absent split-state (e.g. a re-split-of-a-re-split before extend is
+    // wired) defaults to Root, which is what `begin` produces anyway.
+    let scope = s
+        .split_states
+        .get(&old_rsid)
+        .map(|r| r.scope)
+        .unwrap_or(RecoveryScope::Root);
+    ensure!(
+        matches!(scope, RecoveryScope::Root),
+        "re-split of a vault-scoped recovery set is not supported; recruit new trustees and split manually"
+    );
+
+    // §9.3: the unfriended ex-trustee must NEVER be a member of the new set - re-granting
+    // them a fresh valid share would defeat the re-split's whole point (strand them below M).
+    // The default/suggested set already excludes them; this guards an operator-supplied set.
+    ensure!(
+        !new_trustee_users.contains(&ex_user),
+        "the unfriended trustee cannot be a member of the new re-split set"
+    );
+    // Reject duplicate new-trustee pubkeys: duplicates inflate issuance and desync the
+    // attestation tracker's N from the deduped roster (n <= 32, so the scan is cheap).
+    for (i, u) in new_trustee_users.iter().enumerate() {
+        ensure!(
+            !new_trustee_users[i + 1..].contains(u),
+            "duplicate pubkey {} in the new re-split set",
+            hex32(u)
+        );
+    }
+
+    // The OLD honest trustees (told to destroy) are always the old set minus the ex-friend,
+    // independent of the chosen NEW set.
+    let old_honest: Vec<[u8; 32]> = g
         .trustees
         .iter()
         .filter(|t| t.user != ex_user)
         .map(|t| t.node)
         .collect();
-    let n = u8::try_from(remaining.len()).context("too many remaining trustees")?;
+
+    // Resolve each chosen new trustee's roster identity (user + node + relay). Prefer the
+    // old grant record (still knows the node), else the current friend card; a user that is
+    // neither fails loudly - we cannot build a roster entry or deliver to it.
+    let mut new_roster: Vec<CoTrustee> = Vec::with_capacity(new_trustee_users.len());
+    for user in new_trustee_users {
+        let ct = if let Some(t) = g.trustees.iter().find(|t| t.user == *user) {
+            CoTrustee {
+                user: *user,
+                node: t.node,
+                relay_url: t.relay_url.clone(),
+            }
+        } else if let Some(card) = s.friends.get(user) {
+            let node = card
+                .nodes
+                .first()
+                .with_context(|| format!("new trustee {} card names no node", hex32(user)))?;
+            CoTrustee {
+                user: *user,
+                node: node.node_id,
+                relay_url: node.relay_url.clone(),
+            }
+        } else {
+            anyhow::bail!(
+                "new trustee {} is neither an old trustee nor an established friend",
+                hex32(user)
+            );
+        };
+        new_roster.push(ct);
+    }
+    let new_nodes: Vec<[u8; 32]> = new_roster.iter().map(|c| c.node).collect();
+    let n = u8::try_from(new_nodes.len()).context("too many new trustees")?;
     ensure!(
         n >= m,
-        "too few remaining trustees ({n}) to re-split {m}-of-N; recruit new trustees"
+        "too few new trustees ({n}) to re-split {m}-of-N; recruit new trustees"
     );
     let slack = if n > m { 1 } else { 0 };
 
-    let (rs, _shares, grants) = Resplit::begin(
+    let (rs, shares, _grants, new_state) = Resplit::begin(
         node_key,
         k_root,
         subject,
@@ -5227,23 +5511,49 @@ fn build_resplit(
         slack,
         true,
         old_rsid,
-        remaining.clone(),
-        remaining.clone(),
+        old_honest.clone(),
+        new_nodes.clone(),
         recovery_delay,
     )
     .map_err(|e| anyhow::anyhow!("re-split begin failed: {e:?}"))?;
     let new_rsid = rs.new_rsid();
 
-    let new_peers: Vec<ResplitPeer> = remaining
-        .iter()
-        .copied()
-        .zip(grants)
-        .map(|(node, grant)| ResplitPeer {
-            node,
+    // §8: mint each new grant with the co-trustee roster (recipient excluded) + latest
+    // announce refs, using the fresh shares `begin` produced. The empty-roster grants
+    // `begin` also returned are discarded - `begin` has no roster context, this does.
+    let refs = current_announce_refs(s);
+    let mut new_peers = Vec::with_capacity(new_nodes.len());
+    let mut new_records = Vec::with_capacity(new_nodes.len());
+    let mut roster: HashMap<[u8; 32], u64> = HashMap::new();
+    for (i, ct) in new_roster.iter().enumerate() {
+        let cotrustees: Vec<CoTrustee> = new_roster
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, o)| o.clone())
+            .collect();
+        let grant = build_share_grant(
+            node_key,
+            subject,
+            &shares[i],
+            recovery_delay,
+            cotrustees,
+            refs.clone(),
+        );
+        new_peers.push(ResplitPeer {
+            node: ct.node,
             grant: Some(grant),
-        })
-        .collect();
-    let old_peers: Vec<ResplitPeer> = remaining
+        });
+        roster.insert(ct.node, u64::from(shares[i].x));
+        new_records.push(GrantedTrustee {
+            user: ct.user,
+            node: ct.node,
+            relay_url: ct.relay_url.clone(),
+            share: shares[i].clone(),
+            delivered: false,
+        });
+    }
+    let old_peers: Vec<ResplitPeer> = old_honest
         .iter()
         .copied()
         .map(|node| ResplitPeer { node, grant: None })
@@ -5258,22 +5568,93 @@ fn build_resplit(
         new_peers,
         old_peers,
         delivered: HashSet::new(),
+        new_records,
+        roster,
+        m,
+        recovery_delay,
+        refs,
+        scope,
+        new_state: Some(new_state),
+        registered: false,
     })
 }
 
+/// §9.3.4 "who is online now": a peer is online iff it answered us (any successful
+/// connection/sync, recorded in `peer_last_seen`) within [`RESPLIT_ONLINE_WINDOW_SECS`].
+/// A bare cached address (`peer_addrs`) is NOT liveness - it survives a peer going offline.
+fn online_within_window(last_seen: Option<u64>, now: u64) -> bool {
+    last_seen.is_some_and(|t| now.saturating_sub(t) <= RESPLIT_ONLINE_WINDOW_SECS)
+}
+
+/// §9.3 step 4: on re-split completion (old set destroyed) make the NEW recovery-set id the
+/// ACTIVE one for ongoing bookkeeping - the owner's attestation cadence + drift tracking
+/// (`share_sets`), grant-refresh (`granted`), and extend (`split_states`) now target the new
+/// set - and retire the old set's trackers. One-shot per re-split (guarded by
+/// [`OpenResplit::registered`]); the destroy-gate invariant is untouched (the old shares
+/// were already destroyed through [`Resplit::share_destroy`] to reach `Complete`).
+fn register_completed_resplit(s: &mut Shared, old_rsid: u64) {
+    // Snapshot the registration data and mark it done, dropping the `&mut o` borrow before
+    // mutating the sibling maps (`granted`/`share_sets`/`split_states`).
+    let snap = {
+        let Some(o) = s.resplits.get_mut(&old_rsid) else {
+            return;
+        };
+        if o.rs.phase() != ResplitPhase::Complete || o.registered {
+            return;
+        }
+        o.registered = true;
+        // Reflect actual grant delivery in the active records.
+        let mut records = o.new_records.clone();
+        for r in &mut records {
+            r.delivered = o.delivered.contains(&r.node);
+        }
+        (
+            o.new_rsid,
+            o.subject,
+            o.recovery_delay,
+            o.refs.clone(),
+            records,
+            o.roster.clone(),
+            o.m,
+            o.scope,
+            o.new_state.take(),
+        )
+    };
+    let (new_rsid, subject, recovery_delay, refs, records, roster, m, scope, state) = snap;
+    let n = records.len();
+    s.granted.insert(
+        new_rsid,
+        OwnerGrants {
+            subject,
+            recovery_delay,
+            trustees: records,
+            refs,
+        },
+    );
+    s.share_sets
+        .insert(new_rsid, AttestTracker::new(m, n, roster));
+    if let Some(state) = state {
+        s.split_states
+            .insert(new_rsid, RecoverySet { scope, state });
+    }
+    // Retire the old set: it is destroyed everywhere honest, so stop tracking it.
+    s.granted.remove(&old_rsid);
+    s.share_sets.remove(&old_rsid);
+    s.split_states.remove(&old_rsid);
+    // Retire the completed OpenResplit itself: its `new_records` hold a duplicate in-memory
+    // copy of the new shares (already in `granted[new_rsid]`) that would otherwise accumulate
+    // unbounded across re-splits and never drop; removing it also stops drive_resplit from
+    // no-op-driving a finished re-split every maintenance tick.
+    s.resplits.remove(&old_rsid);
+}
+
 /// Build the §9.3 step-4 [`ResplitStatus`] for one open re-split: progress from the
-/// guarded [`Resplit`], plus per-remaining-friend reachability (a direct address is
-/// known now, or they have already answered) and per-step completion.
+/// guarded [`Resplit`], plus per-remaining-friend reachability (answered within the
+/// freshness window, or already done this re-split) and per-step completion.
 fn resplit_status_of(s: &Shared, o: &OpenResplit) -> ResplitStatus {
     let now = unix_now();
-    // §9.3.4 "who is online now": a peer is online iff it either already answered this
-    // re-split (`done`) or actually responded to us within the freshness window. A bare
-    // cached address (`peer_addrs`) is NOT liveness - it survives a peer going offline.
-    let online_now = |node: &[u8; 32]| {
-        s.peer_last_seen
-            .get(node)
-            .is_some_and(|&t| now.saturating_sub(t) <= RESPLIT_ONLINE_WINDOW_SECS)
-    };
+    let online_now =
+        |node: &[u8; 32]| online_within_window(s.peer_last_seen.get(node).copied(), now);
     let p = o.rs.progress();
     let phase = match p.phase {
         ResplitPhase::AwaitingNewSet => "awaiting_new_set",
@@ -6719,9 +7100,26 @@ mod tests {
         assert!(!s.held_grants.contains_key(&ex_user));
         assert!(!s.held_shares.contains_key(&their_rsid));
 
-        // Their node is queued for replica re-placement; a re-split is pending.
+        // Their node is queued for replica re-placement; a re-split is pending (NOT
+        // started - §9.3.4 prompt), with the suggested new set = the old honest trustees.
         assert!(s.unfriended_nodes.contains(&ex_node));
-        assert_eq!(s.pending_resplits.get(&our_rsid), Some(&ex_user));
+        let pend = s
+            .pending_resplits
+            .get(&our_rsid)
+            .expect("a pending re-split was recorded");
+        assert_eq!(pend.ex_trustee, ex_user);
+        assert_eq!(
+            pend.suggested,
+            vec![
+                kp(0x60).verifying_key().to_bytes(),
+                kp(0x61).verifying_key().to_bytes()
+            ],
+            "suggested new set is the old set minus the ex-friend"
+        );
+        assert!(
+            !s.resplits.contains_key(&our_rsid),
+            "the re-split is pending, not started"
+        );
 
         // What we PLACED on them, for the outbound DeleteRequests.
         assert_eq!(out.placement.replica_vids, vec![our_vid]);
@@ -6747,16 +7145,30 @@ mod tests {
         let subject = og.subject;
         let mut s = Shared::default();
         s.granted.insert(old_rsid, og);
+        // A published owned vault, so the re-split grants can carry its announce ref (§8).
+        let vid = [0x77; 32];
+        s.announces.push(announce(&owner_node, vid, 1));
 
+        // Default new set = old honest trustees (B, C), as user pubkeys.
+        let suggested = vec![b.verifying_key().to_bytes(), c.verifying_key().to_bytes()];
         let mut open = build_resplit(
             &owner_node,
             &k_root,
             &s,
             old_rsid,
             a.verifying_key().to_bytes(),
+            &suggested,
         )
         .expect("re-split stands up among the remaining trustees");
         assert_eq!(open.new_peers.len(), 2, "new set is B + C (A excluded)");
+        // §8 gap 3: each new grant carries the co-trustee roster (the OTHER new trustee)
+        // AND the latest announce refs - mirroring the original split's grants.
+        for p in &open.new_peers {
+            let g = p.grant.as_ref().unwrap();
+            assert_eq!(g.cotrustees.len(), 1, "roster excludes the recipient");
+            assert_eq!(g.refs.len(), 1, "grant carries the latest announce refs");
+            assert_eq!(g.refs[0].vid, vid);
+        }
         assert_eq!(open.old_peers.len(), 2);
         assert_eq!(open.rs.phase(), ResplitPhase::AwaitingNewSet);
 
@@ -6817,14 +7229,183 @@ mod tests {
         let (rsid2, og2) = granted_set(&[0x23; 32], 2, &[&a, &b]);
         let mut s2 = Shared::default();
         s2.granted.insert(rsid2, og2);
+        // Suggested set = only B (A removed): 1 < M=2, an impossible set.
+        let suggested = vec![b.verifying_key().to_bytes()];
         assert!(build_resplit(
             &owner_node,
             &k_root,
             &s2,
             rsid2,
-            a.verifying_key().to_bytes()
+            a.verifying_key().to_bytes(),
+            &suggested,
         )
         .is_err());
+    }
+
+    // §9.3.4 liveness window: a peer counts as online iff it answered within
+    // RESPLIT_ONLINE_WINDOW_SECS. The boundary is inclusive; a bare None (never seen) is
+    // never online.
+    #[test]
+    fn w5_online_within_window_boundary() {
+        let now = 1_800_000_000u64;
+        assert!(online_within_window(Some(now), now), "just seen is online");
+        assert!(
+            online_within_window(Some(now - RESPLIT_ONLINE_WINDOW_SECS), now),
+            "exactly at the window edge is still online (inclusive)"
+        );
+        assert!(
+            !online_within_window(Some(now - RESPLIT_ONLINE_WINDOW_SECS - 1), now),
+            "one second past the window is offline"
+        );
+        assert!(
+            !online_within_window(None, now),
+            "a peer we never saw answer is offline"
+        );
+    }
+
+    // §9.3 step 4: registering a COMPLETED re-split makes the new set the active one -
+    // its id takes over grant-refresh (`granted`), attestation cadence (`share_sets`), and
+    // extend bookkeeping (`split_states`) - and retires the old set. It is a one-shot
+    // (guarded by `OpenResplit::registered`) and refuses to fire before the re-split is
+    // Complete (old shares destroyed).
+    #[test]
+    fn w5_register_completed_resplit_activates_new_set() {
+        let owner_node = kp(0x30);
+        let k_root = [0x44u8; 32];
+        let a = kp(0x40); // the unfriended trustee
+        let b = kp(0x41);
+        let c = kp(0x42);
+
+        let (old_rsid, og) = granted_set(&[0x22; 32], 2, &[&a, &b, &c]);
+        let subject = og.subject;
+        let mut s = Shared::default();
+        s.granted.insert(old_rsid, og);
+        let vid = [0x77; 32];
+        s.announces.push(announce(&owner_node, vid, 1));
+        let suggested = vec![b.verifying_key().to_bytes(), c.verifying_key().to_bytes()];
+
+        // (1) An OPEN but not-yet-Complete re-split is not registered: the old set stays
+        // active (nothing else has a working set yet).
+        let fresh = build_resplit(
+            &owner_node,
+            &k_root,
+            &s,
+            old_rsid,
+            a.verifying_key().to_bytes(),
+            &suggested,
+        )
+        .unwrap();
+        assert_eq!(fresh.rs.phase(), ResplitPhase::AwaitingNewSet);
+        let incomplete_new_rsid = fresh.new_rsid;
+        s.resplits.insert(old_rsid, fresh);
+        register_completed_resplit(&mut s, old_rsid);
+        assert!(
+            s.granted.contains_key(&old_rsid),
+            "old set retained while the re-split is incomplete"
+        );
+        assert!(!s.granted.contains_key(&incomplete_new_rsid));
+        assert!(
+            !s.resplits.get(&old_rsid).unwrap().registered,
+            "an incomplete re-split is never marked registered"
+        );
+        s.resplits.remove(&old_rsid);
+
+        // (2) Drive a re-split all the way to Complete, then register it.
+        let mut open = build_resplit(
+            &owner_node,
+            &k_root,
+            &s,
+            old_rsid,
+            a.verifying_key().to_bytes(),
+            &suggested,
+        )
+        .unwrap();
+        let new_rsid = open.new_rsid;
+        let node_key_for = |node: &[u8; 32]| -> SigningKey {
+            for k in [&b, &c] {
+                if k.verifying_key().to_bytes() == *node {
+                    return (*k).clone();
+                }
+            }
+            panic!("unknown new trustee");
+        };
+        let peers: Vec<([u8; 32], ShareGrant)> = open
+            .new_peers
+            .iter()
+            .map(|p| (p.node, p.grant.clone().unwrap()))
+            .collect();
+        for (i, (node, grant)) in peers.iter().enumerate() {
+            let share = share_from_json(&grant.share_json).unwrap();
+            let nonce = [i as u8; 16];
+            let challenge = build_attest_challenge(&owner_node, subject, open.new_rsid, nonce);
+            let att = answer_attest_challenge(&node_key_for(node), &challenge, &share).unwrap();
+            open.rs.record_attestation(&att, &challenge).unwrap();
+        }
+        let _destroy = open.rs.share_destroy(&owner_node).expect("new set is live");
+        for (node, _) in &peers {
+            let ack =
+                build_share_destroy_ack(&node_key_for(node), subject, old_rsid, 1_800_000_000);
+            open.rs.record_destroy_ack(&ack).unwrap();
+        }
+        assert_eq!(open.rs.phase(), ResplitPhase::Complete);
+
+        s.resplits.insert(old_rsid, open);
+        register_completed_resplit(&mut s, old_rsid);
+
+        // The new set is active everywhere; the old set is retired.
+        assert!(
+            s.granted.contains_key(&new_rsid),
+            "new set now grant-tracked"
+        );
+        assert!(
+            !s.granted.contains_key(&old_rsid),
+            "old set dropped from granted"
+        );
+        assert!(
+            s.share_sets.contains_key(&new_rsid),
+            "new set attestation-tracked"
+        );
+        assert!(!s.share_sets.contains_key(&old_rsid));
+        assert!(
+            s.split_states.contains_key(&new_rsid),
+            "new set extend-tracked"
+        );
+        assert!(!s.split_states.contains_key(&old_rsid));
+        assert!(
+            !s.resplits.contains_key(&old_rsid),
+            "completed re-split retired from s.resplits (its duplicate new-share copy dropped)"
+        );
+
+        // (3) Second call is a no-op (the entry is gone, so it early-returns).
+        register_completed_resplit(&mut s, old_rsid);
+        assert!(s.granted.contains_key(&new_rsid));
+        assert!(!s.granted.contains_key(&old_rsid));
+    }
+
+    // §9.3 (audit follow-up): build_resplit must refuse an operator-supplied new set that
+    // includes the unfriended ex-trustee (re-granting them a live share would defeat the
+    // re-split) or contains duplicate pubkeys; the clean suggested set still builds.
+    #[test]
+    fn w5_build_resplit_rejects_ex_trustee_and_dupes() {
+        let owner_node = kp(0x30);
+        let k_root = [0x44u8; 32];
+        let a = kp(0x40); // the unfriended ex-trustee
+        let b = kp(0x41);
+        let c = kp(0x42);
+        let (old_rsid, og) = granted_set(&[0x22; 32], 2, &[&a, &b, &c]);
+        let mut s = Shared::default();
+        s.granted.insert(old_rsid, og);
+        s.announces.push(announce(&owner_node, [0x77; 32], 1));
+        let ex = a.verifying_key().to_bytes();
+        let bk = b.verifying_key().to_bytes();
+        let ck = c.verifying_key().to_bytes();
+
+        // ex-trustee smuggled into the new set is rejected.
+        assert!(build_resplit(&owner_node, &k_root, &s, old_rsid, ex, &[ex, bk]).is_err());
+        // duplicate pubkey is rejected.
+        assert!(build_resplit(&owner_node, &k_root, &s, old_rsid, ex, &[bk, bk]).is_err());
+        // the clean suggested set (old honest set) still builds.
+        assert!(build_resplit(&owner_node, &k_root, &s, old_rsid, ex, &[bk, ck]).is_ok());
     }
 
     // §9.3 step 1: a DeleteRequest deletes exactly the named data we hold OF the owner,

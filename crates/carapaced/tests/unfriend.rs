@@ -177,3 +177,141 @@ async fn forged_friendship_end_and_share_destroy_are_rejected() -> Result<()> {
     v.shutdown().await;
     Ok(())
 }
+
+/// §9.3.4 W5 (gap 1): unfriending a TRUSTEE does not auto-start the re-split. It records a
+/// PENDING one (surfaced with the suggested new set, the ex-trustee excluded) and delivers
+/// NO new grants until the user starts it via `start_pending_resplit`. This is the §9.3.4
+/// prompt flow: the user, not the daemon, decides to re-split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn unfriending_a_trustee_leaves_a_pending_resplit_until_started() -> Result<()> {
+    let a = Daemon::start(seeds(0x01, 0xA2)).await?; // owner of the split secret
+    let b = Daemon::start(seeds(0x11, 0xB2)).await?; // trustee to be unfriended
+    let c = Daemon::start(seeds(0x21, 0xC2)).await?; // honest co-trustee
+    let v = Daemon::start(seeds(0x31, 0xD2)).await?; // honest co-trustee
+
+    for t in [&b, &c, &v] {
+        befriend(&a, t).await?;
+    }
+    let trustees = [b.user_id(), c.user_id(), v.user_id()];
+    a.recovery_split_grant(
+        RSID,
+        RecoveryScope::Root,
+        2,
+        &trustees,
+        RECOVERY_DELAY,
+        false,
+    )
+    .await?;
+
+    assert!(
+        a.pending_resplit_statuses().is_empty(),
+        "no pending re-split before any unfriend"
+    );
+    assert!(
+        a.resplit_statuses().is_empty(),
+        "no open re-split before any unfriend"
+    );
+
+    // Unfriend a trustee: the re-split is DETECTED but left PENDING (§9.3.4 prompt).
+    let outcome = a.unfriend(b.user_id()).await?;
+    assert!(outcome.was_friend);
+    assert_eq!(
+        outcome.resplit_rsids,
+        vec![RSID],
+        "the trustee's recovery set is named as needing a re-split"
+    );
+
+    let pending = a.pending_resplit_statuses();
+    assert_eq!(pending.len(), 1, "exactly one re-split is pending");
+    assert_eq!(pending[0].old_rsid, RSID);
+    assert_eq!(pending[0].ex_trustee, b.user_id());
+    let suggested: Vec<[u8; 32]> = pending[0].suggested.iter().map(|t| t.user).collect();
+    assert!(
+        !suggested.contains(&b.user_id()),
+        "the suggested new set excludes the ex-trustee"
+    );
+    assert_eq!(
+        suggested.len(),
+        2,
+        "suggested new set is the two remaining trustees"
+    );
+    assert!(suggested.contains(&c.user_id()) && suggested.contains(&v.user_id()));
+    assert!(
+        a.resplit_statuses().is_empty(),
+        "unfriend does NOT open the re-split or deliver new-set grants"
+    );
+
+    // The user starts it: it becomes OPEN (delivering) and is cleared from the prompt.
+    let status = a.start_pending_resplit(RSID, None).await?;
+    assert_eq!(status.old_rsid, RSID);
+    assert_eq!(
+        status.new_total, 2,
+        "the new set is the two remaining trustees"
+    );
+    assert!(
+        a.pending_resplit_statuses().is_empty(),
+        "starting clears the pending prompt"
+    );
+    let open = a.resplit_statuses();
+    assert_eq!(open.len(), 1, "the re-split is now open and driving");
+    assert_eq!(open[0].old_rsid, RSID);
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+    v.shutdown().await;
+    Ok(())
+}
+
+/// §9.3.1 W5 (gap 2): a daemon that RECEIVES a FriendshipEnd from a peer it placed data on
+/// must send ITS OWN DeleteRequest(s) for what it placed - deferred to the maintenance loop
+/// (the control handler has no endpoint to dial out). Here B placed a replica on A; when B
+/// receives A's FriendshipEnd, B tears down and, after a maintenance round, asks A to delete
+/// B's replica. A keeps its side of the friendship so it still honors the request and the
+/// deletion is observable end to end. A DeleteRequest never triggers a FriendshipEnd, so
+/// this cannot loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiving_friendship_end_sends_reciprocal_delete_requests() -> Result<()> {
+    let a = Daemon::start(seeds(0x01, 0xA3)).await?;
+    let b = Daemon::start(seeds(0x11, 0xB3)).await?;
+    // B dials A to befriend, so B records A's address (needed to reach A with the delete).
+    befriend(&b, &a).await?;
+    assert!(a.is_friend(&b.user_id()) && b.is_friend(&a.user_id()));
+
+    // B publishes a vault and places a replica on A: A now holds data OF B.
+    let src = tree(b"b-epoch-one");
+    let (vid, _n) = b.new_vid();
+    b.publish_vault(src.path(), vid).await?;
+    let placed = b.place_replicas(vid, &[a.addr()?], 1).await?;
+    assert_eq!(placed, vec![a.node_id()], "A accepted B's replica");
+    assert!(a.holds_replica(&vid), "A stores B's replica before the end");
+
+    // A sends B a validly signed FriendshipEnd naming B, but keeps its OWN friendship with
+    // B (so it still authorizes B's reciprocal DeleteRequest - we can then observe A delete
+    // B's data). This isolates the RECEIVE-path reciprocal-send; in a full mutual unfriend A
+    // would already have dropped B's data in its own teardown.
+    let mut end = FriendshipEnd {
+        user: b.user_id(),
+        ts: 1_700_000_000,
+        by: [0; 32],
+        sig: [0; 64],
+    };
+    end.sign(&node_key(0x01)); // A's node key
+    a.send_control_frame(&b.addr()?, &end).await?;
+    assert!(
+        !b.is_friend(&a.user_id()),
+        "B tore down its friendship on receiving the FriendshipEnd"
+    );
+
+    // B's maintenance loop drains the queued reciprocal DeleteRequest and sends it to A.
+    let _ = b.maintenance_round(1_700_000_100).await;
+
+    assert!(
+        !a.holds_replica(&vid),
+        "B's reciprocal DeleteRequest made A delete the replica B had placed on it"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    Ok(())
+}

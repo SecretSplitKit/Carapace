@@ -16,7 +16,9 @@
 //! both sets briefly coexist - two doors, each still requiring its own full quorum
 //! - and [`Resplit::progress`] reports where the sequence stands.
 
-use carapace_recovery::{attestation_live, build_share_grant, verify_attestation, Share};
+use carapace_recovery::{
+    attestation_live, build_share_grant, verify_attestation, Share, SplitState,
+};
 use carapace_wire::{
     ShareAttestChallenge, ShareAttestation, ShareDestroy, ShareDestroyAck, ShareGrant, Signed,
 };
@@ -90,8 +92,10 @@ impl Resplit {
     /// a share (the ex-friend is deliberately excluded - they will never destroy).
     ///
     /// Returns the machine, the fresh shares (to deliver, one per new trustee, in
-    /// order), and the grants. `new_trustees` and the produced shares are paired by
-    /// index, so their counts must match `n`.
+    /// order), the grants, and the open [`SplitState`] of the fresh split (so the owner
+    /// can register the new set as the active one for extend/bookkeeping once the
+    /// re-split completes, §9.3 step 4). `new_trustees` and the produced shares are
+    /// paired by index, so their counts must match `n`.
     #[allow(clippy::too_many_arguments)]
     pub fn begin(
         owner_signer: &SigningKey,
@@ -105,11 +109,11 @@ impl Resplit {
         old_remaining: Vec<[u8; 32]>,
         new_trustees: Vec<[u8; 32]>,
         recovery_delay: u64,
-    ) -> Result<(Self, Vec<Share>, Vec<ShareGrant>), FriendError> {
+    ) -> Result<(Self, Vec<Share>, Vec<ShareGrant>, SplitState), FriendError> {
         if new_trustees.len() != usize::from(n) {
             return Err(FriendError::WrongSet);
         }
-        let (shares, _state, _warnings) =
+        let (shares, state, _warnings) =
             carapace_recovery::split_root(k_root, m, Some(n), allow_over_cap)?;
         // Every share of one split shares the polynomial's recovery_set_id.
         let new_rsid = u64::from(shares[0].recovery_set_id);
@@ -150,7 +154,7 @@ impl Resplit {
                 .collect(),
             phase: ResplitPhase::AwaitingNewSet,
         };
-        Ok((machine, shares, grants))
+        Ok((machine, shares, grants, state))
     }
 
     /// Record a new-set trustee's [`ShareAttestation`] (§9.3 step 3b). Verifies the
@@ -332,7 +336,7 @@ mod tests {
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
         let old_remaining: Vec<[u8; 32]> = old_honest.iter().map(pk).collect();
 
-        let (mut rs, new_shares, grants) = Resplit::begin(
+        let (mut rs, new_shares, grants, _state) = Resplit::begin(
             &owner,
             &K_ROOT,
             subject,
@@ -416,7 +420,7 @@ mod tests {
         let subject = pk(&key(5));
         let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
-        let (mut rs, new_shares, _g) = Resplit::begin(
+        let (mut rs, new_shares, _g, _state) = Resplit::begin(
             &owner,
             &K_ROOT,
             subject,
@@ -451,7 +455,7 @@ mod tests {
         let subject = pk(&key(5));
         let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
-        let (mut rs, new_shares, _g) = Resplit::begin(
+        let (mut rs, new_shares, _g, _state) = Resplit::begin(
             &owner,
             &K_ROOT,
             subject,
@@ -484,7 +488,7 @@ mod tests {
         let honest = key(10);
         let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
         let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
-        let (mut rs, _shares, _g) = Resplit::begin(
+        let (mut rs, _shares, _g, _state) = Resplit::begin(
             &owner,
             &K_ROOT,
             subject,

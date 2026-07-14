@@ -16,7 +16,7 @@ use axum::{
 };
 use carapace_wire::messages::Message as _;
 use carapace_wire::{FileGrant, InviteTicket};
-use carapaced::{Daemon, RecoveryScope, ResplitStatus};
+use carapaced::{Daemon, PendingResplitStatus, RecoveryScope, ResplitStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -246,6 +246,8 @@ fn status_snapshot(d: &Daemon) -> Value {
         // W5 (§9.3 step 4): open trustee re-splits after an unfriend, with the live
         // reachability of the remaining friends who get the new share / destroy step.
         "resplits": d.resplit_statuses().iter().map(resplit_json).collect::<Vec<_>>(),
+        // §9.3.4: re-splits detected on unfriend but awaiting the user's prompt to start.
+        "pending_resplits": d.pending_resplit_statuses().iter().map(pending_resplit_json).collect::<Vec<_>>(),
         "reachability": if relay_url.is_some() { "relay" } else { "direct" },
         "relay_networks": relay_networks,
         "relay_diversity_warning": relay_networks < 2,
@@ -272,6 +274,21 @@ fn resplit_json(rs: &ResplitStatus) -> Value {
             "online": f.online,
             "done": f.done,
             "status": if f.done { "done" } else if f.online { "online" } else { "will_queue" },
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// One PENDING re-split's §9.3.4 prompt surface as JSON: the ex-trustee and the suggested
+/// new trustee set with each member's live reachability, so the GUI can render the prompt
+/// and pre-fill `POST /api/recovery/{rsid}/resplit-start`.
+fn pending_resplit_json(p: &PendingResplitStatus) -> Value {
+    json!({
+        "old_rsid": p.old_rsid,
+        "ex_trustee": hexs(&p.ex_trustee),
+        "suggested": p.suggested.iter().map(|t| json!({
+            "user": hexs(&t.user),
+            "node": t.node.map(|n| hexs(&n)),
+            "online": t.online,
         })).collect::<Vec<_>>(),
     })
 }
@@ -398,6 +415,54 @@ pub async fn resplit_status(
             format!("no open re-split for recovery set {rsid}"),
         )),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ResplitStartReq {
+    /// Override of the suggested new trustee set (hex user pubkeys of established friends or
+    /// old trustees). Omit (or send an empty body) to use the pre-filled suggested set.
+    trustees: Option<Vec<String>>,
+}
+
+/// `POST /api/recovery/{rsid}/resplit-start`: start the re-split the §9.3.4 prompt was
+/// raised for (keyed by the old recovery-set id). The optional body overrides the suggested
+/// new trustee set. Stands up the new set and begins delivering ShareGrants; returns the
+/// resulting re-split status (same shape as `resplit-status`). 404 if there is no pending
+/// (or open) re-split for that id; 400 if the chosen set cannot form a working set.
+pub async fn resplit_start(
+    Path(rsid): Path<u64>,
+    State(st): State<AppState>,
+    body: Option<Json<ResplitStartReq>>,
+) -> Result<Json<Value>, ApiError> {
+    let override_set = match body.and_then(|Json(b)| b.trustees) {
+        Some(hexes) => {
+            let mut users = Vec::with_capacity(hexes.len());
+            for h in &hexes {
+                users.push(parse_hex32(h)?);
+            }
+            Some(users)
+        }
+        None => None,
+    };
+    // 404 only when nothing is tracked for this id; a chosen-set failure is a 400.
+    let tracked = st.daemon.resplit_status(rsid).is_some()
+        || st
+            .daemon
+            .pending_resplit_statuses()
+            .iter()
+            .any(|p| p.old_rsid == rsid);
+    if !tracked {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no pending or open re-split for recovery set {rsid}"),
+        ));
+    }
+    let status = st
+        .daemon
+        .start_pending_resplit(rsid, override_set)
+        .await
+        .map_err(|e| bad(format!("{e:#}")))?;
+    Ok(Json(resplit_json(&status)))
 }
 
 // ---- replicas ----------------------------------------------------------

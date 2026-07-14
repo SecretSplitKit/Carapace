@@ -9,6 +9,8 @@ export interface StatusSnapshot {
 	share_health: { recovery_sets_owned: number; shares_held: number };
 	// W5 (§9.3 step 4): open trustee re-splits after an unfriend, streamed live.
 	resplits: ResplitStatus[];
+	// §9.3.4: re-splits detected on unfriend but awaiting the user's prompt to start.
+	pending_resplits: PendingResplit[];
 	reachability: string;
 	relay_networks: number;
 	relay_diversity_warning: boolean;
@@ -39,6 +41,22 @@ export interface ResplitStatus {
 	old_destroyed: number;
 	old_total: number;
 	remaining: ResplitFriend[];
+}
+
+/** One suggested new-set trustee in a PendingResplit (§9.3.4): user pubkey, resolved
+ *  node (if still a friend), and live reachability. */
+export interface PendingTrustee {
+	user: string;
+	node: string | null;
+	online: boolean;
+}
+
+/** The §9.3.4 PROMPT surface for one unfriend-detected, not-yet-started re-split. */
+export interface PendingResplit {
+	old_rsid: number;
+	ex_trustee: string;
+	/** Pre-filled default new trustee set (the old honest trustees). */
+	suggested: PendingTrustee[];
 }
 
 export interface UnfriendResult {

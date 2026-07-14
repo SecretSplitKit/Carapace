@@ -53,6 +53,20 @@
 		}
 	}
 
+	// §9.3.4 PROMPT: start a re-split the daemon detected on unfriend but hasn't begun.
+	let starting = $state<number | null>(null);
+	function onlineCount(suggested: { online: boolean }[]): number {
+		return suggested.filter((t) => t.online).length;
+	}
+	async function startResplit(oldRsid: number) {
+		starting = oldRsid;
+		try {
+			await api.resplitStart(oldRsid);
+		} finally {
+			starting = null;
+		}
+	}
+
 	async function copy(text: string, mark: (v: boolean) => void) {
 		if (await copyToClipboard(text)) {
 			mark(true);
@@ -146,6 +160,65 @@
 				{$status.share_health.shares_held} share(s) held here in trust for others
 			</p>
 		</div>
+	{/if}
+
+	{#if $status?.pending_resplits?.length}
+		<h2 style="margin-top: 1.5rem">Re-split required</h2>
+		<p class="muted" style="font-size: var(--step--1)">
+			An unfriended trustee still held a share of the recovery set below (§9.3.4). Start the
+			re-split to hand a fresh share to a new trustee set - the old shares are only destroyed
+			once that new set is live.
+		</p>
+		{#each $status.pending_resplits as pr (pr.old_rsid)}
+			<div class="card resplit" style="margin-top: 1rem">
+				<div class="resplit-head">
+					<span class="mono">rsid {pr.old_rsid}</span>
+					<span class="phase required">re-split required</span>
+				</div>
+				<p class="muted" style="font-size: var(--step--1)">
+					<code class="mono">{pr.ex_trustee.slice(0, 12)}…</code> was a trustee of this recovery set and
+					was unfriended. Their retained share must be neutralized by re-splitting to a fresh set.
+				</p>
+
+				<div class="label muted" style="margin-top: 0.75rem">
+					Suggested new trustee set - live reachability
+				</div>
+				<div class="reach">
+					{#each pr.suggested as t (t.user)}
+						<div class="reach-row">
+							<span class="dot {t.online ? 'online' : 'offline'}" title={t.online ? 'online' : 'offline'}
+							></span>
+							<code class="mono">{t.user.slice(0, 12)}…</code>
+							<span class="muted">{t.online ? 'online' : 'offline'}</span>
+						</div>
+					{/each}
+				</div>
+
+				<p
+					class={onlineCount(pr.suggested) === pr.suggested.length && pr.suggested.length > 0
+						? 'healthy'
+						: 'muted'}
+					style="font-size: var(--step--1); margin-top: 0.5rem"
+				>
+					{onlineCount(pr.suggested)} / {pr.suggested.length} suggested trustee(s) online -
+					{#if onlineCount(pr.suggested) === pr.suggested.length && pr.suggested.length > 0}
+						will complete immediately once started.
+					{:else}
+						will complete progressively as offline trustees come online.
+					{/if}
+				</p>
+
+				<button
+					class="primary"
+					type="button"
+					style="margin-top: 0.75rem"
+					disabled={starting === pr.old_rsid}
+					onclick={() => startResplit(pr.old_rsid)}
+				>
+					{starting === pr.old_rsid ? 'Starting…' : 'Start re-split (use suggested set)'}
+				</button>
+			</div>
+		{/each}
 	{/if}
 
 	{#if $status?.resplits?.length}
@@ -441,6 +514,11 @@
 		border-color: var(--bronze);
 	}
 
+	.phase.required {
+		color: var(--coral);
+		border-color: var(--coral);
+	}
+
 	.gauges {
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -478,7 +556,8 @@
 		background: var(--bronze);
 	}
 
-	.dot.will_queue {
+	.dot.will_queue,
+	.dot.offline {
 		background: var(--muted);
 	}
 

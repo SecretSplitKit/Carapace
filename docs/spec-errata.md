@@ -385,26 +385,18 @@ by a unit test, `carapace_net::endpoint::tests::binds_ipv6`
 (`crates/carapace-net/src/endpoint.rs`), which binds `[::1]:0` through `bind_on` and
 asserts an IPv6 socket appears in `Endpoint::bound_sockets()`.
 
-## Note — W5 §9.3.4 re-split is auto-started, not user-picked (deliberate deviation)
+## Note — W5 §9.3.4 re-split prompt flow (implemented)
 
-§9.3.4 says the client MUST **prompt** the user to re-split when an unfriended party was a
-trustee, and frames the new trustee set as a **user choice** (§9.3.3(a)). Carapace instead
-**auto-starts** the re-split: `Daemon::unfriend` records a pending re-split for every
-recovery set the ex-friend was a trustee of, and `build_resplit` auto-selects the new set
-as **the old set minus the ex-friend** (threshold unchanged, slack 1 where there is room).
-The maintenance loop then drives it to completion under the destroy gate.
-
-This is deliberate, and the consent is not silent: the GUI's unfriend action is itself a
-two-step confirm (`FriendsView.svelte`), and on success it raises a prominent "Re-split
-required" panel naming the affected recovery sets and pointing at the Recovery view, where
-`/api/recovery/{rsid}/resplit-status` (and the aggregate `/api/status` `resplits` feed)
-report live per-friend progress. The user is therefore prompted before the unfriend and
-informed that a re-split is running, but does **not** hand-pick the new trustee set — the
-old-honest-set default is used so the re-split can proceed unattended without stranding the
-secret. Recruiting a fresh trustee set is a subsequent **manual** re-split
-(`/api/recovery/resplit`). The destroy-gating invariant is unaffected either way: the old
-shares are destroyed only once the new set is proven live (`≥ M + slack`), routed solely
-through `Resplit::share_destroy`.
+§9.3.4's prompt flow is implemented. Unfriending a trustee does **not** auto-start a
+re-split: `Daemon::unfriend` records a **pending** re-split (`pending_resplits`) for every
+recovery set the ex-friend was a trustee of, surfaced via `pending_resplit_statuses` (and
+`/api/status`) with the suggested new set (old set minus the ex-friend) and per-friend live
+reachability. Nothing stands up until the user acts: `POST
+/api/recovery/{rsid}/resplit-start` (`Daemon::start_pending_resplit`, optional trustee-set
+override) is the **only** path that opens a re-split, after which the maintenance loop drives
+it under the destroy gate. The destroy-gating invariant is unaffected: the old shares are
+destroyed only once the new set is proven live (`≥ M + slack`), routed solely through
+`Resplit::share_destroy`.
 
 The trustee-side receiver of that destroy (§9.3 step 3c) binds the instruction to the
 share's owner: `ControlHandler::serve_share_destroy` requires the signer node to map to the

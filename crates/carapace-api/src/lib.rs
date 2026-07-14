@@ -94,6 +94,10 @@ pub fn app(state: AppState) -> Router {
             "/api/recovery/{rsid}/resplit-status",
             get(handlers::resplit_status),
         )
+        .route(
+            "/api/recovery/{rsid}/resplit-start",
+            post(handlers::resplit_start),
+        )
         .route("/api/recovery/ceremony", get(handlers::ceremony_status))
         .route("/api/recovery/ceremony/open", post(handlers::ceremony_open))
         .route(

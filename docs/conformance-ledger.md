@@ -12,7 +12,7 @@ unit-tested but never wired to the daemon control stream or a background loop**
 | W2 | Recovery ceremony wired end-to-end (§8.5/§8.4: transport, fan-out/alarm, delay-gated release, claimant recover+re-sign, max-epoch fetch) | BLOCKER | recovery, daemon, api | DONE |
 | W3 | ShareGrant minting/delivery/ref-refresh (§8, §7.3 propagate to trustees) | MAJOR | recovery, daemon | DONE |
 | W4 | Background maintenance loops (§10.1 PoR+repair, §10.2 attestation cadence, self-validate, drift) | MAJOR | daemon, share, recovery | DONE |
-| W5 | Unfriend + trustee re-split flow wired (§9.3: FriendshipEnd, delete reqs, gated destroy sequence, re-split prompt) | BLOCKER | friend, daemon, api, replica, gui | TODO |
+| W5 | Unfriend + trustee re-split flow wired (§9.3: FriendshipEnd, delete reqs, gated destroy sequence, re-split prompt) | BLOCKER | friend, daemon, api, replica, gui | DONE |
 | W6 | Relay reachability lifecycle: dialback verify, advertise-on-success/withdraw-on-loss, self-elect, relay-TCP port mapping (§6) | BLOCKER | net, daemon | TODO |
 | W7 | Anti-entropy store-and-forward of third-party docs; newest-card own-device rollback; attestations in reconciliation (§6) | MAJOR | net/sync, daemon | DONE |
 | W8 | Replica blob-read authorization for held chunks (§7.4 MUST) | MAJOR | net, daemon | DONE |
@@ -20,7 +20,7 @@ unit-tested but never wired to the daemon control stream or a background loop**
 | W10 | Relay diversity warning surfaced in GUI (§6 MUST warn <2 networks) | MAJOR | gui, daemon | DONE |
 | W11 | Cross-client golden vectors (KDF tree, chunk-boundary, (vid,P)→ct+ChunkID) + pin FastCDC normalization (§4/§5) | MAJOR | content, kdf, docs, wire | DONE |
 | W12 | §11 filesystem watcher for Dropbox-like live sync | MAJOR | daemon | DONE |
-| W13 | IPv6 bind/verify (unverifiable — may already dual-stack) | MINOR | net | TODO |
+| W13 | IPv6 bind/verify (unverifiable — may already dual-stack) | MINOR | net | DONE (non-gap: iroh 1.0.2 dual-stacks) |
 | W14 | Default initial split N0 = M+1 when caller doesn't override (§12) | MINOR | recovery | DONE |
 | W15 | Paper-card export/print route + GUI action (§10.2 backstop) | MINOR | api, gui | TODO |
 
