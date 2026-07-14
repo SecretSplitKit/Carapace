@@ -15,6 +15,9 @@ ed25519-dalek = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 anyhow = "1"
 iroh = "1.0.2"
+# The embedded self-hosted relay (§6) lives behind iroh-relay's `server`
+# feature, which `iroh` itself does not enable. Pull it in directly.
+iroh-relay = { version = "1.0.2", features = ["server"] }
 iroh-blobs = "0.103"
 blake3 = "1"
 

@@ -8,11 +8,15 @@
 //! loopback control API (127.0.0.1 + per-session bearer token), prints the API URL
 //! and where the token lives, and idles until Ctrl-C.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use carapaced::{Daemon, State};
+use carapaced::{Daemon, NetConfig, State};
+
+/// Default bind for the embedded relay when `--relay` is given no explicit socket.
+const DEFAULT_RELAY_BIND: &str = "0.0.0.0:9991";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,10 +35,12 @@ async fn run(rest: Vec<String>) -> Result<()> {
     let mut publish: Option<PathBuf> = None;
     let mut vid_hex: Option<String> = None;
     let mut api_port: u16 = 0;
-    let mut bind: Option<String> = None;
-    let mut discovery = false;
+    let mut bind: Option<SocketAddr> = None;
+    let mut relays: Vec<carapaced::RelayUrl> = Vec::new();
+    let mut run_relay: Option<SocketAddr> = None;
+    let mut relay_host: Option<String> = None;
 
-    let mut it = rest.into_iter();
+    let mut it = rest.into_iter().peekable();
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--state-dir" => {
@@ -49,30 +55,62 @@ async fn run(rest: Vec<String>) -> Result<()> {
                     .parse()
                     .context("--api-port must be a u16 port")?
             }
-            "--bind" => bind = Some(it.next().context("--bind needs an ip:port value")?),
-            "--discovery" => discovery = true,
+            "--bind" => {
+                bind = Some(
+                    it.next()
+                        .context("--bind needs an ip:port value")?
+                        .parse()
+                        .context("--bind must be ip:port")?,
+                )
+            }
+            // Run the embedded self-hosted relay (§6). Optional value = its bind
+            // socket; defaults to `0.0.0.0:9991`. The next token is taken as the
+            // bind only if it is not another flag.
+            "--relay" => {
+                let b = match it.peek() {
+                    Some(v) if !v.starts_with("--") => it.next().unwrap(),
+                    _ => DEFAULT_RELAY_BIND.to_string(),
+                };
+                run_relay = Some(b.parse().context("--relay bind must be ip:port")?);
+            }
+            // Host/IP to advertise in our relay URL (e.g. a public DNS name/WAN IP).
+            "--relay-host" => {
+                relay_host = Some(it.next().context("--relay-host needs a host or ip")?)
+            }
+            // A friend's self-hosted relay URL to consume (repeatable). These form
+            // this node's usable relay set for relay fallback (§6).
+            "--relay-url" => relays.push(
+                it.next()
+                    .context("--relay-url needs an http(s)://host:port url")?
+                    .parse()
+                    .context("--relay-url must be a valid relay url")?,
+            ),
             other => bail!("unknown flag {other:?}"),
         }
     }
 
     let state_dir = state_dir.context("--state-dir is required")?;
     let state = State::load_or_generate(&state_dir)?;
-    let daemon = Arc::new(match (bind, discovery) {
-        (Some(b), disc) => {
-            let addr: std::net::SocketAddr = b.parse().context("--bind must be ip:port")?;
-            Daemon::start_on(state, carapaced::ReplicaLimits::default(), addr, disc).await?
-        }
-        (None, true) => {
-            let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
-            Daemon::start_on(state, carapaced::ReplicaLimits::default(), addr, true).await?
-        }
-        (None, false) => Daemon::start(state).await?,
+    let networked = bind.is_some() || run_relay.is_some() || !relays.is_empty();
+    let daemon = Arc::new(if networked {
+        let cfg = NetConfig {
+            bind,
+            relays,
+            run_relay,
+            relay_host,
+        };
+        Daemon::start_on(state, carapaced::ReplicaLimits::default(), cfg).await?
+    } else {
+        Daemon::start(state).await?
     });
 
     println!("node_id: {}", hex(&daemon.node_id()));
     match daemon.addr() {
         Ok(addr) => println!("addr: {addr:?}"),
         Err(e) => eprintln!("addr unavailable: {e}"),
+    }
+    if let Some(url) = daemon.advertised_relay_url() {
+        println!("relay_url: {url}");
     }
 
     if let Some(dir) = publish {

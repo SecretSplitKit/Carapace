@@ -185,3 +185,43 @@ Phase 5 audit dispositions for the owner-side blob-read gate (`authorize_fetch`)
   its ciphertext and size leak - acceptable. Folding the envelope digest into
   `owned_chunks` (gated to own devices + replica set) would tighten it if envelope
   metadata size/among-friends exposure ever matters.
+
+## Note — self-hosted NAT-traversal audit dispositions (§6, §14)
+
+Phase-N audit of the embedded relay + endpoint wiring. C1 (open unauthenticated
+relay) and W1 (undelegated hint injection) are fixed in code (`carapace-net::relay`
+friend-gate + per-client rate cap; `carapaced::learn_card_hints` delegation gate),
+W4 (relay-diversity warning) is implemented on the status surface
+(`relay_network_count` / `relay_diversity_warning`). The two below are settled
+here rather than in code.
+
+- **W2 (accepted metadata exposure): the embedded relay is plain HTTP.** The
+  `/relay` WebSocket is served over `ws://` (no TLS, no cert - the "zero
+  third-party infrastructure" relay). The relayed QUIC payload stays
+  end-to-end-encrypted, so content is safe, but the relay routing header carries
+  source/destination endpoint ids in the clear, so any passive on-path observer
+  (ISP, wifi, transit), not only the relay operator, sees which of your friends'
+  NodeIDs are talking and the packet timing/sizes. §14 scopes metadata exposure to
+  "friends' relays" (the operator); plain HTTP widens that to arbitrary on-path
+  networks. **Resolution: this on-path metadata exposure is accepted for Phase N.**
+  iroh's relay client speaks TLS only to an `https://` URL with a
+  handshake-valid cert, so closing this needs ACME or a pinned-cert scheme on
+  stable-named relays (§6 anticipates DDNS). §14 should state that a plain-HTTP
+  self-hosted relay exposes routing metadata to on-path observers, and that TLS is
+  recommended once a relay has a stable name.
+
+- **W3 (deferred feature): advertised relay is not dialback-verified.** A node run
+  with `--relay` advertises its relay URL in its ContactCard and issued tickets
+  unconditionally at startup; §6's "peer-dialback verification; advertise on
+  success, withdraw on loss" is not implemented, and there is no card re-issue when
+  the relay dies. Compounding it, iroh's portmapper maps only the single iroh
+  **endpoint UDP port**, never the relay's HTTP/TCP port, so a home-NAT node's
+  advertised relay is unreachable from the WAN unless the operator manually
+  port-forwards or fronts it with DDNS. **Resolution: documented, implementation
+  deferred.** Full dialback needs a cooperating external prober and an
+  event-driven advertise/withdraw + card-bump path (a new subsystem), out of scope
+  for this pass. Until then: a home node's relay port needs a manual
+  port-forward/DDNS, and friends may waste dials on an unreachable advertised
+  relay (bounded - the relay is a fallback hint, direct/hole-punched paths and
+  other friends' relays still work). §6 should note the portmapper does not open
+  the relay's TCP port.

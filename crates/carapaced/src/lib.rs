@@ -22,6 +22,10 @@ mod state;
 
 pub use state::State;
 
+/// Re-export so callers without an `iroh` dependency (e.g. the CLI) can parse
+/// friends' relay URLs for [`Daemon::start_on`].
+pub use iroh::RelayUrl;
+
 use anyhow::{ensure, Context, Result};
 use carapace_crypto::kdf::{self, INFO_DISCLOSE};
 use carapace_crypto::seal::{self, HpkePrivateKey, HpkePublicKey};
@@ -32,8 +36,8 @@ use carapace_friend::{
 };
 use carapace_net::endpoint::ALPN;
 use carapace_net::{
-    authorizing_event_sender, read_frame_raw, read_msg, write_msg, CarapaceEndpoint, DocStore,
-    IrohBlobStore,
+    authorizing_event_sender, read_frame_raw, read_msg, write_msg, CarapaceEndpoint, CarapaceRelay,
+    DocStore, IrohBlobStore, PeerHints, RelayAccessPolicy,
 };
 use carapace_recovery::{
     extend_split, share_to_json, split_root, split_vault, CeremonyState, PolicyWarning,
@@ -110,6 +114,28 @@ impl Default for ReplicaLimits {
             rate_refill_per_sec: DEFAULT_RATE_REFILL_PER_SEC,
         }
     }
+}
+
+/// Network wiring for [`Daemon::start_on`] (§6): where the endpoint binds, which
+/// friend-hosted relays to consume, and whether this node runs the embedded
+/// self-hosted relay a capable node offers its friends.
+#[derive(Clone, Debug, Default)]
+pub struct NetConfig {
+    /// Endpoint bind socket. `None` picks a default: loopback:0 for a plain
+    /// in-process node, or `0.0.0.0:0` when relays are involved (so the
+    /// portmapper can open the port and friends can reach us).
+    pub bind: Option<std::net::SocketAddr>,
+    /// Friends' advertised self-hosted relay URLs to consume at startup. These
+    /// form this node's usable relay set for relay fallback ("your usable relay
+    /// set = relays advertised by your friends", §6).
+    pub relays: Vec<RelayUrl>,
+    /// Run the embedded relay bound at this socket (`Some`), so friends can relay
+    /// through this node. `None` runs no relay.
+    pub run_relay: Option<std::net::SocketAddr>,
+    /// Host or IP to advertise in the relay URL instead of the bind IP (e.g. a
+    /// public DNS name or WAN address). Ignored when `run_relay` is `None`;
+    /// falls back to the relay's bound address.
+    pub relay_host: Option<String>,
 }
 
 /// The outcome of one PoR audit round over a vault's replicas ([`Daemon::por_audit_round`]).
@@ -304,6 +330,10 @@ struct ControlHandler {
     /// `serve_replica_store` later enforces as that friend's replica quota (W1);
     /// the initiating `befriend` path can agree a different amount explicitly.
     default_grant_bytes: u64,
+    /// Injector for peer addressing hints + relay URLs into the live endpoint, so
+    /// a friend's card learned on the accept path teaches this node how to dial
+    /// them back by node id via hole-punch/relay (§6).
+    hints: PeerHints,
 }
 
 impl ControlHandler {
@@ -429,6 +459,10 @@ impl ControlHandler {
                 .insert(requester_user, self.default_grant_bytes);
             accept
         };
+
+        // §6: learn how to reach this new friend by node id (their direct addrs
+        // and self-hosted relay), so we can dial them back via hole-punch/relay.
+        learn_card_hints(&self.hints, &req.card).await;
 
         write_msg(send, &accept).await?;
         send.finish()?;
@@ -603,6 +637,12 @@ pub struct Daemon {
     /// cannot exhaust an honest subject's budget. Single long-lived limiter guarded by
     /// its own mutex so `ceremony_open` can charge it without touching `shared`.
     recovery_limiter: Mutex<RecoveryRateLimiter>,
+    /// This node's own advertised relay URL, set iff it runs the embedded relay
+    /// (§6). Populated into its ContactCard `NodeEntry.relay_url` and issued
+    /// tickets' `relay_urls` so friends learn a relay through which to reach it.
+    advertised_relay: Option<RelayUrl>,
+    /// The embedded relay server, held to keep it running for the daemon's life.
+    _relay: Option<CarapaceRelay>,
     _router: Router,
 }
 
@@ -622,34 +662,85 @@ impl Daemon {
         Self::start_on(
             state,
             limits,
-            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-            false,
+            NetConfig {
+                bind: Some(std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    0,
+                ))),
+                ..NetConfig::default()
+            },
         )
         .await
     }
 
-    /// Like [`Daemon::start_with_limits`] but binds the iroh endpoint on a
-    /// caller-chosen socket address and optionally enables relay + discovery.
-    /// Pass `0.0.0.0:<port>` to make the node reachable from other hosts (the
-    /// default binds loopback for in-process tests); pass `discovery = true` to
-    /// enable iroh's relay + node discovery so peers behind separate NATs can
-    /// reach this node by node id (see [`CarapaceEndpoint::bind_on`]).
-    pub async fn start_on(
-        state: State,
-        limits: ReplicaLimits,
-        bind: std::net::SocketAddr,
-        discovery: bool,
-    ) -> Result<Self> {
+    /// Like [`Daemon::start_with_limits`] but with full network wiring
+    /// ([`NetConfig`]): a caller-chosen bind, friends' self-hosted relays to
+    /// consume, and optionally running this node's own embedded relay (§6). A node
+    /// that runs a relay advertises its URL in its ContactCard and issued tickets
+    /// and registers on it so friends can reach it via relay fallback.
+    pub async fn start_on(state: State, limits: ReplicaLimits, cfg: NetConfig) -> Result<Self> {
         let node_key = state.node_key.clone();
         let user_key = state.user_key();
         let k_root = state.k_root.clone();
+        let self_user = user_key.verifying_key().to_bytes();
+        let self_node = node_key.verifying_key().to_bytes();
 
-        let ep = CarapaceEndpoint::bind_on(&node_key, bind, discovery).await?;
-        let blobs = IrohBlobStore::new();
+        // The friend/replica state the relay's access gate and the daemon's
+        // handlers share. Created up front so the relay can be friend-gated
+        // against the live friend set (C1).
         let shared = Arc::new(RwLock::new(Shared::default()));
 
-        // This device's ContactCard: one node entry, user-signed delegation.
-        let card = build_card(&user_key, &node_key, &k_root);
+        // Run the embedded relay first (if requested) so its URL can be folded
+        // into both the endpoint's relay set (as this node's home relay) and the
+        // advertised card/tickets. C1: the relay is friend-gated - it admits only
+        // this node's own devices and established friends' delegated nodes, never
+        // arbitrary internet peers.
+        let relay = match cfg.run_relay {
+            Some(bind) => {
+                let access = Arc::new(FriendRelayGate {
+                    shared: Arc::clone(&shared),
+                    self_user,
+                    self_node,
+                });
+                Some(CarapaceRelay::start(bind, access).await?)
+            }
+            None => None,
+        };
+        let advertised_relay = match &relay {
+            Some(r) => Some(relay_advert_url(r, cfg.relay_host.as_deref())?),
+            None => None,
+        };
+
+        // The endpoint's usable relay set: friends' relays plus our own (so we
+        // register on it and advertise it as our home relay).
+        let mut relays = cfg.relays.clone();
+        if let Some(url) = &advertised_relay {
+            if !relays.contains(url) {
+                relays.push(url.clone());
+            }
+        }
+
+        // Default bind: loopback for a plain in-process node, but all-interfaces
+        // once relays are in play so the portmapper can open our port.
+        let bind = cfg.bind.unwrap_or_else(|| {
+            if relay.is_some() || !relays.is_empty() {
+                std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            } else {
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))
+            }
+        });
+
+        let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await?;
+        let blobs = IrohBlobStore::new();
+
+        // This device's ContactCard: one node entry, user-signed delegation, and
+        // (if we run a relay) our advertised relay URL so friends learn it (§6).
+        let card = build_card(
+            &user_key,
+            &node_key,
+            &k_root,
+            advertised_relay.as_ref().map(|u| u.to_string()),
+        );
         {
             let mut s = shared.write().expect("shared lock");
             s.cards.push(card);
@@ -665,10 +756,12 @@ impl Daemon {
             hello,
             node_key: node_key.clone(),
             user_key: user_key.clone(),
-            self_user: user_key.verifying_key().to_bytes(),
+            self_user,
             blobs: blobs.clone(),
             shared: Arc::clone(&shared),
             default_grant_bytes: limits.quota_bytes,
+            // Feed hints from friend cards learned on the accept path (§6).
+            hints: ep.hints(),
         };
         // §7.4 / D3 fetch authorization (closes S5 for owned granted content): the
         // blob store no longer answers `iroh_blobs::ALPN` fetches from any dialer.
@@ -709,6 +802,8 @@ impl Daemon {
             docs,
             // §8.5: at most 5 recovery opens per subject per 24 h window.
             recovery_limiter: Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)),
+            advertised_relay,
+            _relay: relay,
             _router: router,
         })
     }
@@ -941,13 +1036,23 @@ impl Daemon {
         // is monotonic on the friend's own stored version, so a first-seen older
         // card (accepted by the empty DocStore) cannot roll the address book back.
         if !newer_cards.is_empty() {
-            let mut s = self.shared.write().expect("shared lock");
-            for card in &newer_cards {
-                if let Some(existing) = s.friends.get(&card.user) {
-                    if card.version > existing.version {
-                        s.friends.insert(card.user, card.clone());
+            let mut updated: Vec<ContactCard> = Vec::new();
+            {
+                let mut s = self.shared.write().expect("shared lock");
+                for card in &newer_cards {
+                    if let Some(existing) = s.friends.get(&card.user) {
+                        if card.version > existing.version {
+                            s.friends.insert(card.user, card.clone());
+                            updated.push(card.clone());
+                        }
                     }
                 }
+            }
+            // §6: refresh addressing hints (relay + direct addrs) from the newer
+            // cards, so a friend that moves or changes relay stays reachable.
+            let hints = self.ep.hints();
+            for card in &updated {
+                learn_card_hints(&hints, card).await;
             }
         }
 
@@ -1079,8 +1184,21 @@ impl Daemon {
     /// daemon records it and will honor exactly one matching `FriendRequest`.
     pub fn issue_ticket(&self) -> Result<InviteTicket> {
         let now = unix_now();
-        let ticket = build_ticket(&self.user_key, self.node_id(), vec![], vec![], now + 3600)
-            .map_err(|e| anyhow::anyhow!("build ticket: {e}"))?;
+        // §6: advertise our self-hosted relay in the ticket's relay set, so the
+        // redeemer can reach us via relay fallback without our direct address.
+        let relay_urls: Vec<String> = self
+            .advertised_relay
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        let ticket = build_ticket(
+            &self.user_key,
+            self.node_id(),
+            vec![],
+            relay_urls,
+            now + 3600,
+        )
+        .map_err(|e| anyhow::anyhow!("build ticket: {e}"))?;
         {
             let mut s = self.shared.write().expect("shared lock");
             s.tickets.prune(now); // S7: drop expired tokens before recording a new one.
@@ -1114,6 +1232,11 @@ impl Daemon {
             s.cards.first().cloned().context("no own card")?
         };
         let req = build_friend_request(&self.node_key, own_card, ticket.token);
+
+        // §6: inject the ticket's addressing hints (issuer node id + direct addrs
+        // + self-hosted relay URLs) so we can dial the issuer by node id even when
+        // `peer` carries no direct address (the NAT-blind, relay-only path).
+        learn_ticket_hints(&self.ep.hints(), ticket).await;
 
         let conn = self.ep.connect(peer, ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -1150,6 +1273,9 @@ impl Daemon {
             s.friend_grants
                 .insert(acceptor_user, grant_bytes.unwrap_or(DEFAULT_QUOTA_BYTES));
         }
+        // §6: learn the acceptor's card hints (relay + direct addrs) for later
+        // dials (anti-entropy, PoR probes) by node id.
+        learn_card_hints(&self.ep.hints(), &accept.card).await;
         drop(conn);
         Ok(friendship)
     }
@@ -1924,6 +2050,51 @@ impl Daemon {
         }
     }
 
+    /// This node's own advertised relay URL as a string, iff it runs the embedded
+    /// relay (§6). Surfaced on the status + ticket API so the operator can see (and
+    /// share) the relay friends will use to reach this node.
+    pub fn advertised_relay_url(&self) -> Option<String> {
+        self.advertised_relay.as_ref().map(|u| u.to_string())
+    }
+
+    /// W4: number of distinct networks in this node's usable relay set (§6/§14) -
+    /// its own advertised relay plus every relay URL in an established friend's
+    /// newest card, deduplicated by host. §6 requires warning the user when this
+    /// drops below 2, since a single relay network is both a single point of
+    /// failure for reachability and a single metadata choke point.
+    ///
+    /// ponytail: "distinct network" == distinct URL host (DNS name or IP literal),
+    /// lowercased. Upgrade to IP-subnet/ASN grouping if two friends behind the
+    /// same host must count as one network more precisely.
+    pub fn relay_network_count(&self) -> usize {
+        let mut urls: Vec<String> = Vec::new();
+        if let Some(u) = &self.advertised_relay {
+            urls.push(u.to_string());
+        }
+        let s = self.shared.read().expect("shared lock");
+        for card in s.friends.values() {
+            for n in &card.nodes {
+                if let Some(url) = &n.relay_url {
+                    urls.push(url.clone());
+                }
+            }
+        }
+        distinct_relay_networks(urls.iter().map(String::as_str))
+    }
+
+    /// W4: whether to warn the user that their usable relay set spans fewer than
+    /// 2 distinct networks (§6 normative MUST). Surfaced on the status API.
+    pub fn relay_diversity_warning(&self) -> bool {
+        self.relay_network_count() < 2
+    }
+
+    /// Wait until the endpoint has registered with at least one relay, so it is
+    /// reachable via relay fallback. Never completes with no relays configured;
+    /// guard with a timeout.
+    pub async fn wait_online(&self) {
+        self.ep.online().await;
+    }
+
     /// Recovery-set share-health counts for the status surface:
     /// `(recovery_sets_owned, shares_held_as_trustee)`.
     pub fn share_health_counts(&self) -> (usize, usize) {
@@ -2304,6 +2475,51 @@ fn node_is_authorized(s: &Shared, self_user: &[u8; 32], node: &[u8; 32], now: u6
         .any(|c| card_delegates_node(c, node, now))
 }
 
+/// C1: friend-gate for the embedded relay (§6/§14). Admits only this node itself,
+/// its own delegated devices, and nodes delegated by an established friend's
+/// newest card - never arbitrary internet peers. Reads the live friend set on
+/// every connection, so a peer befriended after the relay started is admitted
+/// and an unfriended one stops being admitted, with no relay restart.
+///
+/// The endpoint id is authenticated by the relay handshake before this runs
+/// (iroh-relay), so a non-friend cannot forge a friend's id to pass the gate.
+struct FriendRelayGate {
+    shared: Arc<RwLock<Shared>>,
+    self_user: [u8; 32],
+    self_node: [u8; 32],
+}
+
+impl std::fmt::Debug for FriendRelayGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FriendRelayGate")
+            .field("self_node", &hex32(&self.self_node))
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelayAccessPolicy for FriendRelayGate {
+    fn allows(&self, endpoint_id: &EndpointId, auth_token: Option<&str>) -> bool {
+        let node = *endpoint_id.as_bytes();
+        // Always admit ourselves: we register on our own relay as home relay,
+        // independent of when our own card lands in `shared`.
+        if node == self.self_node {
+            return true;
+        }
+        let now = unix_now();
+        let s = self.shared.read().expect("shared lock");
+        if node_is_authorized(&s, &self.self_user, &node, now) {
+            return true;
+        }
+        // Invite bootstrap (§6): a not-yet-friend that presents a live invite
+        // ticket we issued (as its relay auth token) is admitted so it can reach
+        // us to complete the friendship handshake. Without this, a friend-only
+        // gate would make the very first, ticketed contact impossible over relay.
+        auth_token
+            .and_then(parse_ticket_auth_token)
+            .is_some_and(|tok| s.tickets.admits(&tok, now))
+    }
+}
+
 /// The per-friend replica-storage grant to enforce for a placement signed by
 /// `node`: the byte limit agreed with the friend whose newest card delegates
 /// `node`, or `DEFAULT_QUOTA_BYTES` if no grant is recorded (defensive default -
@@ -2424,6 +2640,129 @@ fn endpoint_addr(node: [u8; 32], addrs: &[String]) -> Result<EndpointAddr> {
     Ok(ea)
 }
 
+/// Build the relay URL to advertise for a running embedded relay: `relay_host`
+/// (a public DNS name or WAN IP) on the relay's bound port, or the relay's own
+/// bound `http://addr` when no host override is given (§6).
+fn relay_advert_url(relay: &CarapaceRelay, host: Option<&str>) -> Result<RelayUrl> {
+    match host {
+        Some(h) => format!("http://{}:{}", h, relay.http_addr().port())
+            .parse::<RelayUrl>()
+            .map_err(|e| anyhow::anyhow!("advertised relay url for host {h:?}: {e}")),
+        None => Ok(relay.relay_url()),
+    }
+}
+
+/// Feed a friend's ContactCard addressing hints into the live endpoint (§6): for
+/// each node entry, inject an `EndpointAddr` (id + direct addrs + relay url) so it
+/// can be dialed by node id, and add its relay to our usable relay set. A
+/// malformed entry is skipped rather than failing the whole learn.
+async fn learn_card_hints(hints: &PeerHints, card: &ContactCard) {
+    let now = unix_now();
+    for n in &card.nodes {
+        // W1: only inject a hint for a node the card's user actually delegates,
+        // with a delegation that has not expired. `card.verify()` at the call
+        // sites covers only the card's self-signature, not the per-node
+        // user->node delegations, so without this gate a card could inject an
+        // address hint for a node_id it never delegated.
+        //
+        // ponytail (known ceiling): this enforces the card's own trust model but
+        // does not fully stop cross-friend hint poisoning - delegations are
+        // user-signed only, so a malicious friend can self-delegate an arbitrary
+        // node_id (including a third friend's) with attacker-chosen addrs. That
+        // residual is bounded (no impersonation; QUIC is node-id-authenticated;
+        // hints merge, not replace) and closing it needs source-keyed hints, out
+        // of scope here.
+        if card_delegates_node(card, &n.node_id, now) {
+            // No relay auth token: an established friend's relay admits us via the
+            // friend branch of its gate, not via an invite ticket.
+            inject_hint(hints, n.node_id, &n.addrs, n.relay_url.as_deref(), None).await;
+        }
+    }
+}
+
+/// Like [`learn_card_hints`] but from an [`InviteTicket`] (issuer node id + direct
+/// addrs + advertised relay URLs). "Your usable relay set = relays advertised by
+/// your friends" (§6). The ticket's token is attached to the issuer's relays as
+/// the relay auth token so the issuer's friend-gated relay admits us for the
+/// (not-yet-friend) bootstrap handshake.
+async fn learn_ticket_hints(hints: &PeerHints, ticket: &InviteTicket) {
+    let auth = ticket_auth_token(&ticket.token);
+    inject_hint(
+        hints,
+        ticket.node,
+        &ticket.addrs,
+        ticket.relay_urls.first().map(String::as_str),
+        Some(&auth),
+    )
+    .await;
+    // Any further advertised relays join our usable set too, with the same token.
+    for url in ticket.relay_urls.iter().skip(1) {
+        if let Ok(u) = url.parse::<RelayUrl>() {
+            hints.add_relay_with_token(u, auth.clone()).await;
+        }
+    }
+}
+
+/// Inject one peer's `{node_id, direct addrs, relay}` hint into the endpoint.
+/// Unparseable node ids, socket strings, or relay URLs are dropped (best effort:
+/// addresses are hints, §6). When `auth_token` is set, the relay is added with
+/// that client auth token (the invite bootstrap, §6); otherwise it is added plain.
+async fn inject_hint(
+    hints: &PeerHints,
+    node: [u8; 32],
+    addrs: &[String],
+    relay: Option<&str>,
+    auth_token: Option<&str>,
+) {
+    let Ok(id) = EndpointId::from_bytes(&node) else {
+        return;
+    };
+    let mut ea = EndpointAddr::new(id);
+    for a in addrs {
+        if let Ok(sock) = a.parse::<std::net::SocketAddr>() {
+            ea = ea.with_ip_addr(sock);
+        }
+    }
+    if let Some(url) = relay {
+        if let Ok(u) = url.parse::<RelayUrl>() {
+            ea = ea.with_relay_url(u.clone());
+            match auth_token {
+                Some(t) => {
+                    hints.add_relay_with_token(u, t.to_string()).await;
+                }
+                None => {
+                    hints.add_relay(u).await;
+                }
+            }
+        }
+    }
+    hints.add_peer(ea);
+}
+
+/// Hex-encode a 16-byte invite-ticket token for use as a relay auth token (§6
+/// bootstrap). Lowercase, unpadded, 32 chars.
+fn ticket_auth_token(token: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in token {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Parse a relay auth token back to a 16-byte invite-ticket token, or `None` if
+/// it is not exactly 32 hex chars. Inverse of [`ticket_auth_token`].
+fn parse_ticket_auth_token(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Current unix time in seconds (for delegation-expiry checks).
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -2481,8 +2820,14 @@ fn keys_from_grant(body: &GrantBody) -> ChunkKeys {
 }
 
 /// This device's ContactCard: display name, disclosure enc key, and a single
-/// node entry whose delegation is user-signed (§4).
-fn build_card(user_key: &SigningKey, node_key: &SigningKey, k_root: &[u8; 32]) -> ContactCard {
+/// node entry whose delegation is user-signed (§4). `relay_url` is this node's
+/// advertised self-hosted relay (§6), or `None` when it runs no relay.
+fn build_card(
+    user_key: &SigningKey,
+    node_key: &SigningKey,
+    k_root: &[u8; 32],
+    relay_url: Option<String>,
+) -> ContactCard {
     let (_priv, disclose_pub) = seal::derive_keypair(&*kdf::k_disclose(k_root));
     let enc_pub: [u8; 32] = disclose_pub
         .to_bytes()
@@ -2501,11 +2846,11 @@ fn build_card(user_key: &SigningKey, node_key: &SigningKey, k_root: &[u8; 32]) -
             deleg,
             not_after: DELEG_NOT_AFTER,
             addrs: vec![],
-            relay_url: None,
+            relay_url: relay_url.clone(),
         }],
         offers: Offers {
             storage_bytes: 0,
-            relay: false,
+            relay: relay_url.is_some(),
             trustee: false,
         },
         version: 1,
@@ -2514,6 +2859,21 @@ fn build_card(user_key: &SigningKey, node_key: &SigningKey, k_root: &[u8; 32]) -
     };
     card.sign(user_key);
     card
+}
+
+/// W4: count distinct relay networks among a set of relay URLs, keyed by host
+/// (DNS name or IP literal, lowercased). Unparseable URLs and URLs with no host
+/// are ignored. Two relays on the same host (any port) count as one network.
+fn distinct_relay_networks<'a>(urls: impl Iterator<Item = &'a str>) -> usize {
+    let mut hosts: HashSet<String> = HashSet::new();
+    for url in urls {
+        if let Ok(u) = url.parse::<RelayUrl>() {
+            if let Some(h) = u.host_str() {
+                hosts.insert(h.to_ascii_lowercase());
+            }
+        }
+    }
+    hosts.len()
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -2574,7 +2934,7 @@ mod tests {
     fn c1_only_delegated_signer_is_accepted() {
         let user = kp(1);
         let node = kp(3);
-        let card = build_card(&user, &node, &[9; 32]);
+        let card = build_card(&user, &node, &[9; 32], None);
         let self_user = user.verifying_key().to_bytes();
         let vid = [0x55; 32];
 
@@ -2614,7 +2974,7 @@ mod tests {
         let user = kp(1);
         let node = kp(3);
         let rogue = kp(0x42);
-        let card = build_card(&user, &node, &[9; 32]);
+        let card = build_card(&user, &node, &[9; 32], None);
         let self_user = user.verifying_key().to_bytes();
         let good = [0x11; 32];
         let bad = [0x22; 32];
@@ -2638,7 +2998,7 @@ mod tests {
     fn c1_expired_or_unknown_delegation_refused() {
         let user = kp(1);
         let node = kp(3);
-        let card = build_card(&user, &node, &[9; 32]);
+        let card = build_card(&user, &node, &[9; 32], None);
         let node_id = node.verifying_key().to_bytes();
         assert!(card_delegates_node(&card, &node_id, NOW));
         assert!(
@@ -2724,7 +3084,8 @@ mod tests {
         let self_uid = self_user.verifying_key().to_bytes();
 
         let mut s = Shared::default();
-        s.cards.push(build_card(&self_user, &self_node, &[9; 32]));
+        s.cards
+            .push(build_card(&self_user, &self_node, &[9; 32], None));
         s.friends.insert(
             friend_user.verifying_key().to_bytes(),
             card_with(&friend_user, &friend_node, 1),
@@ -2855,7 +3216,7 @@ mod tests {
     fn w2_rollback_persists_across_syncs() {
         let user = kp(1);
         let node = kp(3);
-        let card = build_card(&user, &node, &[9; 32]);
+        let card = build_card(&user, &node, &[9; 32], None);
         let self_user = user.verifying_key().to_bytes();
         let vid = [0x55; 32];
 
@@ -2892,5 +3253,129 @@ mod tests {
             NOW,
         );
         assert!(t.is_empty(), "equal epoch is refused");
+    }
+
+    // C1: the embedded relay's friend-gate admits only this node itself and nodes
+    // delegated by an established friend's newest card - never arbitrary peers -
+    // and it tracks the live friend set (a peer befriended after start is
+    // admitted with no relay restart).
+    #[test]
+    fn c1_relay_gate_admits_only_self_and_friends() {
+        let self_user_key = kp(1);
+        let self_node_key = kp(2);
+        let self_user = self_user_key.verifying_key().to_bytes();
+        let self_node = self_node_key.verifying_key().to_bytes();
+
+        let friend_user = kp(10);
+        let friend_node = kp(11);
+        let friend_card = build_card(&friend_user, &friend_node, &[0xAA; 32], None);
+
+        let shared = Arc::new(RwLock::new(Shared::default()));
+        let gate = FriendRelayGate {
+            shared: Arc::clone(&shared),
+            self_user,
+            self_node,
+        };
+        let eid = |k: &SigningKey| {
+            EndpointId::from_bytes(&k.verifying_key().to_bytes()).expect("valid endpoint id")
+        };
+
+        // Self is always admitted (it registers on its own relay as home relay).
+        assert!(gate.allows(&eid(&self_node_key), None));
+        // Before the friendship exists, the friend's node and any stranger are
+        // denied - the relay is not an open forwarder.
+        assert!(!gate.allows(&eid(&friend_node), None));
+        assert!(!gate.allows(&eid(&kp(99)), None));
+
+        // Invite bootstrap: a stranger presenting a live invite-ticket token we
+        // issued (as its relay auth token) is admitted so it can reach us to
+        // complete the handshake; a bogus/unknown token is not.
+        let ticket = build_ticket(&self_user_key, self_node, vec![], vec![], NOW + 3600).unwrap();
+        let good = ticket_auth_token(&ticket.token);
+        shared.write().unwrap().tickets.issue(&ticket);
+        assert!(
+            gate.allows(&eid(&kp(99)), Some(&good)),
+            "a stranger with a live issued ticket token is admitted for bootstrap"
+        );
+        assert!(
+            !gate.allows(&eid(&kp(99)), Some(&ticket_auth_token(&[0xAB; 16]))),
+            "an unknown ticket token is not admitted"
+        );
+        assert!(
+            !gate.allows(&eid(&kp(99)), Some("not-hex")),
+            "a malformed auth token is not admitted"
+        );
+
+        // Establishing the friendship admits their delegated node, live.
+        shared
+            .write()
+            .unwrap()
+            .friends
+            .insert(friend_user.verifying_key().to_bytes(), friend_card);
+        assert!(
+            gate.allows(&eid(&friend_node), None),
+            "established friend's delegated node is admitted"
+        );
+        // An unrelated stranger with no token is still denied.
+        assert!(!gate.allows(&eid(&kp(99)), None));
+    }
+
+    // W1: a card injects an addressing hint only for a node it validly delegates.
+    // `card.verify()` covers the card self-signature but not the per-node
+    // user->node delegations, so an entry carrying an invalid delegation must not
+    // be injected even when the card itself is validly signed.
+    #[test]
+    fn w1_hint_gate_rejects_undelegated_node() {
+        let user = kp(5);
+        let node = kp(6);
+        let mut card = build_card(&user, &node, &[1; 32], None);
+        assert!(card_delegates_node(
+            &card,
+            &node.verifying_key().to_bytes(),
+            NOW
+        ));
+
+        // Append a third party's node_id with a bogus (all-zero) delegation, then
+        // re-sign the card so its self-signature is valid (a malicious friend
+        // controls their own card). The bogus entry must be rejected by the gate.
+        let victim = kp(7);
+        card.nodes.push(NodeEntry {
+            node_id: victim.verifying_key().to_bytes(),
+            deleg: [0u8; 64],
+            not_after: DELEG_NOT_AFTER,
+            addrs: vec!["9.9.9.9:9".to_string()],
+            relay_url: None,
+        });
+        card.sign(&user);
+        assert!(card.verify().is_ok(), "card self-signature is still valid");
+        assert!(
+            !card_delegates_node(&card, &victim.verifying_key().to_bytes(), NOW),
+            "an entry with an invalid user->node delegation is not injected"
+        );
+    }
+
+    // W4: distinct relay networks are counted by host, so a diversity warning
+    // (set < 2 networks) reflects real redundancy, not just relay-URL count.
+    #[test]
+    fn w4_distinct_relay_networks_dedup_by_host() {
+        // Same host, different ports = one network.
+        assert_eq!(
+            distinct_relay_networks(
+                ["http://relay.example:9991", "http://relay.example:80"].into_iter()
+            ),
+            1
+        );
+        // Distinct hosts = distinct networks.
+        assert_eq!(
+            distinct_relay_networks(["http://a.example:9991", "http://b.example:9991"].into_iter()),
+            2
+        );
+        // Unparseable or hostless URLs are ignored.
+        assert_eq!(
+            distinct_relay_networks(["not a url", "http://c.example"].into_iter()),
+            1
+        );
+        // No relays at all = zero networks (diversity warning fires).
+        assert_eq!(distinct_relay_networks(std::iter::empty()), 0);
     }
 }

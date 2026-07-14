@@ -5,17 +5,23 @@
 //! unit test for the monotonic-version rollback rule.
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use carapace_net::endpoint::ALPN;
-use carapace_net::{CarapaceEndpoint, DocStore, IrohBlobStore, Reject, SyncHandler};
+use carapace_net::{
+    read_msg, write_msg, AllowList, CarapaceEndpoint, CarapaceRelay, DocStore, IrohBlobStore,
+    Reject, SyncHandler,
+};
 use carapace_vault::{
     ingest_dir, new_vid, open_envelope, reconstruct, ChunkStore, MemoryStore, VaultKeys,
 };
 use carapace_wire::{ContactCard, Hello, ManifestEnvelope, Offers, Signed, VaultAnnounce};
 use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::BlobsProtocol;
 
 const K_ROOT: [u8; 32] = [0x33; 32];
@@ -256,4 +262,161 @@ fn rollback_rule_rejects_stale_and_equal_versions() {
     );
     let c2 = make_card(&user, 2);
     assert_eq!(store.offer_card(&c2), Ok(true));
+}
+
+/// Accept exactly one `carapace/1` connection on `ep`, read one `Hello` frame and
+/// echo it straight back, then keep the connection open until the peer closes it.
+async fn echo_one_hello(ep: Endpoint) -> Result<()> {
+    let incoming = ep.accept().await.context("no incoming connection")?;
+    let conn = incoming
+        .accept()
+        .context("accept incoming")?
+        .await
+        .context("await connection")?;
+    let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi")?;
+    let hello: Hello = read_msg(&mut recv).await?;
+    write_msg(&mut send, &hello).await?;
+    send.finish()?;
+    conn.closed().await;
+    Ok(())
+}
+
+/// Relay fallback (§6): two endpoints that know ONLY each other's self-hosted
+/// relay URL - no direct-address hints - open a `carapace/1` connection and
+/// round-trip a frame. Since neither peer knows a direct address for the other
+/// and there is no discovery service, the embedded relay is the only thing that
+/// can bootstrap the connection: this is the path taken when peers can't dial
+/// directly (both behind symmetric NAT).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_fallback_connects_and_roundtrips() -> Result<()> {
+    let a_key = SigningKey::from_bytes(&[0x21; 32]);
+    let b_key = SigningKey::from_bytes(&[0x22; 32]);
+
+    // A self-hosted, plain-HTTP relay (no TLS, no certificate). Friend-gated: only
+    // A and B are admitted (C1 - the relay is not an open forwarder).
+    let access = Arc::new(AllowList::new([
+        a_key.verifying_key().to_bytes(),
+        b_key.verifying_key().to_bytes(),
+    ]));
+    let relay = CarapaceRelay::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), access).await?;
+    let relay_url = relay.relay_url();
+    assert_eq!(
+        relay_url.scheme(),
+        "http",
+        "embedded relay must be plain HTTP"
+    );
+
+    // Both endpoints are configured with ONLY this relay; no direct-addr hints.
+    let a = CarapaceEndpoint::bind_on(
+        &a_key,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        std::slice::from_ref(&relay_url),
+    )
+    .await?;
+    let b = CarapaceEndpoint::bind_on(
+        &b_key,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        std::slice::from_ref(&relay_url),
+    )
+    .await?;
+
+    // Wait for both to register with the relay (become reachable via it).
+    tokio::time::timeout(Duration::from_secs(30), a.online())
+        .await
+        .context("A did not come online via the relay")?;
+    tokio::time::timeout(Duration::from_secs(30), b.online())
+        .await
+        .context("B did not come online via the relay")?;
+
+    // A accepts one carapace/1 connection and echoes the frame.
+    let accept = tokio::spawn(echo_one_hello(a.endpoint().clone()));
+
+    // B learns A only as {node_id, relay_url} - the StaticProvider hint - then
+    // dials A by bare node id, forcing resolution through the relay.
+    b.add_peer(EndpointAddr::new(a.id()).with_relay_url(relay_url.clone()));
+
+    let sent = Hello {
+        protocol: 1,
+        card_version: 42,
+        roles: 5,
+    };
+    let echoed = tokio::time::timeout(Duration::from_secs(30), async {
+        let conn = b.connect(EndpointAddr::new(a.id()), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
+        write_msg(&mut send, &sent).await?;
+        send.finish()?;
+        let echoed: Hello = read_msg(&mut recv).await?;
+
+        // The peer is reachable purely because of the relay: assert a relay
+        // transport path to A is known while the connection is live.
+        let info = b
+            .endpoint()
+            .remote_info(a.id())
+            .await
+            .context("no remote info for A")?;
+        let via_relay = info.addrs().any(|ta| ta.addr().is_relay());
+        assert!(via_relay, "expected a relay transport path to peer A");
+
+        anyhow::Ok(echoed)
+    })
+    .await
+    .context("relay round-trip timed out")??;
+
+    assert_eq!(
+        echoed, sent,
+        "frame must round-trip unchanged through the relay"
+    );
+
+    accept.await.context("accept task panicked")??;
+    a.close().await;
+    b.close().await;
+    relay.shutdown().await?;
+    Ok(())
+}
+
+/// Direct path: two endpoints with NO relay configured connect purely from a
+/// direct-address hint injected into the peer's `MemoryLookup` (id + bound
+/// socket), and round-trip a frame. Proves the `add_peer` direct-dial path and
+/// that the relay is not involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_addr_hint_connects_and_roundtrips() -> Result<()> {
+    let a_key = SigningKey::from_bytes(&[0x31; 32]);
+    let b_key = SigningKey::from_bytes(&[0x32; 32]);
+
+    // No relays: direct-address dialing only.
+    let a =
+        CarapaceEndpoint::bind_on(&a_key, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &[]).await?;
+    let b =
+        CarapaceEndpoint::bind_on(&b_key, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), &[]).await?;
+
+    let accept = tokio::spawn(echo_one_hello(a.endpoint().clone()));
+
+    // B learns A as {node_id, direct socket} - no relay - then dials by bare id.
+    b.add_peer(a.direct_addr()?);
+
+    let sent = Hello {
+        protocol: 1,
+        card_version: 7,
+        roles: 3,
+    };
+    let echoed = tokio::time::timeout(Duration::from_secs(30), async {
+        let conn = b.connect(EndpointAddr::new(a.id()), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
+        write_msg(&mut send, &sent).await?;
+        send.finish()?;
+        let echoed: Hello = read_msg(&mut recv).await?;
+        anyhow::Ok(echoed)
+    })
+    .await
+    .context("direct round-trip timed out")??;
+
+    assert_eq!(
+        echoed, sent,
+        "frame must round-trip unchanged over the direct path"
+    );
+
+    accept.await.context("accept task panicked")??;
+    a.close().await;
+    b.close().await;
+    Ok(())
 }

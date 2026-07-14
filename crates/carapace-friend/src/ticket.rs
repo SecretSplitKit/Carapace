@@ -115,6 +115,20 @@ impl TicketBook {
         Ok(())
     }
 
+    /// Whether `token` was issued by this book and has not yet expired at `now`,
+    /// without consuming it. Used to gate the embedded relay's invite bootstrap
+    /// (§6): a not-yet-friend presenting a live invite-ticket token as its relay
+    /// auth token is admitted so it can reach the issuer to complete the
+    /// handshake. Consumption stays with [`redeem`](Self::redeem) - a spent but
+    /// unexpired token still admits the relay connection (the handshake redeems
+    /// it exactly once; the redeemer then becomes a friend), which avoids a
+    /// mid-handshake reconnect being denied.
+    pub fn admits(&self, token: &[u8; 16], now: u64) -> bool {
+        self.issued
+            .get(token)
+            .is_some_and(|&expires| now <= expires)
+    }
+
     /// Drop tokens that expired at or before `now` (S7). An expired token can no
     /// longer be redeemed (`redeem` rejects it on expiry), so both its issued
     /// record and any consumed marker are dead weight; prune them so the book does
@@ -222,6 +236,36 @@ mod tests {
             book.redeem(&ticket.token, NOW),
             Err(FriendError::TicketConsumed)
         ));
+    }
+
+    // The relay invite-bootstrap gate: `admits` is a non-consuming liveness check
+    // - a live issued token admits (even after redemption), an unknown or expired
+    // one does not.
+    #[test]
+    fn ticket_book_admits_live_tokens_without_consuming() {
+        let (_user, ticket) = a_ticket(NOW);
+        let mut book = TicketBook::new();
+        assert!(
+            !book.admits(&ticket.token, NOW),
+            "unknown token not admitted"
+        );
+        book.issue(&ticket);
+        assert!(
+            book.admits(&ticket.token, NOW),
+            "live issued token admitted"
+        );
+        // Non-consuming: redeem still works afterwards, and a redeemed (spent) but
+        // unexpired token is still admitted for an in-flight relay connection.
+        book.redeem(&ticket.token, NOW).unwrap();
+        assert!(
+            book.admits(&ticket.token, NOW),
+            "spent-but-live token admitted"
+        );
+        // Expired token is not admitted.
+        assert!(
+            !book.admits(&ticket.token, ticket.expires + 1),
+            "expired token not admitted"
+        );
     }
 
     // S7: expired tokens are pruned from both issued and consumed, and pruning is

@@ -194,13 +194,20 @@ fn status_snapshot(d: &Daemon) -> Value {
         .collect();
     let held: Vec<String> = d.held_replica_vids().iter().map(|v| hexs(v)).collect();
     let (sets, shares) = d.share_health_counts();
+    let relay_url = d.advertised_relay_url();
+    // W4 (§6 MUST): warn when the usable relay set spans fewer than 2 distinct
+    // networks - a single relay is a single point of failure and metadata choke.
+    let relay_networks = d.relay_network_count();
     json!({
         "node_id": hexs(&d.node_id()),
         "addr": d.dialable_addr_strings(),
+        "relay_url": relay_url,
         "friends": { "count": friends.len(), "list": friends },
         "vaults": { "published": vaults, "held_replicas": held },
         "share_health": { "recovery_sets_owned": sets, "shares_held": shares },
-        "reachability": "direct",
+        "reachability": if relay_url.is_some() { "relay" } else { "direct" },
+        "relay_networks": relay_networks,
+        "relay_diversity_warning": relay_networks < 2,
     })
 }
 
@@ -254,6 +261,7 @@ pub async fn issue_ticket(State(st): State<AppState>) -> Result<Json<Value>, Api
         "ticket_hex": hexs(&ticket.encode_frame()),
         "node_id": hexs(&st.daemon.node_id()),
         "addrs": st.daemon.dialable_addr_strings(),
+        "relay_urls": ticket.relay_urls,
     })))
 }
 
