@@ -237,3 +237,32 @@ fn portmapper_for(bind: SocketAddr) -> PortmapperConfig {
         PortmapperConfig::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    /// W13 (§6 IPv6): a caller can bind an IPv6 socket. Passing an IPv6 `--bind`
+    /// (e.g. `[::]:port`, here `[::1]:0`) flows through `bind_on` into iroh's
+    /// `bind_addr` and actually binds an IPv6 UDP socket. iroh 1.0.2 is dual-stack
+    /// by construction - its builder pre-loads both a `0.0.0.0` and a `[::]`
+    /// transport (`socket/transports.rs::default_ipv4`/`default_ipv6`), and a
+    /// user `bind_addr` only replaces the same-family default - so this is a
+    /// non-gap; the test just pins the guarantee. See docs/spec-errata.md (W13).
+    #[tokio::test]
+    async fn binds_ipv6() {
+        let node_key = SigningKey::from_bytes(&[0x5c; 32]);
+        let bind = SocketAddr::from((Ipv6Addr::LOCALHOST, 0));
+        let ep = CarapaceEndpoint::bind_on(&node_key, bind, &[])
+            .await
+            .expect("bind IPv6 endpoint");
+
+        let socks = ep.endpoint().bound_sockets();
+        assert!(
+            socks.iter().any(|s| s.is_ipv6()),
+            "expected an IPv6 bound socket, got {socks:?}"
+        );
+        ep.close().await;
+    }
+}
