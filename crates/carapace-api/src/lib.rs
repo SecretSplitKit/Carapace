@@ -86,6 +86,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/recovery/split", post(handlers::recovery_split))
         .route("/api/recovery/extend", post(handlers::recovery_extend))
         .route("/api/recovery/resplit", post(handlers::recovery_resplit))
+        .route("/api/recovery/ceremony", get(handlers::ceremony_status))
         .route("/api/recovery/ceremony/open", post(handlers::ceremony_open))
         .route(
             "/api/recovery/ceremony/approve",

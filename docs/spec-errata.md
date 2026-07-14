@@ -318,3 +318,31 @@ announces are the versioned documents that flow (and now store-and-forward) acro
 friendship edges; the attestation cadence is a separate §10.2 liveness protocol that
 must stay nonce-fresh. §6 should scope its anti-entropy list to cards + announces and
 cross-reference §10.2 for the attestation challenge/response cadence.
+
+## Note — W2 ceremony roster is reconstructed at the daemon, not read from `grant.by` (§8.5)
+
+The ceremony crate's `CeremonyState::open_from_grant` derives the trustee roster as
+`grant.by` (the grant signer) plus each `cotrustee.user`. That is correct for the crate's
+own model, where each trustee holds a grant it signed itself (`grant.by` == the holder).
+But a **W3 owner-minted grant is signed by the OWNER's node key** (`recovery_split_grant`
+uses `build_share_grant(&self.node_key, …)`) and its `cotrustees` list **excludes the
+holder** - so `grant.by` is the subject-owner (not a trustee at all) and the holder is
+absent from the derived roster. Feeding such a grant to `open_from_grant` yields a roster
+that both **omits the holding trustee** and **wrongly admits the owner**, breaking every
+downstream check (`RecoveryOpen.by ∈ roster`, `CeremonyApprove.by ∈ roster`).
+
+**Resolution: the daemon reconstructs the ceremony roster itself** as `{this trustee's
+own user key} ∪ {each grant cotrustee.user}` (`carapaced::track_from_grant`), using the
+lower-level `CeremonyState::open` rather than `open_from_grant`. The holder is exactly the
+missing roster entry, so `{self} ∪ cotrustees` is the full N-trustee set on every observer;
+the owner-subject (who aborts, never approves) is correctly excluded. Opens, approvals, and
+aborts are signed with the **user** key (roster membership is by user key; node keys are
+dial hints + the §10.2 attestation roster only). Per-subject rate limiting stays on the
+sponsor path (`ceremony_sponsor_open`), matching §8.5 "rate-limited per subject" (the
+opener); the fan-out receive path relies on ceremony-id dedup + roster-gated tracking.
+The share-release transport reuses the signed `RecoveryOpen` as the claimant's request
+frame: a trustee whose gate is open (it approved AND `≥ M` approvals AND `max(opened_at,
+local first_seen)+recovery_delay` elapsed AND no abort) replies with its `CeremonyShare`
+HPKE-sealed to `ceremony_enc`; otherwise it replies with nothing. The spec prose is
+unaffected (it does not prescribe the grant's signer); this is an implementation
+reconciliation between the W3 grant format and the ceremony primitives.

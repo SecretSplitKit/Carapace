@@ -15,7 +15,7 @@ use axum::{
     Json,
 };
 use carapace_wire::messages::Message as _;
-use carapace_wire::{CeremonyApprove, FileGrant, InviteTicket, RecoveryOpen, ShareGrant};
+use carapace_wire::{FileGrant, InviteTicket};
 use carapaced::{Daemon, RecoveryScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -241,6 +241,8 @@ fn status_snapshot(d: &Daemon) -> Value {
         "vaults": { "published": vaults, "held_replicas": held },
         "share_health": { "recovery_sets_owned": sets, "shares_held": shares, "recovery": recovery },
         "recovery_grants": { "minted": grants, "held": held_grants },
+        // W2 (§8.5): live recovery ceremonies + the anti-silent-takeover alarm.
+        "ceremonies": ceremony_rows(d),
         "reachability": if relay_url.is_some() { "relay" } else { "direct" },
         "relay_networks": relay_networks,
         "relay_diversity_warning": relay_networks < 2,
@@ -553,43 +555,65 @@ pub async fn recovery_extend(
 
 #[derive(Deserialize)]
 pub struct CeremonyOpenReq {
-    open_hex: String,
-    grant_hex: String,
+    /// Hex user pubkey of the subject whose secret is being recovered. This daemon
+    /// must hold that subject's grant (only a trustee may open, §8.5 step 1).
+    subject: String,
+    /// The key-less claimant's display name.
+    claimant_display: String,
+    /// Hex X25519 ceremony pubkey the claimant generated on the new device; trustees
+    /// seal their shares to it.
+    ceremony_enc: String,
+    /// Hex node id of the claimant's new device (re-delegated after recovery).
+    new_node: String,
+    /// The sponsor's stated reason.
+    reason: String,
 }
 
-/// `POST /api/recovery/ceremony/open`: begin tracking an inbound recovery ceremony.
+/// `POST /api/recovery/ceremony/open`: a trustee opens a recovery ceremony for a
+/// subject it holds a grant for (§8.5 step 1) and fans the signed open out to the
+/// co-trustees and the subject's devices (step 2). Returns the signed open (hex) - the
+/// sponsor hands it to the claimant - and the ceremony id.
 pub async fn ceremony_open(
     State(st): State<AppState>,
     Json(req): Json<CeremonyOpenReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let open_bytes = hex::decode(&req.open_hex).map_err(|_| bad("invalid open hex"))?;
-    let grant_bytes = hex::decode(&req.grant_hex).map_err(|_| bad("invalid grant hex"))?;
-    let open =
-        RecoveryOpen::decode_frame(&open_bytes).map_err(|e| bad(format!("decode open: {e}")))?;
-    let grant =
-        ShareGrant::decode_frame(&grant_bytes).map_err(|e| bad(format!("decode grant: {e}")))?;
-    let (id, phase) = st.daemon.ceremony_open(&open, &grant, unix_now())?;
+    let subject = parse_hex32(&req.subject)?;
+    let ceremony_enc = parse_hex32(&req.ceremony_enc)?;
+    let new_node = parse_hex32(&req.new_node)?;
+    let (open, id) = st.daemon.ceremony_sponsor_open(
+        subject,
+        req.claimant_display,
+        ceremony_enc,
+        new_node,
+        req.reason,
+        unix_now(),
+    )?;
+    let reached = st.daemon.ceremony_fanout(&open).await.unwrap_or(0);
     Ok(Json(json!({
         "ceremony_id": hexs(&id),
-        "phase": format!("{phase:?}"),
+        "open_hex": hexs(&open.encode_frame()),
+        "fanout_reached": reached,
     })))
 }
 
 #[derive(Deserialize)]
 pub struct CeremonyApproveReq {
-    approve_hex: String,
+    ceremony_id: String,
 }
 
-/// `POST /api/recovery/ceremony/approve`: record a trustee's approval.
+/// `POST /api/recovery/ceremony/approve`: a trustee approves after out-of-band
+/// verification (§8.5 step 4) and broadcasts the approval to the co-trustees.
 pub async fn ceremony_approve(
     State(st): State<AppState>,
     Json(req): Json<CeremonyApproveReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let bytes = hex::decode(&req.approve_hex).map_err(|_| bad("invalid approve hex"))?;
-    let approve =
-        CeremonyApprove::decode_frame(&bytes).map_err(|e| bad(format!("decode approve: {e}")))?;
-    let approvals = st.daemon.ceremony_approve(&approve)?;
-    Ok(Json(json!({ "approvals": approvals })))
+    let id = parse_hex16(&req.ceremony_id)?;
+    let ap = st.daemon.ceremony_approve(id, unix_now())?;
+    let reached = st.daemon.ceremony_broadcast_approve(&ap).await.unwrap_or(0);
+    Ok(Json(json!({
+        "approve_hex": hexs(&ap.encode_frame()),
+        "broadcast_reached": reached,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -597,14 +621,50 @@ pub struct CeremonyAbortReq {
     ceremony_id: String,
 }
 
-/// `POST /api/recovery/ceremony/abort`: sign a subject abort for a ceremony.
+/// `POST /api/recovery/ceremony/abort`: the subject signs an authoritative abort
+/// (§8.5 step 3) and broadcasts it to the trustees, cancelling the ceremony.
 pub async fn ceremony_abort(
     State(st): State<AppState>,
     Json(req): Json<CeremonyAbortReq>,
 ) -> Result<Json<Value>, ApiError> {
     let id = parse_hex16(&req.ceremony_id)?;
-    let abort = st.daemon.ceremony_abort(id)?;
-    Ok(Json(json!({ "abort_hex": hexs(&abort.encode_frame()) })))
+    let ab = st.daemon.ceremony_abort(id)?;
+    let reached = st.daemon.ceremony_broadcast_abort(&ab).await.unwrap_or(0);
+    Ok(Json(json!({
+        "abort_hex": hexs(&ab.encode_frame()),
+        "broadcast_reached": reached,
+    })))
+}
+
+/// The recovery-ceremony status rows (§8.5 step 2/6) for the status surface: each
+/// ceremony this device has seen, its phase, approvals, and the alarm flags.
+fn ceremony_rows(d: &Daemon) -> Vec<Value> {
+    d.ceremony_statuses()
+        .iter()
+        .map(|c| {
+            json!({
+                "ceremony_id": hexs(&c.ceremony_id),
+                "subject": hexs(&c.subject),
+                "sponsor": hexs(&c.sponsor),
+                "claimant_display": c.claimant_display,
+                "reason": c.reason,
+                "phase": c.phase,
+                "approvals": c.approvals,
+                "threshold": c.threshold,
+                "is_self_subject": c.is_self_subject,
+                "takeover": c.takeover,
+                "trustee": c.trustee,
+                "approved": c.approved,
+                // The anti-silent-takeover banner: a live ceremony against OUR account.
+                "alarm": c.is_self_subject && !c.takeover,
+            })
+        })
+        .collect()
+}
+
+/// `GET /api/recovery/ceremony`: the recovery-ceremony status (§8.5 step 2/6).
+pub async fn ceremony_status(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({ "ceremonies": ceremony_rows(&st.daemon) }))
 }
 
 // ---- events (WebSocket) ------------------------------------------------

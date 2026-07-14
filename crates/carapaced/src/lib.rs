@@ -40,8 +40,9 @@ use carapace_net::{
     DocStore, IrohBlobStore, PeerHints, RelayAccessPolicy,
 };
 use carapace_recovery::{
-    build_share_grant, extend_split, share_to_json, split_root, split_vault, verify_share_grant,
-    CeremonyState, PolicyWarning, RecoveryRateLimiter,
+    build_ceremony_share, build_share_grant, extend_split, open_ceremony_share, open_recovery,
+    recover_key_from_shares, share_from_json, share_to_json, split_root, split_vault,
+    verify_share_grant, CeremonyPhase, CeremonyState, PolicyWarning, RecoveryRateLimiter,
 };
 use carapace_replica::{
     build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
@@ -59,10 +60,11 @@ use carapace_vault::{
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
-    AnnounceRef, CeremonyAbort, CeremonyApprove, CoTrustee, ContactCard, FileGrant, FriendAccept,
-    FriendRequest, Friendship, GrantBody, GrantChunk, GrantFile, Hello, InviteTicket, Manifest,
-    ManifestEnvelope, NodeEntry, Offers, RecoveryOpen, ReplicaAccept, ReplicaInvite, Sealed,
-    ShareAttestChallenge, ShareAttestation, ShareGrant, Signed, VaultAnnounce,
+    sign_delegation, AnnounceRef, CeremonyAbort, CeremonyApprove, CeremonyShare, CoTrustee,
+    ContactCard, FileGrant, FriendAccept, FriendRequest, Friendship, GrantBody, GrantChunk,
+    GrantFile, Hello, InviteTicket, Manifest, ManifestEnvelope, NodeEntry, Offers, RecoveryOpen,
+    ReplicaAccept, ReplicaInvite, Sealed, ShareAttestChallenge, ShareAttestation, ShareGrant,
+    Signed, VaultAnnounce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -404,9 +406,22 @@ struct Shared {
     /// re-splitting. ponytail: in-memory, daemon-lifetime like the rest of daemon
     /// state; persist a sealed split-state blob if extend must survive a restart.
     split_states: HashMap<u64, RecoverySet>,
-    /// Recovery ceremonies this device tracks (§8.5), keyed by ceremony id. The GUI
-    /// drives approve/abort against these; `phase`/`can_release` read from them.
-    ceremonies: HashMap<[u8; 16], carapace_recovery::CeremonyState>,
+    /// Recovery ceremonies this device tracks AS A TRUSTEE (§8.5), keyed by ceremony
+    /// id: the primitive state machine plus this trustee's own approval flag and
+    /// takeover flag. The API drives approve/abort against these; the delay-gated
+    /// share release reads `state.can_release` here.
+    ceremonies: HashMap<[u8; 16], TrackedCeremony>,
+    /// Surfaced ceremony alarms (§8.5 step 2), keyed by ceremony id: every inbound
+    /// `RecoveryOpen` this device saw, whether or not it is a trustee of the subject,
+    /// so the status API can raise "recovery of your account started - is this you?"
+    /// even on the subject's own devices and friends (who hold no grant to track a
+    /// full ceremony). The anti-silent-takeover signal.
+    ceremony_alarms: HashMap<[u8; 16], AlarmRecord>,
+    /// Injected wall clock for the ceremony delay gate (0 = real time). Test-only knob
+    /// (`set_test_clock`) so the 72 h abort delay is exercised without ever sleeping:
+    /// only the network-triggered ceremony paths (track `first_seen`, release gate)
+    /// read it; every other clock stays real.
+    test_now: u64,
     /// Trustee-side: the full verified `ShareGrant`s this daemon holds for other
     /// owners (W3, §8), keyed by the subject user pubkey whose secret was split. Held
     /// verbatim (roster + recovery_delay + announce refs), so at ceremony time the
@@ -463,6 +478,76 @@ type RefreshJob = (u64, [u8; 32], u64, Vec<AnnounceRef>, Vec<TrusteeJob>);
 struct RecoverySet {
     scope: RecoveryScope,
     state: carapace_recovery::SplitState,
+}
+
+/// A recovery ceremony this device tracks AS A TRUSTEE (§8.5): the primitive state
+/// machine plus the daemon-side facts the release gate and status surface need.
+struct TrackedCeremony {
+    /// The delay-anchored ceremony state (approvals, roster, `ceremony_enc`, subject).
+    state: CeremonyState,
+    /// Whether THIS trustee has approved (its own out-of-band verification, §8.5 step
+    /// 4). A trustee releases its share only if it approved: a trustee that never
+    /// verified the claimant must not be dragged into releasing just because `M`
+    /// others did. `state.can_release` gates on `≥ M` approvals + the delay; this
+    /// adds the "and I, specifically, approved" requirement.
+    approved: bool,
+    /// A valid subject-signed abort flagged this ceremony as an attempted takeover
+    /// (§8.5 step 3). Once set, this trustee never releases. (The sponsor / claimant /
+    /// reason for the status surface live in the paired [`AlarmRecord`], always present
+    /// alongside a tracked ceremony.)
+    takeover: bool,
+}
+
+/// A surfaced ceremony alarm (§8.5 step 2) for the status API: enough to show
+/// "recovery of <subject> started by <sponsor>" and, on the subject's own device,
+/// offer the authoritative abort. Recorded for EVERY inbound `RecoveryOpen`, whether
+/// or not this device is a trustee, so the anti-silent-takeover signal reaches the
+/// subject's own devices and friends.
+#[derive(Clone)]
+struct AlarmRecord {
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    claimant_display: String,
+    reason: String,
+    /// This device holds the subject's user key (the alarm is about OUR account) -
+    /// surface it loudly and offer the abort.
+    is_self_subject: bool,
+    /// A valid subject abort cancelled this ceremony.
+    aborted: bool,
+    /// The abort flagged it as an attempted takeover.
+    takeover: bool,
+}
+
+/// One recovery-ceremony row for the status API (§8.5 step 2/6): phase, approvals,
+/// and the alarm flags, so a client can raise the anti-silent-takeover signal and
+/// show ceremony progress. Built from [`Daemon::ceremony_statuses`].
+#[derive(Clone, Debug)]
+pub struct CeremonyStatus {
+    /// The ceremony id (echoed by every message in this ceremony).
+    pub ceremony_id: [u8; 16],
+    /// The subject user whose secret is being recovered.
+    pub subject: [u8; 32],
+    /// The sponsoring trustee that opened the ceremony.
+    pub sponsor: [u8; 32],
+    /// The claimant's display name from the `RecoveryOpen`.
+    pub claimant_display: String,
+    /// The sponsor's stated reason.
+    pub reason: String,
+    /// The observable phase: `"open"`, `"ready"` (delay elapsed AND `≥ M` approvals),
+    /// or `"aborted"`.
+    pub phase: &'static str,
+    /// Distinct trustee approvals collected so far (0 for an alarm-only observer).
+    pub approvals: usize,
+    /// The reconstruction threshold `M` (0 for an alarm-only observer).
+    pub threshold: usize,
+    /// This device is the subject: the alarm is about our account - surface loudly.
+    pub is_self_subject: bool,
+    /// A valid subject abort cancelled this ceremony as an attempted takeover.
+    pub takeover: bool,
+    /// This device is tracking it as a trustee (vs. an alarm-only observer).
+    pub trustee: bool,
+    /// This device (as a trustee) has approved.
+    pub approved: bool,
 }
 
 /// What a recovery split targets (§8.2). The inner circle splits `K_root` (a full
@@ -556,6 +641,18 @@ impl ControlHandler {
             Some((ShareGrant::TYPE, body)) => {
                 let grant = ShareGrant::from_map(body)?;
                 self.serve_grant(grant, &remote, &mut send).await?;
+            }
+            Some((RecoveryOpen::TYPE, body)) => {
+                let open = RecoveryOpen::from_map(body)?;
+                self.serve_recovery_open(open, &mut send).await?;
+            }
+            Some((CeremonyApprove::TYPE, body)) => {
+                let ap = CeremonyApprove::from_map(body)?;
+                self.serve_ceremony_approve(ap, &mut send).await?;
+            }
+            Some((CeremonyAbort::TYPE, body)) => {
+                let ab = CeremonyAbort::from_map(body)?;
+                self.serve_ceremony_abort(ab, &mut send).await?;
             }
             // Unknown/legacy first frame (or a bare Hello): reveal only the Hello.
             _ => {
@@ -923,6 +1020,125 @@ impl ControlHandler {
         };
         if stored {
             write_u64(send, 1).await?; // ack: the grant is held
+        }
+        send.finish()?;
+        Ok(())
+    }
+
+    /// Receive a `RecoveryOpen` (§8.5 step 2 fan-out AND the §8.5 step 5 claimant
+    /// share request - the same signed message serves both). Any dialer may relay an
+    /// open; only its self-signature is required to record the alarm, so the
+    /// anti-silent-takeover signal reaches the subject's own devices and friends
+    /// (which hold no grant). If we hold a grant for the subject we ALSO track the full
+    /// ceremony - deriving the roster as `{this trustee} ∪ the grant's co-trustees`
+    /// (the owner-minted grant is owner-signed and excludes the holder, so the ceremony
+    /// roster is reconstructed here, not from the grant signer) - and, once the gate is
+    /// open (we approved AND `≥ M` approvals AND the delay elapsed AND no abort), reply
+    /// with our share HPKE-sealed to `open.ceremony_enc`. No trustee ever sees another's
+    /// share, and nothing is ever sent unsealed.
+    ///
+    /// The delay clock is anchored to the LOCAL `first_seen` captured the first time we
+    /// track a ceremony id (never reset by a re-send), so a backdated sponsor
+    /// `opened_at` cannot collapse the abort window (spec-errata E4).
+    async fn serve_recovery_open(&self, open: RecoveryOpen, send: &mut SendStream) -> Result<()> {
+        if open.verify().is_err() {
+            send.finish()?; // an unsigned/forged open is neither an alarm nor trackable
+            return Ok(());
+        }
+        let mut share_to_send: Option<CeremonyShare> = None;
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            let now = ceremony_now(&s);
+            let is_self = open.subject == self.self_user;
+            // Alarm for every observer, deduped by ceremony id (a re-send never clears
+            // an abort flag). This is what /api/status surfaces.
+            s.ceremony_alarms
+                .entry(open.ceremony_id)
+                .or_insert_with(|| AlarmRecord {
+                    subject: open.subject,
+                    sponsor: open.by,
+                    claimant_display: open.claimant_display.clone(),
+                    reason: open.reason.clone(),
+                    is_self_subject: is_self,
+                    aborted: false,
+                    takeover: false,
+                });
+            // Trustee role: track (once) and, if the gate is open, seal our share.
+            if let Some(grant) = s.held_grants.get(&open.subject).cloned() {
+                // Track once, anchoring `first_seen` at the first observation - a re-send
+                // (or the claimant's later share request) never resets it (E4).
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    s.ceremonies.entry(open.ceremony_id)
+                {
+                    if let Ok(state) = track_from_grant(&self.self_user, &open, &grant, now) {
+                        e.insert(TrackedCeremony {
+                            state,
+                            approved: false,
+                            takeover: false,
+                        });
+                    }
+                }
+                if let Some(tc) = s.ceremonies.get(&open.ceremony_id) {
+                    if tc.approved && !tc.takeover && tc.state.can_release(now) {
+                        // Seal to the claimant's fresh ceremony key, signed with our
+                        // USER key so the claimant authenticates us against the roster.
+                        if let Ok(cs) = build_ceremony_share(
+                            &self.user_key,
+                            open.ceremony_id,
+                            &tc.state.ceremony_enc,
+                            &grant.share_json,
+                        ) {
+                            share_to_send = Some(cs);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cs) = share_to_send {
+            write_msg(send, &cs).await?;
+        }
+        send.finish()?;
+        Ok(())
+    }
+
+    /// Receive a co-trustee's `CeremonyApprove` (§8.5 step 4) and fold it into the
+    /// tracked ceremony's approval set. `state.approve` verifies the signature and
+    /// roster membership and counts each trustee once; a non-roster or duplicate
+    /// approval is silently ignored. Fire-and-forget (no reply).
+    async fn serve_ceremony_approve(
+        &self,
+        ap: CeremonyApprove,
+        send: &mut SendStream,
+    ) -> Result<()> {
+        if ap.verify().is_ok() {
+            let mut s = self.shared.write().expect("shared lock");
+            if let Some(tc) = s.ceremonies.get_mut(&ap.ceremony_id) {
+                let _ = tc.state.approve(&ap);
+            }
+        }
+        send.finish()?;
+        Ok(())
+    }
+
+    /// Receive a `CeremonyAbort` (§8.5 step 3). `state.abort` enforces `ab.by ==
+    /// subject` (authoritative, unforgeable by an impostor): a valid subject abort
+    /// cancels the ceremony permanently and this device flags it as an attempted
+    /// takeover, so no share ever releases afterward. Also flags the alarm record so an
+    /// alarm-only observer (a subject device / friend holding no grant) still shows it.
+    async fn serve_ceremony_abort(&self, ab: CeremonyAbort, send: &mut SendStream) -> Result<()> {
+        if ab.verify().is_ok() {
+            let mut s = self.shared.write().expect("shared lock");
+            if let Some(tc) = s.ceremonies.get_mut(&ab.ceremony_id) {
+                if tc.state.abort(&ab).is_ok() {
+                    tc.takeover = true;
+                }
+            }
+            if let Some(al) = s.ceremony_alarms.get_mut(&ab.ceremony_id) {
+                if ab.by == al.subject {
+                    al.aborted = true;
+                    al.takeover = true;
+                }
+            }
         }
         send.finish()?;
         Ok(())
@@ -3466,54 +3682,197 @@ impl Daemon {
             .collect()
     }
 
-    /// Begin tracking an inbound recovery ceremony (§8.5) from a signed `RecoveryOpen`
-    /// gated by a signed `ShareGrant`. Verifies both, derives roster/`M`/delay from the
-    /// grant, charges the per-subject rate limit, and records the ceremony. Returns the
-    /// ceremony id and its observable phase. `now` is this observer's wall clock and
-    /// anchors the abort delay (a sponsor cannot backdate it).
-    pub fn ceremony_open(
+    /// Sponsor-open a recovery ceremony for `subject` (§8.5 step 1). ONLY a trustee may
+    /// open: this daemon must hold the subject's `ShareGrant` (which is exactly what
+    /// makes it a trustee of the set), or the open is refused. Mints and signs a
+    /// `RecoveryOpen` with this device's USER key (so `open.by` is a roster member),
+    /// binding the claimant's fresh `ceremony_enc` pubkey and `new_node` id from the
+    /// key-less device, charges the per-subject rate limit, and begins tracking the
+    /// ceremony locally. Returns the signed open (to fan out with
+    /// [`Daemon::ceremony_fanout`]) and its ceremony id.
+    ///
+    /// `now` is the wall clock stamped as `opened_at` and the sponsor's own
+    /// `first_seen`; the delay gate uses `max(opened_at, first_seen) + recovery_delay`.
+    pub fn ceremony_sponsor_open(
         &self,
-        open: &RecoveryOpen,
-        grant: &ShareGrant,
+        subject: [u8; 32],
+        claimant_display: String,
+        ceremony_enc: [u8; 32],
+        new_node: [u8; 32],
+        reason: String,
         now: u64,
-    ) -> Result<([u8; 16], carapace_recovery::CeremonyPhase)> {
-        let state = {
+    ) -> Result<(RecoveryOpen, [u8; 16])> {
+        let grant = self.held_grant(&subject).context(
+            "cannot open a recovery ceremony for a subject we hold no grant for (only a trustee may sponsor, §8.5)",
+        )?;
+        let share = verify_share_grant(&grant)
+            .map_err(|e| anyhow::anyhow!("held grant failed verification: {e:?}"))?;
+        let rsid = u64::from(share.recovery_set_id);
+        // Per-subject rate limit (§8.5): a trustee cannot spam opens for one subject.
+        {
             let mut limiter = self.recovery_limiter.lock().expect("recovery limiter lock");
-            CeremonyState::open_from_grant(open, grant, &mut limiter, now)
-                .map_err(|e| anyhow::anyhow!("ceremony open rejected: {e:?}"))?
+            limiter
+                .check_and_record(subject, now)
+                .map_err(|e| anyhow::anyhow!("recovery open rate limited: {e:?}"))?;
+        }
+        let mut ceremony_id = [0u8; 16];
+        getrandom::getrandom(&mut ceremony_id)
+            .map_err(|e| anyhow::anyhow!("generate ceremony id: {e}"))?;
+        let open = open_recovery(
+            &self.user_key,
+            ceremony_id,
+            subject,
+            rsid,
+            claimant_display.clone(),
+            ceremony_enc,
+            new_node,
+            reason.clone(),
+            now,
+        );
+        // Track our own participation (roster = {us} ∪ the grant's co-trustees).
+        let self_user = self.user_id();
+        let state = track_from_grant(&self_user, &open, &grant, now)
+            .map_err(|e| anyhow::anyhow!("sponsor cannot track its own ceremony: {e:?}"))?;
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            s.ceremony_alarms.insert(
+                ceremony_id,
+                AlarmRecord {
+                    subject,
+                    sponsor: self_user,
+                    claimant_display,
+                    reason,
+                    is_self_subject: subject == self_user,
+                    aborted: false,
+                    takeover: false,
+                },
+            );
+            s.ceremonies.insert(
+                ceremony_id,
+                TrackedCeremony {
+                    state,
+                    approved: false,
+                    takeover: false,
+                },
+            );
+        }
+        Ok((open, ceremony_id))
+    }
+
+    /// Fan a signed `RecoveryOpen` out to every co-trustee named in our grant for the
+    /// subject, plus the subject's own devices and our friends we can reach (§8.5 step
+    /// 2): the anti-silent-takeover broadcast. Best-effort - an unreachable target is
+    /// skipped (the open is a re-sendable signed alarm). Returns the number reached.
+    pub async fn ceremony_fanout(&self, open: &RecoveryOpen) -> Result<usize> {
+        let targets = {
+            let s = self.shared.read().expect("shared lock");
+            resolve_ceremony_peers(&s, self.node_id(), &open.subject)
         };
-        let id = state.ceremony_id;
-        let phase = state.phase(now);
-        self.shared
-            .write()
-            .expect("shared lock")
-            .ceremonies
-            .insert(id, state);
-        Ok((id, phase))
+        let mut reached = 0;
+        for addr in targets {
+            if self.deliver_recovery_open(&addr, open).await.is_ok() {
+                reached += 1;
+            }
+        }
+        Ok(reached)
     }
 
-    /// Apply a trustee's signed `CeremonyApprove` (§8.5 step 4) to a tracked ceremony.
-    /// Returns the running distinct-approval count. Errors if the ceremony is unknown
-    /// or the approver is not a roster trustee.
-    pub fn ceremony_approve(&self, approve: &CeremonyApprove) -> Result<usize> {
+    /// Relay a `RecoveryOpen` to one peer's control stream (§8.5 step 2 fan-out). The
+    /// receiver records the alarm and, if it is a trustee, tracks the ceremony. Any
+    /// sealed-share reply is discarded here (fan-out precedes the release gate); the
+    /// claimant collects shares via [`ClaimantDevice::recover`]. Bounded by the connect
+    /// timeout so an offline target fails fast.
+    pub async fn deliver_recovery_open(
+        &self,
+        addr: &EndpointAddr,
+        open: &RecoveryOpen,
+    ) -> Result<()> {
+        self.dial_recovery_open(addr, open).await.map(|_| ())
+    }
+
+    /// Dial `addr`, send `open`, and read the trustee's optional sealed `CeremonyShare`
+    /// reply. A co-trustee that is not yet releasable replies with nothing.
+    async fn dial_recovery_open(
+        &self,
+        addr: &EndpointAddr,
+        open: &RecoveryOpen,
+    ) -> Result<Option<CeremonyShare>> {
+        let conn = tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(addr.clone(), ALPN))
+            .await
+            .context("recovery-open dial timed out")?
+            .context("recovery-open dial failed")?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, open).await?;
+        let reply = match read_frame_raw(&mut recv).await? {
+            Some((CeremonyShare::TYPE, body)) => Some(CeremonyShare::from_map(body)?),
+            _ => None,
+        };
+        let _ = send.finish();
+        Ok(reply)
+    }
+
+    /// Approve a tracked ceremony as this trustee (§8.5 step 4). Call this ONLY after
+    /// verifying the claimant out of band (video, in person). Records our signed
+    /// approval locally - so we will release our share once the gate opens - and returns
+    /// the `CeremonyApprove` to broadcast to the co-trustees (via
+    /// [`Daemon::ceremony_broadcast_approve`] or [`Daemon::send_ceremony_approve`]).
+    /// Errors if we do not track the ceremony (we never received the open).
+    pub fn ceremony_approve(&self, ceremony_id: [u8; 16], now: u64) -> Result<CeremonyApprove> {
+        let mut ap = CeremonyApprove {
+            ceremony_id,
+            ts: now,
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        ap.sign(&self.user_key);
         let mut s = self.shared.write().expect("shared lock");
-        let cer = s
+        let tc = s
             .ceremonies
-            .get_mut(&approve.ceremony_id)
-            .context("unknown ceremony")?;
-        cer.approve(approve)
+            .get_mut(&ceremony_id)
+            .context("unknown ceremony (no RecoveryOpen received)")?;
+        tc.state
+            .approve(&ap)
             .map_err(|e| anyhow::anyhow!("ceremony approve rejected: {e:?}"))?;
-        Ok(cer.approvals_count())
+        tc.approved = true;
+        Ok(ap)
     }
 
-    /// Abort a recovery ceremony (§8.5 step 3) by signing a `CeremonyAbort` with THIS
-    /// device's user key. Only the subject user can abort; this daemon is the subject
-    /// iff its own user key matches the ceremony's subject. Applies the abort to the
-    /// locally tracked ceremony (if any) and returns the signed message so the GUI can
-    /// broadcast it to the trustees. The abort is only *authoritative* if this device's
-    /// user key is the ceremony's subject: every trustee checks `abort.by == subject`,
-    /// so an abort this daemon signs for a ceremony it is not the subject of is inert
-    /// (and, if the ceremony is locally tracked, `abort()` rejects it as `NotSubject`).
+    /// Send a `CeremonyApprove` to one peer's control stream so its tracked ceremony
+    /// accrues this approval (§8.5 step 4 gossip). Bounded by the connect timeout.
+    pub async fn send_ceremony_approve(
+        &self,
+        addr: &EndpointAddr,
+        ap: &CeremonyApprove,
+    ) -> Result<()> {
+        self.send_control_frame(addr, ap).await
+    }
+
+    /// Broadcast an approval to the co-trustees / friends we can reach (best-effort).
+    /// Returns the number reached. The subject is looked up from the tracked ceremony.
+    pub async fn ceremony_broadcast_approve(&self, ap: &CeremonyApprove) -> Result<usize> {
+        let targets = {
+            let s = self.shared.read().expect("shared lock");
+            match s.ceremonies.get(&ap.ceremony_id) {
+                Some(tc) => resolve_ceremony_peers(&s, self.node_id(), &tc.state.subject),
+                None => Vec::new(),
+            }
+        };
+        let mut reached = 0;
+        for addr in targets {
+            if self.send_ceremony_approve(&addr, ap).await.is_ok() {
+                reached += 1;
+            }
+        }
+        Ok(reached)
+    }
+
+    /// Sign a `CeremonyAbort` for `ceremony_id` with THIS device's user key (§8.5 step
+    /// 3) and apply it locally. The abort is *authoritative* only if this device's user
+    /// key IS the ceremony's subject: every trustee checks `abort.by == subject`, so an
+    /// abort signed by a non-subject is inert (and `state.abort` rejects it as
+    /// `NotSubject`, leaving the ceremony untouched). Broadcast the returned message to
+    /// the trustees with [`Daemon::ceremony_broadcast_abort`] /
+    /// [`Daemon::send_ceremony_abort`].
     pub fn ceremony_abort(&self, ceremony_id: [u8; 16]) -> Result<CeremonyAbort> {
         let mut ab = CeremonyAbort {
             ceremony_id,
@@ -3522,11 +3881,118 @@ impl Daemon {
         };
         ab.sign(&self.user_key);
         let mut s = self.shared.write().expect("shared lock");
-        if let Some(cer) = s.ceremonies.get_mut(&ceremony_id) {
-            cer.abort(&ab)
-                .map_err(|e| anyhow::anyhow!("ceremony abort rejected: {e:?}"))?;
+        if let Some(tc) = s.ceremonies.get_mut(&ceremony_id) {
+            if tc.state.abort(&ab).is_ok() {
+                tc.takeover = true;
+            }
+        }
+        if let Some(al) = s.ceremony_alarms.get_mut(&ceremony_id) {
+            if ab.by == al.subject {
+                al.aborted = true;
+                al.takeover = true;
+            }
         }
         Ok(ab)
+    }
+
+    /// Send a `CeremonyAbort` to one peer's control stream (§8.5 step 3). Bounded.
+    pub async fn send_ceremony_abort(&self, addr: &EndpointAddr, ab: &CeremonyAbort) -> Result<()> {
+        self.send_control_frame(addr, ab).await
+    }
+
+    /// Broadcast a subject abort to the trustees / friends we can reach (best-effort).
+    /// Returns the number reached. Resolves peers from our held grant for the subject
+    /// (the abort's `by` IS the subject when authoritative) plus our friends.
+    pub async fn ceremony_broadcast_abort(&self, ab: &CeremonyAbort) -> Result<usize> {
+        let targets = {
+            let s = self.shared.read().expect("shared lock");
+            // The subject is `ab.by` when the abort is authoritative (self-abort).
+            resolve_ceremony_peers(&s, self.node_id(), &ab.by)
+        };
+        let mut reached = 0;
+        for addr in targets {
+            if self.send_ceremony_abort(&addr, ab).await.is_ok() {
+                reached += 1;
+            }
+        }
+        Ok(reached)
+    }
+
+    /// Dial `addr` on the control stream, send one signed message, drain the (empty)
+    /// reply, and finish. Shared by the approve/abort send paths. Bounded by the
+    /// connect timeout.
+    async fn send_control_frame<M: carapace_wire::messages::Message>(
+        &self,
+        addr: &EndpointAddr,
+        msg: &M,
+    ) -> Result<()> {
+        let conn = tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(addr.clone(), ALPN))
+            .await
+            .context("ceremony send dial timed out")?
+            .context("ceremony send dial failed")?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, msg).await?;
+        let _ = read_frame_raw(&mut recv).await;
+        let _ = send.finish();
+        Ok(())
+    }
+
+    /// The recovery-ceremony status surface for `/api/recovery/ceremony` (§8.5 step
+    /// 2/6): one row per ceremony this device has seen (an alarm, and - if it is a
+    /// trustee - the tracked phase and approval count), so a client can raise the
+    /// anti-silent-takeover signal and show progress. Evaluated against the (injectable)
+    /// ceremony clock.
+    pub fn ceremony_statuses(&self) -> Vec<CeremonyStatus> {
+        let s = self.shared.read().expect("shared lock");
+        let now = ceremony_now(&s);
+        s.ceremony_alarms
+            .iter()
+            .map(|(id, al)| match s.ceremonies.get(id) {
+                Some(tc) => {
+                    let phase = match tc.state.phase(now) {
+                        CeremonyPhase::Open => "open",
+                        CeremonyPhase::ReadyToRelease => "ready",
+                        CeremonyPhase::Aborted => "aborted",
+                    };
+                    CeremonyStatus {
+                        ceremony_id: *id,
+                        subject: al.subject,
+                        sponsor: al.sponsor,
+                        claimant_display: al.claimant_display.clone(),
+                        reason: al.reason.clone(),
+                        phase,
+                        approvals: tc.state.approvals_count(),
+                        threshold: usize::from(tc.state.m),
+                        is_self_subject: al.is_self_subject,
+                        takeover: tc.takeover || al.takeover,
+                        trustee: true,
+                        approved: tc.approved,
+                    }
+                }
+                None => CeremonyStatus {
+                    ceremony_id: *id,
+                    subject: al.subject,
+                    sponsor: al.sponsor,
+                    claimant_display: al.claimant_display.clone(),
+                    reason: al.reason.clone(),
+                    phase: if al.aborted { "aborted" } else { "open" },
+                    approvals: 0,
+                    threshold: 0,
+                    is_self_subject: al.is_self_subject,
+                    takeover: al.takeover,
+                    trustee: false,
+                    approved: false,
+                },
+            })
+            .collect()
+    }
+
+    /// Test-only: pin the ceremony delay clock to `now` (0 restores real time). Lets a
+    /// bounded test advance past the 72 h abort delay instantly instead of sleeping;
+    /// only the ceremony `first_seen`/release paths read it.
+    #[doc(hidden)]
+    pub fn set_test_clock(&self, now: u64) {
+        self.shared.write().expect("shared lock").test_now = now;
     }
 }
 
@@ -3940,6 +4406,262 @@ fn current_announce_refs(s: &Shared) -> Vec<AnnounceRef> {
         .collect();
     refs.sort_by_key(|r| r.vid);
     refs
+}
+
+/// The wall clock the ceremony delay gate reads: the injected `test_now` when set
+/// (bounded tests advance it past the 72 h delay instantly), else real time. Only the
+/// network-triggered ceremony paths (track `first_seen`, `can_release`, status) use it.
+fn ceremony_now(s: &Shared) -> u64 {
+    if s.test_now == 0 {
+        unix_now()
+    } else {
+        s.test_now
+    }
+}
+
+/// Track an inbound `RecoveryOpen` against a held `ShareGrant` (§8.5): verify the
+/// grant + open, bind the open to the grant's subject/rsid, derive the FULL trustee
+/// roster as `{this trustee} ∪ the grant's co-trustees`, and build the delay-anchored
+/// [`CeremonyState`] (`first_seen = now`).
+///
+/// The roster is reconstructed here rather than via the ceremony crate's
+/// `open_from_grant`, because a W3 owner-minted grant is signed by the OWNER (not the
+/// holding trustee) and lists only the OTHER co-trustees - so `grant.by` is the owner,
+/// not a roster member. The holder is this device (`self_user`), which is exactly the
+/// missing roster entry.
+fn track_from_grant(
+    self_user: &[u8; 32],
+    open: &RecoveryOpen,
+    grant: &ShareGrant,
+    now: u64,
+) -> Result<CeremonyState, carapace_recovery::RecoveryError> {
+    let share = verify_share_grant(grant)?;
+    if open.subject != grant.subject || open.rsid != u64::from(share.recovery_set_id) {
+        return Err(carapace_recovery::RecoveryError::GrantMismatch);
+    }
+    let mut roster: Vec<[u8; 32]> = Vec::with_capacity(1 + grant.cotrustees.len());
+    roster.push(*self_user);
+    for c in &grant.cotrustees {
+        if !roster.contains(&c.user) {
+            roster.push(c.user);
+        }
+    }
+    CeremonyState::open(open, roster, share.threshold, grant.recovery_delay, now)
+}
+
+/// Resolve dialable addresses of the recovery participants for `subject` we can reach
+/// (§8.5 step 2 fan-out audience): the co-trustees named in our held grant (node
+/// hints), the subject's own devices (from the subject's friend card), and our
+/// friends' devices - deduped, excluding this node, best-effort address resolution.
+fn resolve_ceremony_peers(
+    s: &Shared,
+    self_node: [u8; 32],
+    subject: &[u8; 32],
+) -> Vec<EndpointAddr> {
+    let mut nodes: Vec<[u8; 32]> = Vec::new();
+    if let Some(grant) = s.held_grants.get(subject) {
+        for c in &grant.cotrustees {
+            nodes.push(c.node);
+        }
+    }
+    if let Some(card) = s.friends.get(subject) {
+        for n in &card.nodes {
+            nodes.push(n.node_id);
+        }
+    }
+    for card in s.friends.values() {
+        for n in &card.nodes {
+            nodes.push(n.node_id);
+        }
+    }
+    let mut seen = HashSet::new();
+    nodes
+        .into_iter()
+        .filter(|n| *n != self_node && seen.insert(*n))
+        .filter_map(|n| resolve_peer(&s.peer_addrs, &n))
+        .collect()
+}
+
+/// §8.4 max-epoch selection: from announce refs gathered across all reachable
+/// trustees and replicas, the highest-epoch ref per vault - the manifest a recovering
+/// claimant fetches. Taking the max defeats a rollback where one stale trustee/replica
+/// would otherwise pin recovery to an old epoch. Sorted by vid for a stable result.
+#[must_use]
+pub fn max_epoch_refs(refs: &[AnnounceRef]) -> Vec<AnnounceRef> {
+    let mut best: HashMap<[u8; 32], AnnounceRef> = HashMap::new();
+    for r in refs {
+        match best.get(&r.vid) {
+            Some(prev) if prev.epoch >= r.epoch => {}
+            _ => {
+                best.insert(r.vid, r.clone());
+            }
+        }
+    }
+    let mut out: Vec<AnnounceRef> = best.into_values().collect();
+    out.sort_by_key(|r| r.vid);
+    out
+}
+
+/// A key-less recovery claimant (§8.4/§8.5 step 6): a fresh device with NO user key
+/// and NO `K_root` (that is what it is recovering), holding only a fresh ceremony HPKE
+/// keypair and a fresh node key. It hands its `ceremony_enc` pubkey to a sponsoring
+/// trustee (which builds the `RecoveryOpen`), then collects `M` HPKE-sealed
+/// `CeremonyShare`s from the approving trustees, recovers `K_root` locally, and
+/// re-derives its identity so the recovered device is usable (existing friendships and
+/// cards stay valid).
+///
+/// It cannot be a full [`Daemon`] (that needs `K_root` to build its card), so it binds
+/// a bare endpoint from its node key just long enough to collect shares.
+pub struct ClaimantDevice {
+    node_key: SigningKey,
+    ceremony_sk: HpkePrivateKey,
+    ceremony_pub: [u8; 32],
+}
+
+/// The identity a claimant recovers at the end of the ceremony (§8.4).
+pub struct Recovered {
+    /// The recovered 32-byte identity master key (or a scoped vault key). Zeroized on
+    /// drop; secret-equivalent to the original.
+    pub k_root: Zeroizing<[u8; 32]>,
+    /// The re-derived user pubkey - identical to the original owner's, because the user
+    /// key derives deterministically from `K_root`, so existing friendships and cards
+    /// stay valid (§8.4).
+    pub user_id: [u8; 32],
+    /// A fresh user-signed delegation of the new device's node key (§8.4 "the restored
+    /// user key re-signs delegations for the new device").
+    pub node_deleg: [u8; 64],
+    /// The new device's node id (the delegation's subject).
+    pub new_node: [u8; 32],
+}
+
+impl ClaimantDevice {
+    /// Generate a fresh claimant device: a new node key plus a fresh ceremony HPKE
+    /// keypair (the key the trustees seal their shares to).
+    pub fn new() -> Result<Self> {
+        let mut node_seed = [0u8; 32];
+        getrandom::getrandom(&mut node_seed).map_err(|e| anyhow::anyhow!("node seed: {e}"))?;
+        let mut ikm = [0u8; 32];
+        getrandom::getrandom(&mut ikm).map_err(|e| anyhow::anyhow!("ceremony ikm: {e}"))?;
+        let (sk, pk) = seal::derive_keypair(&ikm);
+        let ceremony_pub: [u8; 32] = pk
+            .to_bytes()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("ceremony pubkey is not 32 bytes"))?;
+        Ok(Self {
+            node_key: SigningKey::from_bytes(&node_seed),
+            ceremony_sk: sk,
+            ceremony_pub,
+        })
+    }
+
+    /// The fresh X25519 ceremony pubkey to hand the sponsor for the `RecoveryOpen`.
+    #[must_use]
+    pub fn ceremony_enc(&self) -> [u8; 32] {
+        self.ceremony_pub
+    }
+
+    /// This new device's node id (goes into the `RecoveryOpen`, re-delegated on
+    /// recover).
+    #[must_use]
+    pub fn new_node(&self) -> [u8; 32] {
+        self.node_key.verifying_key().to_bytes()
+    }
+
+    /// Collect the raw sealed `CeremonyShare`s the approving trustees release (§8.5
+    /// step 5). Dials each trustee with the signed `open`; a trustee whose gate is not
+    /// open (delay not elapsed, sub-`M` approvals, aborted, or it did not approve)
+    /// replies with nothing. The returned shares are still HPKE-sealed to the ceremony
+    /// key - no trustee saw another's, and nothing crosses the wire in the clear.
+    /// Bounded by the connect timeout per trustee.
+    pub async fn collect_raw(
+        &self,
+        open: &RecoveryOpen,
+        trustees: &[EndpointAddr],
+    ) -> Result<Vec<CeremonyShare>> {
+        let ep = CarapaceEndpoint::bind(&self.node_key)
+            .await
+            .context("bind claimant endpoint")?;
+        let mut out = Vec::new();
+        for addr in trustees {
+            match self.request_share(&ep, addr, open).await {
+                Ok(Some(cs)) => out.push(cs),
+                _ => continue,
+            }
+        }
+        ep.close().await;
+        Ok(out)
+    }
+
+    /// Open `M` collected shares with the ceremony key and recover `K_root` (§8.5 step
+    /// 6, §8.4). Each share is authenticated against `roster` (a sender not in the
+    /// trustee roster, or a tampered signature, is refused) before decryption; Chela's
+    /// integrity tag + CRC then guarantee recovery never silently yields a wrong secret.
+    /// The recovered user key re-signs a delegation for this new device.
+    ///
+    /// `roster` is the trustee user pubkeys (the sponsor provides it out of band, from
+    /// its grant). Errors if fewer than `M` valid shares open (recovery needs a quorum).
+    pub fn recover_from(&self, shares: &[CeremonyShare], roster: &[[u8; 32]]) -> Result<Recovered> {
+        let mut parsed: Vec<Share> = Vec::new();
+        for cs in shares {
+            let json = open_ceremony_share(&self.ceremony_sk, cs, roster)
+                .map_err(|e| anyhow::anyhow!("open ceremony share: {e:?}"))?;
+            parsed.push(
+                share_from_json(&json).map_err(|e| anyhow::anyhow!("parse share json: {e:?}"))?,
+            );
+        }
+        ensure!(
+            !parsed.is_empty(),
+            "no ceremony shares collected - the delay is not satisfied or too few trustees approved"
+        );
+        let k_root = recover_key_from_shares(&parsed).map_err(|e| {
+            anyhow::anyhow!("recover K_root failed (need >= M valid shares): {e:?}")
+        })?;
+        // Re-derive the identity and re-delegate this new device (§8.4). Identical user
+        // key to the original owner's, so existing friendships and cards stay valid.
+        let user_key = carapace_crypto::identity::user_key_from_seed(&kdf::k_userid(&*k_root));
+        let user_id = user_key.verifying_key().to_bytes();
+        let new_node = self.new_node();
+        let node_deleg = sign_delegation(&user_key, &new_node, DELEG_NOT_AFTER);
+        Ok(Recovered {
+            k_root,
+            user_id,
+            node_deleg,
+            new_node,
+        })
+    }
+
+    /// Collect `M` shares from the trustees and recover `K_root` in one call (§8.5 step
+    /// 6): [`collect_raw`](Self::collect_raw) then [`recover_from`](Self::recover_from).
+    pub async fn recover(
+        &self,
+        open: &RecoveryOpen,
+        roster: &[[u8; 32]],
+        trustees: &[EndpointAddr],
+    ) -> Result<Recovered> {
+        let shares = self.collect_raw(open, trustees).await?;
+        self.recover_from(&shares, roster)
+    }
+
+    /// Dial one trustee, send the `open` request, and read its optional sealed share.
+    async fn request_share(
+        &self,
+        ep: &CarapaceEndpoint,
+        addr: &EndpointAddr,
+        open: &RecoveryOpen,
+    ) -> Result<Option<CeremonyShare>> {
+        let conn = tokio::time::timeout(POR_CONNECT_TIMEOUT, ep.connect(addr.clone(), ALPN))
+            .await
+            .context("claimant share-request dial timed out")?
+            .context("claimant share-request dial failed")?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, open).await?;
+        let reply = match read_frame_raw(&mut recv).await? {
+            Some((CeremonyShare::TYPE, body)) => Some(CeremonyShare::from_map(body)?),
+            _ => None,
+        };
+        let _ = send.finish();
+        Ok(reply)
+    }
 }
 
 /// The announce `replicas` list: this device first, then the accepted members.
