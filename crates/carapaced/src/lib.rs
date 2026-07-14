@@ -623,24 +623,28 @@ impl Daemon {
             state,
             limits,
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            false,
         )
         .await
     }
 
     /// Like [`Daemon::start_with_limits`] but binds the iroh endpoint on a
-    /// caller-chosen socket address. Pass `0.0.0.0:<port>` to make the node
-    /// reachable from other hosts (the default binds loopback for in-process
-    /// tests). Peers dial this node by its node id plus a routable `ip:port`.
+    /// caller-chosen socket address and optionally enables relay + discovery.
+    /// Pass `0.0.0.0:<port>` to make the node reachable from other hosts (the
+    /// default binds loopback for in-process tests); pass `discovery = true` to
+    /// enable iroh's relay + node discovery so peers behind separate NATs can
+    /// reach this node by node id (see [`CarapaceEndpoint::bind_on`]).
     pub async fn start_on(
         state: State,
         limits: ReplicaLimits,
         bind: std::net::SocketAddr,
+        discovery: bool,
     ) -> Result<Self> {
         let node_key = state.node_key.clone();
         let user_key = state.user_key();
         let k_root = state.k_root.clone();
 
-        let ep = CarapaceEndpoint::bind_on(&node_key, bind).await?;
+        let ep = CarapaceEndpoint::bind_on(&node_key, bind, discovery).await?;
         let blobs = IrohBlobStore::new();
         let shared = Arc::new(RwLock::new(Shared::default()));
 

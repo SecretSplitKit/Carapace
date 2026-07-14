@@ -23,19 +23,44 @@ impl CarapaceEndpoint {
     /// iroh NodeID is the carapace node id by construction. Uses the `Minimal`
     /// preset (no DNS/relay discovery) for deterministic in-process operation.
     pub async fn bind(node_key: &SigningKey) -> Result<Self> {
-        Self::bind_on(node_key, SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await
+        Self::bind_on(node_key, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), false).await
     }
 
-    /// Like [`bind`](Self::bind) but binds on a caller-chosen socket address.
-    /// Pass `0.0.0.0:<port>` to listen on every interface so peers on other
-    /// hosts can dial this node (the loopback default is for in-process use).
-    pub async fn bind_on(node_key: &SigningKey, bind: SocketAddr) -> Result<Self> {
+    /// Like [`bind`](Self::bind) but binds on a caller-chosen socket address and
+    /// optionally enables relay + node discovery.
+    ///
+    /// - `bind`: pass `0.0.0.0:<port>` to listen on every interface so peers on
+    ///   other hosts can dial this node (the loopback default is for in-process
+    ///   use).
+    /// - `discovery`: with `true`, use iroh's n0 preset (public relays + DNS/pkarr
+    ///   discovery + hole-punching), so peers behind separate NATs can reach this
+    ///   node by node id alone, without a routable address. With `false`, use the
+    ///   `Minimal` preset (no third-party infra, direct-address dialing only) — the
+    ///   spec's zero-infrastructure ideal, but requires a reachable address.
+    pub async fn bind_on(node_key: &SigningKey, bind: SocketAddr, discovery: bool) -> Result<Self> {
         let sk = SecretKey::from_bytes(&node_key.to_bytes());
-        let builder = Endpoint::builder(presets::Minimal)
-            .secret_key(sk)
-            .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()]);
-        let builder = builder.bind_addr(bind).context("bind address")?;
-        let ep = builder.bind().await.context("bind iroh endpoint")?;
+        let alpns = vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()];
+        // `presets::N0` and `presets::Minimal` are distinct types, so the builder
+        // chain is branched here rather than sharing a preset binding.
+        let ep = if discovery {
+            Endpoint::builder(presets::N0)
+                .secret_key(sk)
+                .alpns(alpns)
+                .bind_addr(bind)
+                .context("bind address")?
+                .bind()
+                .await
+                .context("bind iroh endpoint")?
+        } else {
+            Endpoint::builder(presets::Minimal)
+                .secret_key(sk)
+                .alpns(alpns)
+                .bind_addr(bind)
+                .context("bind address")?
+                .bind()
+                .await
+                .context("bind iroh endpoint")?
+        };
         Ok(Self { ep })
     }
 

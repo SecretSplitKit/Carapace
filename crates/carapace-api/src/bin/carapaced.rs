@@ -32,6 +32,7 @@ async fn run(rest: Vec<String>) -> Result<()> {
     let mut vid_hex: Option<String> = None;
     let mut api_port: u16 = 0;
     let mut bind: Option<String> = None;
+    let mut discovery = false;
 
     let mut it = rest.into_iter();
     while let Some(flag) = it.next() {
@@ -49,18 +50,23 @@ async fn run(rest: Vec<String>) -> Result<()> {
                     .context("--api-port must be a u16 port")?
             }
             "--bind" => bind = Some(it.next().context("--bind needs an ip:port value")?),
+            "--discovery" => discovery = true,
             other => bail!("unknown flag {other:?}"),
         }
     }
 
     let state_dir = state_dir.context("--state-dir is required")?;
     let state = State::load_or_generate(&state_dir)?;
-    let daemon = Arc::new(match bind {
-        Some(b) => {
+    let daemon = Arc::new(match (bind, discovery) {
+        (Some(b), disc) => {
             let addr: std::net::SocketAddr = b.parse().context("--bind must be ip:port")?;
-            Daemon::start_on(state, carapaced::ReplicaLimits::default(), addr).await?
+            Daemon::start_on(state, carapaced::ReplicaLimits::default(), addr, disc).await?
         }
-        None => Daemon::start(state).await?,
+        (None, true) => {
+            let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
+            Daemon::start_on(state, carapaced::ReplicaLimits::default(), addr, true).await?
+        }
+        (None, false) => Daemon::start(state).await?,
     });
 
     println!("node_id: {}", hex(&daemon.node_id()));
