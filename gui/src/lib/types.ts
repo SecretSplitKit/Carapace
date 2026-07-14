@@ -8,6 +8,8 @@ export interface StatusSnapshot {
 	vaults: { published: PublishedVault[]; held_replicas: string[] };
 	share_health: { recovery_sets_owned: number; shares_held: number };
 	reachability: string;
+	relay_networks: number;
+	relay_diversity_warning: boolean;
 }
 
 export interface PublishedVault {

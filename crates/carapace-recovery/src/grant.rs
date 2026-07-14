@@ -158,7 +158,7 @@ mod tests {
     }
 
     fn a_share() -> Share {
-        let (shares, _s, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (shares, _s, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         shares.into_iter().next().unwrap()
     }
 

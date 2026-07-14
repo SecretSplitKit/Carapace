@@ -232,6 +232,21 @@ struct Shared {
     /// Vids this daemon stores *as a replica* for some owner (blobs live in the
     /// iroh store; this records the relationship for read-serving/accounting).
     held: HashSet<[u8; 32]>,
+    /// Every blob (manifest envelope + ciphertext chunk) this daemon holds *as a
+    /// replica* for another owner, mapped to the vid it belongs to. The blob-read
+    /// gate ([`authorize_fetch`]) consults this so a replica-held chunk is served
+    /// only to that vault owner's delegated devices or a current replica-set member
+    /// (§7.4 a/b), never to an arbitrary dialer (W8). Populated in
+    /// [`ControlHandler::serve_replica_store`] from the pushed blob hashes.
+    replica_chunks: HashMap<[u8; 32], [u8; 32]>,
+    /// For each vid held as a replica, the vault owner's *user* pubkey (derived from
+    /// the inviting owner node's friend card). The gate uses it to admit that owner's
+    /// delegated devices (§7.4 a).
+    replica_owner: HashMap<[u8; 32], [u8; 32]>,
+    /// For each vid held as a replica, the current replica-set node ids from the
+    /// owner-signed `VaultAnnounce` received at placement. The gate admits a member
+    /// of this set so a co-replica can fetch for repair (§7.4 b).
+    replica_members: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// Owner-side deny-list of peer node ids this daemon refuses to place on (S4).
     replica_deny: HashSet<[u8; 32]>,
     /// Per-peer token buckets limiting how much a friend can push into our replica
@@ -303,6 +318,12 @@ enum BlobAuth {
     OwnDevice,
     /// A delegated device of the named established friend (the friend branch).
     Friend([u8; 32]),
+    /// A delegated device of a vault OWNER we store replicas for, authenticated by a
+    /// self-consistent card the dialer presented (its user is an owner in
+    /// `replica_owner`). Grants nothing on our own owned chunks; only unlocks that
+    /// owner's replica-held chunks (§7.4 a, W8). Used for an owner device this
+    /// replica does not otherwise know (not enumerated in the stored friend card).
+    ReplicaDevice([u8; 32]),
 }
 
 /// The `carapace/1` control-stream handler. It authenticates the dialer against
@@ -390,7 +411,16 @@ impl ControlHandler {
                     s.blob_auth.insert(*remote, auth);
                     (true, s.cards.clone(), s.announces.clone(), s.grants.clone())
                 }
-                None => (false, Vec::new(), Vec::new(), Vec::new()),
+                None => {
+                    // W8/§7.4 a: even a dialer we serve no documents to may be a
+                    // delegated device of an owner whose vault we replicate. Record
+                    // that classification so its later raw iroh-blobs fetches of that
+                    // owner's replica-held chunks are admitted - and nothing else.
+                    if let Some(owner) = replica_owner_device(&s, card, remote, now) {
+                        s.blob_auth.insert(*remote, BlobAuth::ReplicaDevice(owner));
+                    }
+                    (false, Vec::new(), Vec::new(), Vec::new())
+                }
             }
         };
         if !authorized {
@@ -489,10 +519,16 @@ impl ControlHandler {
         // invite signer must be an established friend (or our own device) AND the
         // connection's authenticated peer, and it must have rate-budget for the
         // advertised size (W1: a single friend cannot flood the store).
-        let admitted = {
+        let (admitted, owner_user) = {
             let mut s = self.shared.write().expect("shared lock");
-            let owner_ok = node_is_authorized(&s, &self.self_user, &inv.by, now);
-            owner_ok && inv.by == *remote && s.rate.allow(*remote, now, inv.approx_bytes)
+            // The inviting owner must be an established friend (or our own device);
+            // resolve it to the owner's *user* pubkey so the blob-read gate can later
+            // admit that owner's delegated devices (§7.4 a, W8).
+            let owner_user = owner_user_of_node(&s, &self.self_user, &inv.by, now);
+            let admitted = owner_user.is_some()
+                && inv.by == *remote
+                && s.rate.allow(*remote, now, inv.approx_bytes);
+            (admitted, owner_user)
         };
         if !admitted {
             send.finish()?; // decline: no accept frame
@@ -522,6 +558,22 @@ impl ControlHandler {
         accept.sign(&self.node_key);
         write_msg(send, &accept).await?;
 
+        // The owner pushes the current owner-signed VaultAnnounce so this replica
+        // learns the replica set it belongs to (§7.4 b, W8). Verify it binds the
+        // inviting owner and this vault before trusting its member list.
+        let announce = read_msg::<VaultAnnounce>(recv).await?;
+        announce
+            .verify()
+            .map_err(|e| anyhow::anyhow!("replica announce bad sig: {e}"))?;
+        ensure!(
+            announce.vid == inv.vid,
+            "replica announce named a different vault"
+        );
+        ensure!(
+            announce.by == inv.by,
+            "replica announce signer is not the inviting owner"
+        );
+
         // Receive the pushed blobs: envelope first (verified), then each chunk.
         // W1: cap the blob count and track the running received-byte total for this
         // (peer, vid), aborting the moment it would exceed the advertised size
@@ -532,6 +584,10 @@ impl ControlHandler {
             "replica push declared {count} blobs, over the cap of {MAX_REPLICA_BLOBS}"
         );
         let mut received: u64 = 0;
+        // S3: do not pre-reserve `count` (peer-declared, up to MAX_REPLICA_BLOBS): a
+        // tiny push could force a ~32 MiB reservation. Grow as blobs arrive; the real
+        // bound is the `received <= inv.approx_bytes` byte cap below.
+        let mut stored: Vec<[u8; 32]> = Vec::new();
         for i in 0..count {
             let bytes = read_blob(recv).await?;
             received = received.saturating_add(bytes.len() as u64);
@@ -546,13 +602,21 @@ impl ControlHandler {
                 env.verify()
                     .map_err(|e| anyhow::anyhow!("replica envelope bad sig: {e}"))?;
             }
-            self.blobs.add(&bytes).await?;
+            // The iroh blob hash is the ChunkID (and the envelope digest for i==0);
+            // record it so the fetch gate can bind it to this replica-held vault (W8).
+            stored.push(self.blobs.add(&bytes).await?);
         }
-        self.shared
-            .write()
-            .expect("shared lock")
-            .held
-            .insert(inv.vid);
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            s.held.insert(inv.vid);
+            if let Some(owner) = owner_user {
+                s.replica_owner.insert(inv.vid, owner);
+            }
+            s.replica_members.insert(inv.vid, announce.replicas.clone());
+            for h in &stored {
+                s.replica_chunks.insert(*h, inv.vid);
+            }
+        }
         // Ack: tell the owner storage is durable before it records membership.
         write_u64(send, count).await?;
         send.finish()?;
@@ -772,12 +836,11 @@ impl Daemon {
         // audience covering that chunk — so a leaked grant document alone (presented
         // by a non-audience party) authorizes nothing.
         //
-        // ponytail (narrowed E-blob-authz residual): chunks we hold *as a replica*
-        // for another owner stay on the inherited residual (AEAD seal + ChunkID
-        // secrecy), because a replica cannot authenticate the owner's *other*
-        // devices without a card that enumerates them — out of scope here. The
-        // normative §7.4 selective-disclosure path (audience fetches from the owner
-        // who issued the grant) is fully gated.
+        // W8/§7.4 replica gate: chunks we hold *as a replica* for another owner are
+        // no longer on the inherited residual. `authorize_fetch` serves them only to
+        // that vault owner's delegated devices (proved by the card the dialer
+        // presents on our control stream) or a current replica-set member from the
+        // owner's announce — an arbitrary dialer is refused.
         let gate_shared = Arc::clone(&shared);
         let events = authorizing_event_sender(move |node, chunk_id| {
             let s = gate_shared.read().expect("shared lock");
@@ -1056,6 +1119,15 @@ impl Daemon {
             }
         }
 
+        // W8/§7.4 a: when the blobs live on a different peer (a replica), first
+        // authenticate to that peer's control stream so it can classify us as a
+        // delegated device of the vault owner. Without it the replica's fetch gate
+        // has no identity for our node id and refuses every replica-held chunk. When
+        // blob and doc peer are the same node the doc pull above already did this.
+        if blob_peer.id != doc_peer.id {
+            self.authenticate_to(&blob_peer).await?;
+        }
+
         // ---- per-vault: fetch, open, reconstruct ----
         // W3: one poisoned/unfetchable vault must not abort the others; collect
         // the error and move on.
@@ -1087,10 +1159,18 @@ impl Daemon {
     ) -> Result<Reconstructed> {
         let vkeys = VaultKeys::derive(&*self.k_root, *vid);
 
+        // W8: fetch into a throwaway store, NOT `self.blobs`, which the router serves
+        // over `iroh_blobs::ALPN`. Fetching the owner's/replica's ciphertext into the
+        // served store would re-serve it ungated from this device (the residual
+        // `authorize_fetch` `true` covers any hash absent from the owned/replica maps),
+        // voiding the replica fetch gate on any device that reconstructs. We only need
+        // the bytes to open the manifest and write plaintext to disk. Mirrors the PoR
+        // probe's `scratch` store.
+        let scratch = IrohBlobStore::new();
         // Manifest envelope by digest.
         let bconn = self.ep.connect(blob_peer.clone(), iroh_blobs::ALPN).await?;
-        self.blobs.fetch(&bconn, ann.digest).await?;
-        let env_bytes = self.blobs.get_bytes(ann.digest).await?;
+        scratch.fetch(&bconn, ann.digest).await?;
+        let env_bytes = scratch.get_bytes(ann.digest).await?;
         let envelope = ManifestEnvelope::from_bytes(&env_bytes)?;
         let manifest = open_envelope(&envelope, &vkeys.k_manifest)?;
         ensure!(&manifest.vid == vid, "envelope vid mismatch");
@@ -1112,8 +1192,8 @@ impl Daemon {
                 continue;
             }
             for (id, _len) in &f.chunks {
-                self.blobs.fetch(&bconn, *id).await?;
-                let ct = self.blobs.get_bytes(*id).await?;
+                scratch.fetch(&bconn, *id).await?;
+                let ct = scratch.get_bytes(*id).await?;
                 carapace_vault::ChunkStore::put(&mut store, *id, ct)?;
             }
         }
@@ -1177,6 +1257,25 @@ impl Daemon {
         }
         send.finish()?;
         Ok((cards, announces, grants))
+    }
+
+    /// Present our own card on `peer`'s `carapace/1` control stream so it can
+    /// classify our node id (W5/§7.4). We discard whatever documents it serves; the
+    /// side effect - the peer recording our blob-read authorization - is the point.
+    /// Used before fetching replica-held blobs from a peer that is not the doc peer.
+    async fn authenticate_to(&self, peer: &EndpointAddr) -> Result<()> {
+        let own_card = {
+            let s = self.shared.read().expect("shared lock");
+            s.cards.first().cloned().context("no own card")?
+        };
+        let conn = self.ep.connect(peer.clone(), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, &own_card).await?;
+        // Drain the peer's response (Hello + any served docs) so it processes our
+        // card fully before we open the blob stream.
+        while (read_frame_raw(&mut recv).await?).is_some() {}
+        send.finish()?;
+        Ok(())
     }
 
     /// Issue a single-use invite ticket (§6). The ticket is signed by this user's
@@ -1507,6 +1606,18 @@ impl Daemon {
             total <= accept.quota_bytes,
             "placement exceeds granted quota"
         );
+
+        // Send the current owner-signed announce so the replica learns the set it
+        // joins and can gate later fetches on membership (§7.4 b, W8).
+        let announce = {
+            let s = self.shared.read().expect("shared lock");
+            s.announces
+                .iter()
+                .find(|a| a.vid == vid)
+                .cloned()
+                .context("no announce for vault being placed")?
+        };
+        write_msg(&mut send, &announce).await?;
 
         write_u64(&mut send, blobs.len() as u64).await?;
         for b in blobs {
@@ -1956,12 +2067,17 @@ impl Daemon {
         // connection and fetch (§7.4 / D3).
         self.present_card(&owner).await?;
 
+        // W8: fetch into a throwaway store, NOT `self.blobs`, which the router serves.
+        // Otherwise a friend that fetched disclosed files would re-serve the owner's
+        // ciphertext ungated from its own node, defeating disclosure revocation. We
+        // only need the bytes to write the granted plaintext to disk.
+        let scratch = IrohBlobStore::new();
         let bconn = self.ep.connect(owner, iroh_blobs::ALPN).await?;
         let mut chunks: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
         for f in &body.files {
             for c in &f.chunks {
-                self.blobs.fetch(&bconn, c.chunk_id).await?;
-                chunks.insert(c.chunk_id, self.blobs.get_bytes(c.chunk_id).await?);
+                scratch.fetch(&bconn, c.chunk_id).await?;
+                chunks.insert(c.chunk_id, scratch.get_bytes(c.chunk_id).await?);
             }
         }
         let out_dir = out_root.join(hex32(&grant.vid));
@@ -2165,8 +2281,10 @@ impl Daemon {
         allow_over_cap: bool,
     ) -> Result<(Vec<String>, Vec<PolicyWarning>)> {
         let (shares, state, warnings) = match scope {
-            RecoveryScope::Root => split_root(&self.k_root, m, n, allow_over_cap),
-            RecoveryScope::Vault(vid) => split_vault(&self.k_root, &vid, m, n, allow_over_cap),
+            RecoveryScope::Root => split_root(&self.k_root, m, Some(n), allow_over_cap),
+            RecoveryScope::Vault(vid) => {
+                split_vault(&self.k_root, &vid, m, Some(n), allow_over_cap)
+            }
         }
         .map_err(|e| anyhow::anyhow!("recovery split failed: {e:?}"))?;
         let jsons = shares.iter().map(share_to_json).collect();
@@ -2319,28 +2437,100 @@ fn select_grant_body(manifest: &Manifest, keys: &ChunkKeys, paths: &[&str]) -> R
 /// published for an owned vault, retained across epoch bumps — so a superseded
 /// chunk keeps its owner gate (W2), not just the current epoch's.
 ///
-/// A chunk we do NOT own (a manifest envelope, or one held as a replica for another
-/// owner) stays on the inherited residual (AEAD seal + ChunkID secrecy): a replica
-/// cannot authenticate the owner's other devices without a card enumerating them
-/// (narrowed spec-errata E-blob-authz). See the `start_with_limits` call site.
+/// A chunk we hold AS A REPLICA for another owner (any hash in `replica_chunks`,
+/// envelope or ciphertext) is gated by §7.4 (a)/(b) (W8): released only to that
+/// vault owner's delegated devices (proved by the card the dialer presents on our
+/// control stream) or a current replica-set member from the owner's announce. Any
+/// other blob (a truly foreign chunk) stays on the inherited residual.
 fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
     // Consult the RETAINED owned-chunk set, not the current-epoch `vault_blobs`, so
     // a superseded chunk stays gated instead of regressing to the residual (W2).
-    let Some(vid) = s.owned_chunks.get(chunk_id).copied() else {
-        return true; // not an owned-vault chunk: inherited residual
-    };
-    match s.blob_auth.get(node) {
-        // (a) our own delegated device.
-        Some(BlobAuth::OwnDevice) => true,
-        // (b) replica-set member of this vault, or (c) an audience member of a grant
-        // covering this chunk.
-        Some(BlobAuth::Friend(user)) => {
-            s.members.get(&vid).is_some_and(|m| m.contains(node))
-                || s.disclosure.is_audience(chunk_id, user)
-        }
-        // Never authenticated on our control stream: refused.
-        None => false,
+    if let Some(vid) = s.owned_chunks.get(chunk_id).copied() {
+        return match s.blob_auth.get(node) {
+            // (a) our own delegated device.
+            Some(BlobAuth::OwnDevice) => true,
+            // (b) replica-set member of this vault, or (c) an audience member of a
+            // grant covering this chunk.
+            Some(BlobAuth::Friend(user)) => {
+                s.members.get(&vid).is_some_and(|m| m.contains(node))
+                    || s.disclosure.is_audience(chunk_id, user)
+            }
+            // A device of some OTHER owner we replicate for is nobody special on our
+            // own owned chunks: refused.
+            Some(BlobAuth::ReplicaDevice(_)) => false,
+            // Never authenticated on our control stream: refused.
+            None => false,
+        };
     }
+
+    // W8/§7.4: a blob we hold AS A REPLICA for another owner. Serve it only to (a)
+    // that vault owner's delegated devices, or (b) a current replica-set member (for
+    // repair) - never to an arbitrary dialer, which the old residual `return true`
+    // let through.
+    if let Some(vid) = s.replica_chunks.get(chunk_id).copied() {
+        let owner = s.replica_owner.get(&vid).copied();
+        // (a) the owner's delegated device: either the owner's own node that is our
+        // friend (Friend), or one of the owner's other devices proven by the card it
+        // presented (ReplicaDevice).
+        let owner_device = owner.is_some_and(|o| match s.blob_auth.get(node) {
+            Some(BlobAuth::Friend(u)) | Some(BlobAuth::ReplicaDevice(u)) => *u == o,
+            _ => false,
+        });
+        // (b) a current replica-set member (TLS-authenticated node id), for repair.
+        let member = s
+            .replica_members
+            .get(&vid)
+            .is_some_and(|m| m.contains(node));
+        return owner_device || member;
+    }
+
+    // Not an owned-vault chunk and not replica-held: inherited residual.
+    true
+}
+
+/// Resolve `node` to the *user* pubkey that delegates it: our own user (if one of
+/// our cards delegates it) or an established friend whose newest card does (§4). The
+/// owner-user a replica records for a placement so it can later admit that owner's
+/// delegated devices (W8).
+fn owner_user_of_node(
+    s: &Shared,
+    self_user: &[u8; 32],
+    node: &[u8; 32],
+    now: u64,
+) -> Option<[u8; 32]> {
+    if s.cards
+        .iter()
+        .any(|c| c.user == *self_user && card_delegates_node(c, node, now))
+    {
+        return Some(*self_user);
+    }
+    s.friends
+        .iter()
+        .find(|(_, c)| card_delegates_node(c, node, now))
+        .map(|(user, _)| *user)
+}
+
+/// W8/§7.4 a: if the self-consistent `card` a dialer presented belongs to a vault
+/// OWNER this daemon holds replicas for and delegates the dialer's `remote` node,
+/// the owner-user it authenticates as. Lets an owner's device this replica does not
+/// otherwise know (not enumerated in the stored friend card) fetch that owner's
+/// replica-held chunks. ponytail (like the self-device gate): this trusts the
+/// presented card's delegation, so a device the owner has since revoked could still
+/// present an old card until a rollback-guarded owner-card store lands.
+fn replica_owner_device(
+    s: &Shared,
+    card: &ContactCard,
+    remote: &[u8; 32],
+    now: u64,
+) -> Option<[u8; 32]> {
+    if card.verify().is_err() {
+        return None;
+    }
+    let owner = card.user;
+    if !s.replica_owner.values().any(|u| *u == owner) {
+        return None;
+    }
+    card_delegates_node(card, remote, now).then_some(owner)
 }
 
 /// Choose which vaults to reconstruct from a pulled document batch, applying the
@@ -3172,6 +3362,99 @@ mod tests {
         assert!(
             authorize_fetch(&s, &[0x99; 32], &[0xAB; 32]),
             "a non-owned chunk keeps the residual (AEAD + ChunkID secrecy)"
+        );
+    }
+
+    // W8/§7.4: a chunk held AS A REPLICA is served only to the vault owner's
+    // delegated devices or a current replica-set member - never to an arbitrary
+    // dialer, which the old residual `return true` let through.
+    #[test]
+    fn w8_replica_held_chunk_is_gated() {
+        let vid = [0x77; 32];
+        let chunk = [0x22; 32];
+
+        // The vault owner (a friend of this replica) with two devices.
+        let owner_user = kp(0x50);
+        let owner_dev1 = kp(0x51); // owner node enumerated in the stored friend card
+        let owner_dev2 = kp(0x52); // owner's OTHER device, not in that card
+        let owner_uid = owner_user.verifying_key().to_bytes();
+        let dev1 = owner_dev1.verifying_key().to_bytes();
+        let dev2 = owner_dev2.verifying_key().to_bytes();
+
+        let member = [0xEE; 32]; // a current replica-set peer
+        let stranger = [0x99; 32];
+
+        let mut s = Shared::default();
+        // This daemon holds `chunk` (and its envelope) as a replica of owner's vault.
+        s.replica_chunks.insert(chunk, vid);
+        s.replica_owner.insert(vid, owner_uid);
+        s.replica_members.insert(vid, vec![member]);
+        // It holds the owner's card (owner is its friend); the card delegates dev1.
+        s.friends.insert(
+            owner_uid,
+            build_card(&owner_user, &owner_dev1, &[0x50; 32], None),
+        );
+
+        // Unauthorized dialer (never authenticated, not a member): refused. This is
+        // exactly the leak the pre-W8 residual `return true` allowed.
+        assert!(
+            !authorize_fetch(&s, &stranger, &chunk),
+            "an arbitrary dialer is refused a replica-held chunk (W8)"
+        );
+
+        // (a) the owner's known device, classified Friend(owner) via the control
+        // stream: served.
+        s.blob_auth.insert(dev1, BlobAuth::Friend(owner_uid));
+        assert!(
+            authorize_fetch(&s, &dev1, &chunk),
+            "the owner's delegated device is served (§7.4 a)"
+        );
+
+        // (a) the owner's OTHER device, authenticated by the card it presented
+        // (replica_owner_device -> ReplicaDevice): served.
+        let dev2_card = build_card(&owner_user, &owner_dev2, &[0x50; 32], None);
+        assert_eq!(
+            replica_owner_device(&s, &dev2_card, &dev2, NOW),
+            Some(owner_uid),
+            "owner's other device authenticates via its presented card"
+        );
+        s.blob_auth.insert(dev2, BlobAuth::ReplicaDevice(owner_uid));
+        assert!(
+            authorize_fetch(&s, &dev2, &chunk),
+            "the owner's other delegated device is served (§7.4 a)"
+        );
+
+        // (b) a current replica-set member, by TLS-authenticated node id: served for
+        // repair, no control-stream handshake required.
+        assert!(
+            authorize_fetch(&s, &member, &chunk),
+            "a current replica-set member is served for repair (§7.4 b)"
+        );
+
+        // A device of a DIFFERENT owner (ReplicaDevice for another user) is refused.
+        s.blob_auth
+            .insert(stranger, BlobAuth::ReplicaDevice([0xAB; 32]));
+        assert!(
+            !authorize_fetch(&s, &stranger, &chunk),
+            "a device of another owner is refused a replica-held chunk"
+        );
+
+        // A ReplicaDevice classification authorizes nothing on a chunk we OWN.
+        let owned = [0x33; 32];
+        s.owned_chunks.insert(owned, vid);
+        assert!(
+            !authorize_fetch(&s, &dev2, &owned),
+            "a replica-owner device is nobody on our own owned chunk"
+        );
+
+        // replica_owner_device only fires for an owner we actually replicate for.
+        let other_user = kp(0x60);
+        let other_node = kp(0x61);
+        let other_card = build_card(&other_user, &other_node, &[0x60; 32], None);
+        assert_eq!(
+            replica_owner_device(&s, &other_card, &other_node.verifying_key().to_bytes(), NOW),
+            None,
+            "no replica held for this user -> no replica-device authentication"
         );
     }
 

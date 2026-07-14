@@ -63,14 +63,18 @@
 		};
 
 		const addrs = s.addr.length;
+		const relayNetworks = s.relay_networks;
+		const atRisk = s.relay_diversity_warning || relayNetworks < RELAY_TARGET;
 		const relaysPlate: Plate = {
 			key: 'relays',
 			label: 'Reachability',
-			achieved: Math.min(addrs, RELAY_TARGET),
+			achieved: Math.min(relayNetworks, RELAY_TARGET),
 			target: RELAY_TARGET,
-			valueLabel: `${addrs}`,
-			state: addrs === 0 ? 'empty' : addrs >= RELAY_TARGET ? 'healthy' : 'at-risk',
-			note: `${s.reachability} · ${addrs} dialable address${addrs === 1 ? '' : 'es'}`
+			valueLabel: `${relayNetworks}`,
+			state: addrs === 0 ? 'empty' : atRisk ? 'at-risk' : 'healthy',
+			note: atRisk
+				? `Only ${relayNetworks} relay network${relayNetworks === 1 ? '' : 's'} - add a friend's relay so you can still be reached if one drops`
+				: `${s.reachability} · ${relayNetworks} relay networks, ${addrs} dialable address${addrs === 1 ? '' : 'es'}`
 		};
 
 		return [replicasPlate, sharesPlate, relaysPlate];

@@ -24,4 +24,6 @@ pub use blobs::{authorizing_event_sender, IrohBlobStore};
 pub use endpoint::{CarapaceEndpoint, PeerHints, ALPN};
 pub use frame::{read_frame_raw, read_msg, write_msg};
 pub use relay::{AllowList, CarapaceRelay, RelayAccessPolicy};
-pub use sync::{pull_documents, DocStore, Reject, SyncHandler};
+pub use sync::{
+    pull_documents, DocStore, Reject, SyncHandler, UnsupportedProtocol, PROTOCOL_VERSION,
+};

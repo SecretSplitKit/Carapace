@@ -11,11 +11,16 @@ pub const MIN_SIZE: usize = 256 * 1024;
 pub const AVG_SIZE: usize = 1024 * 1024;
 pub const MAX_SIZE: usize = 4 * 1024 * 1024;
 
-/// Split `data` into content-defined chunks (FastCDC, standard Gear hash).
-/// Returns `(offset, length)` cut points in order; concatenation reproduces the
-/// input exactly.
+/// Normalization level, normative for cross-client dedup (protocol §5, errata
+/// E3). Pinned EXPLICITLY: a second implementation MUST use FastCDC v2016 with
+/// the standard Gear table and Normalization Level 1, or it cuts differently.
+pub const NORMALIZATION: fastcdc::v2016::Normalization = fastcdc::v2016::Normalization::Level1;
+
+/// Split `data` into content-defined chunks (FastCDC v2016, standard Gear hash,
+/// Normalization Level 1). Returns `(offset, length)` cut points in order;
+/// concatenation reproduces the input exactly.
 pub fn chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
-    fastcdc::v2016::FastCDC::new(data, MIN_SIZE, AVG_SIZE, MAX_SIZE)
+    fastcdc::v2016::FastCDC::with_level(data, MIN_SIZE, AVG_SIZE, MAX_SIZE, NORMALIZATION)
         .map(|c| (c.offset, c.length))
         .collect()
 }

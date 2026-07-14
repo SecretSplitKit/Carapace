@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use carapaced::{Daemon, State};
 
 fn seeds(node: u8, root: u8) -> State {
@@ -93,6 +93,16 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     // cannot derive them.
     let b_ids: HashSet<[u8; 32]> = b.granted_chunk_ids(&grant)?.into_iter().collect();
     assert!(!b_ids.is_empty(), "B's grant discloses F1, F2 chunk ids");
+    // F1 and F2 are distinct single-chunk files, so the grant discloses two ids: one
+    // drives the fetch-gate probes below, the other the W8 re-serve regression (it must
+    // stay untouched by `try_fetch_chunk`, which would otherwise populate B's store).
+    let mut b_id_list: Vec<[u8; 32]> = b_ids.iter().copied().collect();
+    b_id_list.sort_unstable();
+    assert_eq!(
+        b_id_list.len(),
+        2,
+        "F1, F2 each contribute one distinct chunk id"
+    );
 
     // ---- 2. D3: a non-audience friend C, holding the LEAKED grant, is refused ----
     // C cannot even open the grant (not addressed to it): no keys, no ChunkIDs.
@@ -104,7 +114,7 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     let _ = c.pull_doc_counts(a.addr()?).await?;
     // Even authenticated AND knowing a granted ChunkID (leaked out of band here via
     // the test), C is refused the chunk: the gate enforces audience membership.
-    let a_granted = *b_ids.iter().next().context("a granted chunk id")?;
+    let a_granted = b_id_list[0];
     assert!(
         c.try_fetch_chunk(a.addr()?, a_granted).await.is_err(),
         "non-audience C is refused the granted chunk despite holding the grant (D3)"
@@ -113,6 +123,19 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     assert!(
         b.try_fetch_chunk(a.addr()?, a_granted).await.is_ok(),
         "audience B may fetch the granted chunk"
+    );
+
+    // ---- W8 regression: B must NOT re-serve the disclosed ciphertext ----
+    // B fetched F1/F2's ciphertext during fetch_disclosed above. That ciphertext must
+    // land in a throwaway store, never B's router-served blob store: otherwise any
+    // dialer knowing the ChunkID could pull the ciphertext straight off B, voiding the
+    // disclosure gate and revocation. Probe a granted chunk B fetched ONLY via
+    // fetch_disclosed (b_id_list[1] - not the one the try_fetch_chunk probe above pulled
+    // into B's store). C dials B raw and must be refused.
+    let disclosed_only = b_id_list[1];
+    assert!(
+        c.try_fetch_chunk(b.addr()?, disclosed_only).await.is_err(),
+        "B must not re-serve disclosed ciphertext to an arbitrary dialer (W8)"
     );
 
     // ---- 3. snapshot: edit F1, republish; a new grant's keys are disjoint ----

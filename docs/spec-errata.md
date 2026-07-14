@@ -78,17 +78,21 @@ limitation, not a Phase-3 code bug. **Owed: a per-peer blob-read authorization h
 on the blobs protocol** (gate `fetch` on the same friend-graph/delegation check
 `authorize_dialer` applies to documents). Until then the sealing + ChunkID secrecy
 are the only confidentiality boundary. Flagged at the `BlobsProtocol` accept site
-in `carapaced::Daemon::start_with_limits`.
+in `carapaced::Daemon::start_with_limits`. **Resolved by W8** — see the W8 note
+below; the owed per-peer read gate now ships as `authorize_fetch`.
 
 ## E3 — FastCDC variant/params unpinned (protocol §5)
 
 §5 names "FastCDC" with MIN 256 KiB / AVG 1 MiB / MAX 4 MiB but not the
-variant, normalization level, or gear table, and ships no chunk-boundary
-vector. Different variants (e.g. v2016 vs v2020) cut differently, breaking
-cross-client convergent dedup. **Resolution: pin FastCDC v2016 with the
-standard Gear table**, matching the implementation. A chunk-boundary test
-vector is owed (tracked for Phase 1, when the chunker is exercised
-end-to-end).
+variant, normalization level, or gear table, and shipped no chunk-boundary
+vector. Different variants (e.g. v2016 vs v2020) and normalization levels cut
+differently, breaking cross-client convergent dedup. **Resolution: pin FastCDC
+v2016, standard Gear table, Normalization Level 1**, matching the
+implementation. The level is now passed EXPLICITLY in code
+(`content::NORMALIZATION` / `FastCDC::with_level`), not left to the crate
+default. §5 updated with the level; the owed chunk-boundary golden vector now
+ships as Appendix B §B.10.2 (with the KDF-tree §B.10.1 and convergent-seal
+§B.10.3 vectors), pinned by the `carapace-crypto` `appendix_b_pins` tests.
 
 ## Note — per-friend replica-storage grant is local (protocol §9, §10.1)
 
@@ -209,6 +213,50 @@ here rather than in code.
   stable-named relays (§6 anticipates DDNS). §14 should state that a plain-HTTP
   self-hosted relay exposes routing metadata to on-path observers, and that TLS is
   recommended once a relay has a stable name.
+
+## Note — W8 replica blob-read gate + reconstruct/disclose re-serve (§7.4, Phase 5 audit)
+
+W8 lands the per-peer blob-read gate the E-blob-authz note owed: `authorize_fetch`
+serves an owned chunk only to the owner's own devices, the vault's replica-set
+members, or a grant-audience friend, and a replica-held chunk only to that owner's
+devices or a current replica-set member. The verified-clean gate logic is not
+attacker-spoofable (owner/vid→chunk associations all trace to an owner-signed,
+`verify()`'d card/announce). Two completion points from the adversarial review:
+
+- **W8-reserve (fixed): reconstructing/disclosing a vault no longer re-serves the
+  ciphertext.** `reconstruct_one` and `fetch_disclosed` previously fetched the
+  owner's/replica's ciphertext into `self.blobs` - the *same* `MemStore` the router
+  serves over `iroh_blobs::ALPN`. Because `authorize_fetch` ends in a residual
+  `true` for any hash absent from the owned/replica maps, any device that
+  reconstructed A's vault (a delegated device pulling from a replica) or fetched A's
+  disclosed files (an audience friend) would then re-serve that ciphertext to any
+  dialer knowing the ChunkID - voiding the W8 gate one hop over and defeating
+  disclosure revocation. Both paths now fetch into a throwaway `IrohBlobStore` (the
+  PoR probe's `scratch` pattern); the bytes are used to write plaintext to disk and
+  never enter the served store. Regression-tested in `friend_replica`
+  (reconstructing device A2 refuses a stranger) and `selective_disclosure`
+  (audience B refuses a stranger a chunk it got only via `fetch_disclosed`).
+
+- **Residual `true` retained by design.** The gate's default-serve residual is left
+  in place: it covers only the manifest-envelope digest (S4 note above, AEAD-sealed)
+  and, previously, reconstructed/disclosed blobs (now removed from the served store).
+  The fix is at the population site, not the gate, so no owned/replica association
+  and no legitimate serve path changes.
+
+## Note — W9 suite/version rejection is module-scoped, not daemon-wide (§2, Phase 5 audit)
+
+W9 validates `Hello.protocol == PROTOCOL_VERSION` on **both** directions of
+`carapace-net`'s anti-entropy module (`SyncHandler::serve` inbound and
+`pull_documents` outbound), rejecting a mismatch **before** any document is written
+and dropping a connection whose `Hello` fails to decode (no panic). This hardens the
+standalone anti-entropy/sync module, which is exercised only by carapace-net's own
+integration tests. The **daemon** does not register `SyncHandler`; it registers
+`ControlHandler`, which dispatches on the first frame type and never reads a peer
+`Hello.protocol`. Daemon-side suite binding is purely the ALPN string `carapace/1`
+(a mismatched suite never negotiates the ALPN), which is consistent with the
+"suite bound to ALPN" design. So W9 is real and clean within its module but is NOT a
+daemon handshake check - stated here so the ledger's DONE is not mistaken for
+daemon-wide `Hello.protocol` enforcement.
 
 - **W3 (deferred feature): advertised relay is not dialback-verified.** A node run
   with `--relay` advertises its relay URL in its ContactCard and issued tickets

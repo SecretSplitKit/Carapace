@@ -18,7 +18,7 @@ fn trustee_key(seed: u8) -> SigningKey {
 /// Split `K_ROOT` into `n` shares (threshold `m`), pairing each with a distinct
 /// trustee signing key.
 fn shares_with_trustees(m: u8, n: u8) -> Vec<(SigningKey, Share)> {
-    let (shares, _state, _warn) = split_root(&K_ROOT, m, n, false).unwrap();
+    let (shares, _state, _warn) = split_root(&K_ROOT, m, Some(n), false).unwrap();
     shares
         .into_iter()
         .enumerate()
@@ -201,7 +201,7 @@ fn off_roster_and_wrong_card_attestations_are_not_counted() {
 // Trustee-side continuous CRC self-validation flags a corrupted share.
 #[test]
 fn self_validation_flags_corrupt_share() {
-    let (mut shares, _s, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+    let (mut shares, _s, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
     let mut share = shares.pop().unwrap();
 
     let mut monitor = ShareMonitor::with_interval(3600);

@@ -264,6 +264,56 @@ fn rollback_rule_rejects_stale_and_equal_versions() {
     assert_eq!(store.offer_card(&c2), Ok(true));
 }
 
+// W9/§2: a peer advertising an unknown suite id is rejected, never negotiated
+// down. A server whose `Hello.protocol` is 99 must make the client's anti-entropy
+// pull fail instead of silently proceeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_protocol_peer_is_rejected() -> Result<()> {
+    let user = SigningKey::from_bytes(&[0x41; 32]);
+    let server_node = SigningKey::from_bytes(&[0x42; 32]);
+    let client_node = SigningKey::from_bytes(&[0x43; 32]);
+
+    let server_ep = CarapaceEndpoint::bind(&server_node).await?;
+    let handler = SyncHandler {
+        // A future/unknown suite advertised on the carapace/1 ALPN.
+        hello: Hello {
+            protocol: 99,
+            card_version: 1,
+            roles: 1,
+        },
+        cards: Arc::new(vec![make_card(&user, 1)]),
+        announces: Arc::new(vec![]),
+    };
+    let router = Router::builder(server_ep.endpoint().clone())
+        .accept(ALPN, handler)
+        .spawn();
+
+    let client_ep = CarapaceEndpoint::bind(&client_node).await?;
+    let server_addr = server_ep.direct_addr()?;
+    let conn = client_ep.connect(server_addr, ALPN).await?;
+
+    let mut docs = DocStore::new();
+    let res = carapace_net::pull_documents(
+        &conn,
+        &Hello {
+            protocol: 1,
+            card_version: 0,
+            roles: 0,
+        },
+        &mut docs,
+    )
+    .await;
+    assert!(
+        res.is_err(),
+        "a peer advertising protocol=99 must be rejected, not negotiated down"
+    );
+
+    router.shutdown().await.ok();
+    server_ep.close().await;
+    client_ep.close().await;
+    Ok(())
+}
+
 /// Accept exactly one `carapace/1` connection on `ep`, read one `Hello` frame and
 /// echo it straight back, then keep the connection open until the peer closes it.
 async fn echo_one_hello(ep: Endpoint) -> Result<()> {

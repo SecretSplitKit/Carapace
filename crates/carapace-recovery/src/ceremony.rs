@@ -375,7 +375,7 @@ mod tests {
 
     /// 3-of-5 split of K_root with five trustee identities.
     fn setup() -> Setup {
-        let (shares, _state, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (shares, _state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         let trustees: Vec<SigningKey> = (0..5).map(|i| key(0x40 + i)).collect();
         let roster: Vec<[u8; 32]> = trustees
             .iter()

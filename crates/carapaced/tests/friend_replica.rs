@@ -145,6 +145,22 @@ async fn friend_gate_replica_placement_repair_and_recovery() -> Result<()> {
         assert_eq!(&recovered, bytes, "content mismatch for {rel}");
     }
 
+    // ---- W8 regression: A2 must NOT re-serve the reconstructed ciphertext ----
+    // A2 fetched C's ciphertext to rebuild the vault. That must land in a throwaway
+    // store, never A2's router-served store; otherwise the replica fetch gate is void
+    // on any device that reconstructs. Learn one vault ChunkID via a disclosure to
+    // friend B (convergent, so the identical ChunkID A2 fetched), then confirm the
+    // stranger D is refused it off A2.
+    let probe_grant = a.disclose_files(vid, &["readme.txt"], &[b.user_id()])?;
+    let cid = *b
+        .granted_chunk_ids(&probe_grant)?
+        .first()
+        .context("a reconstructed chunk id")?;
+    assert!(
+        d.try_fetch_chunk(a2.addr()?, cid).await.is_err(),
+        "A2 must not re-serve reconstructed ciphertext to a stranger (W8)"
+    );
+
     for daemon in [a, a2, b, c, e, d] {
         daemon.shutdown().await;
     }

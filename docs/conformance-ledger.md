@@ -15,13 +15,13 @@ unit-tested but never wired to the daemon control stream or a background loop**
 | W5 | Unfriend + trustee re-split flow wired (§9.3: FriendshipEnd, delete reqs, gated destroy sequence, re-split prompt) | BLOCKER | friend, daemon, api, replica, gui | TODO |
 | W6 | Relay reachability lifecycle: dialback verify, advertise-on-success/withdraw-on-loss, self-elect, relay-TCP port mapping (§6) | BLOCKER | net, daemon | TODO |
 | W7 | Anti-entropy store-and-forward of third-party docs; newest-card own-device rollback; attestations in reconciliation (§6) | MAJOR | net/sync, daemon | TODO |
-| W8 | Replica blob-read authorization for held chunks (§7.4 MUST) | MAJOR | net, daemon | TODO |
-| W9 | Suite/version rejection: validate Hello.protocol==1, drop mismatch (§2 MUST) | MAJOR | net/sync, wire | TODO |
-| W10 | Relay diversity warning surfaced in GUI (§6 MUST warn <2 networks) | MAJOR | gui, daemon | TODO |
-| W11 | Cross-client golden vectors (KDF tree, chunk-boundary, (vid,P)→ct+ChunkID) + pin FastCDC normalization (§4/§5) | MAJOR | content, kdf, docs, wire | TODO |
+| W8 | Replica blob-read authorization for held chunks (§7.4 MUST) | MAJOR | net, daemon | DONE |
+| W9 | Suite/version rejection: validate Hello.protocol==1, drop mismatch (§2 MUST) | MAJOR | net/sync, wire | DONE |
+| W10 | Relay diversity warning surfaced in GUI (§6 MUST warn <2 networks) | MAJOR | gui, daemon | DONE |
+| W11 | Cross-client golden vectors (KDF tree, chunk-boundary, (vid,P)→ct+ChunkID) + pin FastCDC normalization (§4/§5) | MAJOR | content, kdf, docs, wire | DONE |
 | W12 | §11 filesystem watcher for Dropbox-like live sync | MAJOR | daemon | TODO |
 | W13 | IPv6 bind/verify (unverifiable — may already dual-stack) | MINOR | net | TODO |
-| W14 | Default initial split N0 = M+1 when caller doesn't override (§12) | MINOR | recovery | TODO |
+| W14 | Default initial split N0 = M+1 when caller doesn't override (§12) | MINOR | recovery | DONE |
 | W15 | Paper-card export/print route + GUI action (§10.2 backstop) | MINOR | api, gui | TODO |
 
 No-action (spec-deferred per §13): shared multi-writer vaults, iroh-docs revisit,

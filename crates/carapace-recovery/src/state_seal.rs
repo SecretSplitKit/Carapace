@@ -94,7 +94,7 @@ mod tests {
     use crate::split::split_root;
 
     fn fresh_split() -> SplitState {
-        let (_shares, state, _w) = split_root(&[0x11u8; 32], 3, 5, false).unwrap();
+        let (_shares, state, _w) = split_root(&[0x11u8; 32], 3, Some(5), false).unwrap();
         state
     }
 

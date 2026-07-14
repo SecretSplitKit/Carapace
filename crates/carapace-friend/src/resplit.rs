@@ -110,7 +110,7 @@ impl Resplit {
             return Err(FriendError::WrongSet);
         }
         let (shares, _state, _warnings) =
-            carapace_recovery::split_root(k_root, m, n, allow_over_cap)?;
+            carapace_recovery::split_root(k_root, m, Some(n), allow_over_cap)?;
         // Every share of one split shares the polynomial's recovery_set_id.
         let new_rsid = u64::from(shares[0].recovery_set_id);
 
@@ -319,7 +319,8 @@ mod tests {
         let subject = pk(&key(5)); // the owner user being re-split
 
         // --- OLD recovery set: a real 3-of-5 split already out in the world. ---
-        let (old_shares, _s, _w) = carapace_recovery::split_root(&K_ROOT, M, N, false).unwrap();
+        let (old_shares, _s, _w) =
+            carapace_recovery::split_root(&K_ROOT, M, Some(N), false).unwrap();
         let old_rsid = u64::from(old_shares[0].recovery_set_id);
         // Ex-friend (unfriended trustee) keeps share 0 forever; four honest
         // trustees hold shares 1..5.

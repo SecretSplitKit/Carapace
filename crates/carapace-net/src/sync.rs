@@ -16,6 +16,48 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The one wire suite this build speaks. §2: the suite is bound to the ALPN
+/// (`carapace/1`); a future suite gets a new ALPN and a new protocol number, so a
+/// peer advertising anything else here is speaking a suite we MUST reject rather
+/// than negotiate down to.
+pub const PROTOCOL_VERSION: u64 = 1;
+
+/// A peer advertised a `Hello.protocol` this build does not speak (§2). Unknown
+/// suite ids are rejected outright, never negotiated down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedProtocol {
+    /// The protocol number the peer advertised.
+    pub got: u64,
+    /// The only protocol number this build accepts.
+    pub expected: u64,
+}
+
+impl std::fmt::Display for UnsupportedProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported protocol {}: this build speaks only carapace/{} \
+             (unknown suite ids are rejected, not negotiated down)",
+            self.got, self.expected
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedProtocol {}
+
+/// §2: enforce that `peer` speaks our exact suite. The suite is pinned to the ALPN
+/// `carapace/1`, so any other protocol number is a hard reject.
+fn check_protocol(peer: &Hello) -> Result<(), UnsupportedProtocol> {
+    if peer.protocol == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(UnsupportedProtocol {
+            got: peer.protocol,
+            expected: PROTOCOL_VERSION,
+        })
+    }
+}
+
 /// Why an offered document was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
@@ -124,8 +166,10 @@ pub struct SyncHandler {
 impl SyncHandler {
     async fn serve(&self, conn: Connection) -> Result<()> {
         let (mut send, mut recv) = conn.accept_bi().await?;
-        // Exchange Hello: read the peer's, then send ours.
-        let _peer_hello = read_msg::<Hello>(&mut recv).await?;
+        // Exchange Hello: read the peer's, validate its suite (§2 - an unknown
+        // protocol number is rejected, never negotiated down), then send ours.
+        let peer_hello = read_msg::<Hello>(&mut recv).await?;
+        check_protocol(&peer_hello)?;
         write_msg(&mut send, &self.hello).await?;
         // Push our latest signed documents; the peer applies its own rollback
         // rule on receipt.
@@ -160,7 +204,9 @@ pub async fn pull_documents(
 ) -> Result<usize> {
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, hello).await?;
-    let _peer_hello = read_msg::<Hello>(&mut recv).await?;
+    // §2: reject a peer advertising a suite we do not speak instead of proceeding.
+    let peer_hello = read_msg::<Hello>(&mut recv).await?;
+    check_protocol(&peer_hello)?;
 
     let mut accepted = 0usize;
     while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
@@ -188,3 +234,38 @@ pub async fn pull_documents(
 
 /// The ALPN this sync protocol speaks (re-exported for `Router` registration).
 pub const SYNC_ALPN: &[u8] = ALPN;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(protocol: u64) -> Hello {
+        Hello {
+            protocol,
+            card_version: 1,
+            roles: 1,
+        }
+    }
+
+    // §2: a peer advertising an unknown suite id is rejected, not accepted.
+    #[test]
+    fn unknown_protocol_is_rejected() {
+        assert!(check_protocol(&hello(PROTOCOL_VERSION)).is_ok());
+        assert_eq!(
+            check_protocol(&hello(99)),
+            Err(UnsupportedProtocol {
+                got: 99,
+                expected: PROTOCOL_VERSION,
+            }),
+            "protocol 99 must be rejected outright"
+        );
+        assert_eq!(
+            check_protocol(&hello(0)),
+            Err(UnsupportedProtocol {
+                got: 0,
+                expected: PROTOCOL_VERSION,
+            }),
+            "protocol 0 is not negotiated down to a supported suite"
+        );
+    }
+}

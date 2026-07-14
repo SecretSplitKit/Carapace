@@ -75,12 +75,16 @@ fn check_issuance(
 /// Split a 32-byte key into `n` shares with threshold `m`, returning the shares, the retained
 /// (secret-equivalent) split-state, and any policy warnings. The split is round-trip-verified
 /// against `key` before returning (§10.2); a verification failure is [`RecoveryError::RoundTripFailed`].
+///
+/// `n = None` picks the §12/§8.3 default initial issuance `N₀ = M + 1` (one spare, never the
+/// zero-slack `N₀ = M`). An explicit `n` is always honored as given.
 fn split_key(
     key: &[u8; 32],
     m: u8,
-    n: u8,
+    n: Option<u8>,
     allow_over_cap: bool,
 ) -> Result<(Vec<Share>, SplitState, Vec<PolicyWarning>), RecoveryError> {
+    let n = n.unwrap_or(m.saturating_add(1));
     let warnings = check_initial_issuance(m, n, allow_over_cap)?;
     let mnemonic = key_to_mnemonic(key)?;
     let input = SplitInput::Bip39 {
@@ -94,10 +98,13 @@ fn split_key(
 
 /// Split `K_root` for the inner circle (protocol §8.1/§8.2). Every split of `K_root` is a full
 /// door to the identity, so this SHOULD be done exactly once.
+///
+/// `n = None` defaults the initial issuance to `N₀ = M + 1` (§8.3/§12); pass `Some(n)` to pick an
+/// explicit `N`, which is always honored as given.
 pub fn split_root(
     k_root: &[u8; 32],
     m: u8,
-    n: u8,
+    n: Option<u8>,
     allow_over_cap: bool,
 ) -> Result<(Vec<Share>, SplitState, Vec<PolicyWarning>), RecoveryError> {
     split_key(k_root, m, n, allow_over_cap)
@@ -106,11 +113,14 @@ pub fn split_root(
 /// Split `K_vaultroot(vid)` for an additional / outer-circle trustee set (scoped split, §8.2). A
 /// quorum recovers *that vault only*, never the identity. The state is still sealed under
 /// `K_root` (see [`seal_split_state`]); only the split *secret* is the vault key.
+///
+/// `n = None` defaults the initial issuance to `N₀ = M + 1` (§8.3/§12); pass `Some(n)` to pick an
+/// explicit `N`, which is always honored as given.
 pub fn split_vault(
     k_root: &[u8; 32],
     vid: &[u8; 32],
     m: u8,
-    n: u8,
+    n: Option<u8>,
     allow_over_cap: bool,
 ) -> Result<(Vec<Share>, SplitState, Vec<PolicyWarning>), RecoveryError> {
     let k_vaultroot = carapace_crypto::kdf::k_vaultroot(k_root, vid);
@@ -222,7 +232,7 @@ mod tests {
 
     #[test]
     fn split_root_recovers_from_m_shares() {
-        let (shares, _state, warnings) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (shares, _state, warnings) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         assert_eq!(shares.len(), 5);
         assert!(warnings.is_empty());
         // Any 3 shares reproduce K_root.
@@ -233,7 +243,7 @@ mod tests {
 
     #[test]
     fn sub_m_shares_do_not_recover() {
-        let (shares, _state, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (shares, _state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         let subset = [shares[0].clone(), shares[1].clone()];
         // Two of a 3-of-5 is below threshold: recovery must error, never yield a key.
         assert!(recover_key_from_shares(&subset).is_err());
@@ -242,7 +252,7 @@ mod tests {
     #[test]
     fn split_vault_scopes_to_vault_key_not_root() {
         let vid = [0xC0u8; 32];
-        let (shares, _state, _w) = split_vault(&K_ROOT, &vid, 2, 3, false).unwrap();
+        let (shares, _state, _w) = split_vault(&K_ROOT, &vid, 2, Some(3), false).unwrap();
         let recovered = recover_key_from_shares(&[shares[0].clone(), shares[1].clone()]).unwrap();
         let expected = carapace_crypto::kdf::k_vaultroot(&K_ROOT, &vid);
         assert_eq!(recovered.as_slice(), &*expected);
@@ -252,7 +262,7 @@ mod tests {
 
     #[test]
     fn add_trustee_then_recover_from_mixed_set() {
-        let (mut shares, state, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (mut shares, state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         let sealed = seal_split_state(&K_ROOT, &state).unwrap();
         let (new_share, _resealed) = add_trustee(&K_ROOT, &K_ROOT, &sealed, false).unwrap();
         // New share is on the same polynomial (same rsid + M) at a fresh x.
@@ -269,7 +279,7 @@ mod tests {
 
     #[test]
     fn extend_rejects_wrong_secret() {
-        let (_shares, mut state, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (_shares, mut state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         // Extending with the wrong key must be a clean WrongSecret, not incompatible shares.
         let err = extend_split(&mut state, &[0x22u8; 32], 1, false).unwrap_err();
         assert!(matches!(
@@ -281,19 +291,46 @@ mod tests {
     #[test]
     fn zero_slack_warns_but_succeeds() {
         // N0 = M is allowed but flagged.
-        let (_shares, _state, warnings) = split_root(&K_ROOT, 3, 3, false).unwrap();
+        let (_shares, _state, warnings) = split_root(&K_ROOT, 3, Some(3), false).unwrap();
         assert_eq!(warnings, vec![PolicyWarning::ZeroSlack]);
+    }
+
+    #[test]
+    fn default_n_is_m_plus_one() {
+        // §8.3/§12: N0 defaults to M+1 (one spare), never the zero-slack N0=M, when the caller
+        // doesn't specify N.
+        let (shares, _state, warnings) = split_root(&K_ROOT, 3, None, false).unwrap();
+        assert_eq!(shares.len(), 4);
+        assert!(warnings.is_empty());
+
+        // Vault splits get the same default.
+        let vid = [0xC0u8; 32];
+        let (shares, _state, warnings) = split_vault(&K_ROOT, &vid, 4, None, false).unwrap();
+        assert_eq!(shares.len(), 5);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn explicit_n_is_still_honored() {
+        // An explicit N overrides the M+1 default, including choosing zero-slack N0=M.
+        let (shares, _state, warnings) = split_root(&K_ROOT, 3, Some(3), false).unwrap();
+        assert_eq!(shares.len(), 3);
+        assert_eq!(warnings, vec![PolicyWarning::ZeroSlack]);
+
+        let (shares, _state, warnings) = split_root(&K_ROOT, 3, Some(7), false).unwrap();
+        assert_eq!(shares.len(), 7);
+        assert!(warnings.is_empty());
     }
 
     #[test]
     fn over_soft_cap_blocks_without_override() {
         // M=2 -> cap 5. N=6 exceeds it.
         assert!(matches!(
-            split_root(&K_ROOT, 2, 6, false),
+            split_root(&K_ROOT, 2, Some(6), false),
             Err(RecoveryError::OverSoftCap)
         ));
         // With override it succeeds and reports the warning.
-        let (shares, _state, warnings) = split_root(&K_ROOT, 2, 6, true).unwrap();
+        let (shares, _state, warnings) = split_root(&K_ROOT, 2, Some(6), true).unwrap();
         assert_eq!(shares.len(), 6);
         assert!(warnings.contains(&PolicyWarning::OverSoftCap));
     }
@@ -301,7 +338,7 @@ mod tests {
     #[test]
     fn extend_over_cap_needs_override() {
         // M=2, N0=5 (= cap). One more extension projects to 6 > cap.
-        let (_shares, state, _w) = split_root(&K_ROOT, 2, 5, false).unwrap();
+        let (_shares, state, _w) = split_root(&K_ROOT, 2, Some(5), false).unwrap();
         let sealed = seal_split_state(&K_ROOT, &state).unwrap();
         assert!(matches!(
             add_trustee(&K_ROOT, &K_ROOT, &sealed, false),
@@ -314,18 +351,18 @@ mod tests {
     #[test]
     fn invalid_thresholds_rejected() {
         assert!(matches!(
-            split_root(&K_ROOT, 1, 3, false),
+            split_root(&K_ROOT, 1, Some(3), false),
             Err(RecoveryError::InvalidThreshold)
         ));
         assert!(matches!(
-            split_root(&K_ROOT, 4, 3, false),
+            split_root(&K_ROOT, 4, Some(3), false),
             Err(RecoveryError::InvalidThreshold)
         ));
     }
 
     #[test]
     fn every_m_subset_round_trips_after_extension() {
-        let (shares, state, _w) = split_root(&K_ROOT, 3, 5, false).unwrap();
+        let (shares, state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
         let sealed = seal_split_state(&K_ROOT, &state).unwrap();
         let (new_share, _r) = add_trustee(&K_ROOT, &K_ROOT, &sealed, false).unwrap();
         let mut all = shares;

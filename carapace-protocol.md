@@ -118,9 +118,9 @@ as acting for a user.
 
 ## 5. Content model (unchanged from v0.5)
 
-**Chunking:** FastCDC (v2016, standard Gear table), MIN 256 KiB / AVG 1 MiB /
-MAX 4 MiB (normative for cross-client dedup; see errata E3 — a chunk-boundary
-vector is owed).
+**Chunking:** FastCDC v2016, standard Gear table, **Normalization Level 1**,
+MIN 256 KiB / AVG 1 MiB / MAX 4 MiB (all normative for cross-client dedup; see
+errata E3). The chunk-boundary golden vector is Appendix B §B.10.2.
 
 **Encryption & addressing:**
 
