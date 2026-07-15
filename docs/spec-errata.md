@@ -563,3 +563,29 @@ mechanisms. Each is documented here rather than code-changed.
   offer message is redundant; and PoR issues direct BLAKE3-verified `iroh-blobs` range
   requests (§10.1), so no separate audit-notice frame is needed. Retained in `carapace-wire`
   with their Appendix B vectors for wire-schema completeness and possible future use.
+
+## Note — §8.4 recovery data-fetch: replicas retain and serve the FileGrant (Option A)
+
+§8.4 ("recover K_root, then fetch the latest manifest + chunks from any replica") requires the
+recovering, key-less claimant to obtain the per-chunk decryption keys, which live only in the
+`FileGrant` (`GrantChunk { chunk_key, nonce }`), not in the manifest. Previously the grant was
+served only by the live owner, so a dead-owner claimant could fetch ciphertext but not decrypt
+it. Implemented as **Option A**: on replica placement/repair/epoch-push the owner now pushes the
+epoch-matched `FileGrant` alongside the announce; the replica verifies it (`grant.verify()`,
+`vid`/`by`/`epoch` bound to the placement) and retains it (`replica_grants`, `replica_announce`);
+and a dialer classified `ReplicaDevice(owner)` (which requires presenting an owner-user-key-signed
+card delegating its node - unforgeable without `K_root`) is served that one owner's card, announce,
+and grant so it can drive `select_targets` and reconstruct. Confidentiality is unchanged: the grant
+body is HPKE-sealed to the owner's `K_disclose` (derived from `K_root`), so serving it to anyone
+lacking `K_root` yields nothing, and anyone holding `K_root` could derive the content keys directly.
+End-to-end regression: `crates/carapaced/tests/recovery_reconstruct.rs`.
+
+Two dispositions: (1) the placement push now carries one extra `FileGrant` frame between the
+announce and the blob count - a coordinated in-repo protocol addition, fail-closed against a pre-
+change pusher (placement aborts, no partial state), no mixed-version compat guarantee. (2)
+Deferred **Option B** (carry the per-chunk keys in the sealed manifest so recovery needs no grant
+at all): cleaner long-term, but it revs the core `Manifest`/`FileEntry` wire format and the §4/§5
+cross-client golden vectors (W11), so it is left as a future spec-level decision rather than folded
+in here. (3) Multi-source max-epoch reconciliation across trustees + replicas (§8.4) remains
+unit-tested (`max_epoch_refs`); the live claimant fetch uses a single replica, which is sufficient
+for content recovery - wiring trustee-served announce refs into the live fetch is additive.

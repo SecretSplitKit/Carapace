@@ -369,6 +369,19 @@ struct Shared {
     /// owner-signed `VaultAnnounce` received at placement. The gate admits a member
     /// of this set so a co-replica can fetch for repair (§7.4 b).
     replica_members: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    /// For each vid held as a replica, the full owner-signed `VaultAnnounce` received
+    /// at placement/epoch-push (§8.4). Kept - not just its `replicas` list - so this
+    /// replica can serve it back to a recovering owner-device that lost every original
+    /// device: the announce drives that device's `select_targets`, and its old-node
+    /// signer satisfies the C1 delegated-signer check.
+    replica_announce: HashMap<[u8; 32], VaultAnnounce>,
+    /// For each vid held as a replica, the owner's node-signed `FileGrant` for the
+    /// stored epoch (§8.4). The grant body is HPKE-sealed to the owner's disclosure
+    /// key, so this replica cannot open it; it is served only to that owner's
+    /// delegated device (a `ReplicaDevice(owner)` dialer, which proved an owner-user
+    /// signature) so a recovering owner can re-derive the per-chunk secrets and
+    /// decrypt. Confidentiality holds because opening still requires `K_root`.
+    replica_grants: HashMap<[u8; 32], FileGrant>,
     /// Owner-side deny-list of peer node ids this daemon refuses to place on (S4).
     replica_deny: HashSet<[u8; 32]>,
     /// Last-known dialable address per peer node id, recorded whenever this daemon
@@ -996,45 +1009,84 @@ impl ControlHandler {
             )
         };
 
-        let (authorized, cards, announces, grants) = {
-            // W5: classify the dialer against its authenticated remote node id. On
-            // success, record the classification so the blob-read gate can bind this
-            // node's later raw iroh-blobs fetches to a verified identity (§7.4/D3).
+        // W5: classify the dialer against its authenticated remote node id. On
+        // success, record the classification so the blob-read gate can bind this
+        // node's later raw iroh-blobs fetches to a verified identity (§7.4/D3).
+        enum Serve {
+            // Friend/self (W5): own docs plus the store-and-forward third-party docs.
+            Authorized(Vec<ContactCard>, Vec<VaultAnnounce>, Vec<FileGrant>),
+            // §8.4 recovery: a delegated device of an owner whose vaults we replicate.
+            // Serve ONLY that owner's card + the announce + grant we retained for its
+            // vaults - never any other owner's, and no store-and-forward dump.
+            ReplicaOwner(Vec<ContactCard>, Vec<VaultAnnounce>, Vec<FileGrant>),
+            No,
+        }
+        let serve = {
             let mut s = self.shared.write().expect("shared lock");
             match classify_dialer(&s, &self.self_user, card, remote, now, newest_self.as_ref()) {
                 Some(auth) => {
                     s.blob_auth.insert(*remote, auth);
-                    (true, s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
                 }
-                None => {
-                    // W8/§7.4 a: even a dialer we serve no documents to may be a
-                    // delegated device of an owner whose vault we replicate. Record
-                    // that classification so its later raw iroh-blobs fetches of that
-                    // owner's replica-held chunks are admitted - and nothing else.
-                    if let Some(owner) = replica_owner_device(&s, card, remote, now) {
+                // W8/§7.4 a + §8.4: a dialer we serve no ordinary documents to may be a
+                // delegated device of an owner whose vault we replicate. Record the
+                // ReplicaDevice classification so its raw iroh-blobs fetches of that
+                // owner's replica-held chunks are admitted, AND serve back the owner
+                // docs we retained at placement so a recovering owner-device that lost
+                // every original device can: drive `select_targets` (the announce),
+                // satisfy the C1 delegated-signer check on that old-node-signed announce
+                // (the owner card delegating the original signer), and re-derive the
+                // per-chunk secrets (the grant - still HPKE-sealed to the owner's
+                // disclosure key, so opening it still requires `K_root`).
+                None => match replica_owner_device(&s, card, remote, now) {
+                    Some(owner) => {
                         s.blob_auth.insert(*remote, BlobAuth::ReplicaDevice(owner));
+                        let cards: Vec<ContactCard> =
+                            s.friends.get(&owner).cloned().into_iter().collect();
+                        // Only this exact owner's vaults - never leak another owner's
+                        // announce/grant to this device. Announce + grant were stored
+                        // together per vid, so pair them by vid.
+                        let mut announces: Vec<VaultAnnounce> = Vec::new();
+                        let mut grants: Vec<FileGrant> = Vec::new();
+                        for (vid, ann) in &s.replica_announce {
+                            if s.replica_owner.get(vid) == Some(&owner) {
+                                announces.push(ann.clone());
+                                if let Some(g) = s.replica_grants.get(vid) {
+                                    grants.push(g.clone());
+                                }
+                            }
+                        }
+                        Serve::ReplicaOwner(cards, announces, grants)
                     }
-                    (false, Vec::new(), Vec::new(), Vec::new())
-                }
+                    None => Serve::No,
+                },
             }
         };
-        if !authorized {
-            send.finish()?;
-            return Ok(());
-        }
-        // Own docs first, then the learned third-party docs we re-serve. Overlap is
-        // harmless: the receiver dedups/rolls-back per signer.
+        let (cards, include_forward, announces, grants) = match serve {
+            Serve::No => {
+                send.finish()?;
+                return Ok(());
+            }
+            Serve::Authorized(c, a, g) => (c, true, a, g),
+            Serve::ReplicaOwner(c, a, g) => (c, false, a, g),
+        };
+        // Own/owner docs first, then (friend path only) the learned third-party docs we
+        // re-serve. Overlap is harmless: the receiver dedups/rolls-back per signer.
         for card in &cards {
             write_msg(send, card).await?;
         }
-        for card in &fwd_cards {
-            write_msg(send, card).await?;
+        if include_forward {
+            for card in &fwd_cards {
+                write_msg(send, card).await?;
+            }
         }
         for ann in &announces {
             write_msg(send, ann).await?;
         }
-        for ann in &fwd_announces {
-            write_msg(send, ann).await?;
+        if include_forward {
+            for ann in &fwd_announces {
+                write_msg(send, ann).await?;
+            }
         }
         for grant in &grants {
             write_msg(send, grant).await?;
@@ -1177,6 +1229,27 @@ impl ControlHandler {
             "replica announce signer is not the inviting owner"
         );
 
+        // §8.4: the owner also pushes the epoch's owner-signed FileGrant so this
+        // replica can later serve it to a recovering owner-device (which alone can
+        // open its disclosure-sealed body). Verify the node signature and bind it to
+        // this vault, epoch, and owner before storing - never retain an unverified doc.
+        let grant = read_msg::<FileGrant>(recv).await?;
+        grant
+            .verify()
+            .map_err(|e| anyhow::anyhow!("replica grant bad sig: {e}"))?;
+        ensure!(
+            grant.vid == inv.vid,
+            "replica grant named a different vault"
+        );
+        ensure!(
+            grant.by == inv.by,
+            "replica grant signer is not the inviting owner"
+        );
+        ensure!(
+            grant.epoch == announce.epoch,
+            "replica grant epoch != announce epoch"
+        );
+
         // Receive the pushed blobs: envelope first (verified), then each chunk.
         // W1: cap the blob count and track the running received-byte total for this
         // (peer, vid), aborting the moment it would exceed the advertised size
@@ -1216,6 +1289,10 @@ impl ControlHandler {
                 s.replica_owner.insert(inv.vid, owner);
             }
             s.replica_members.insert(inv.vid, announce.replicas.clone());
+            // §8.4: retain the full signed announce + grant so a recovering
+            // owner-device can pull them back off this replica.
+            s.replica_announce.insert(inv.vid, announce);
+            s.replica_grants.insert(inv.vid, grant);
             for h in &stored {
                 s.replica_chunks.insert(*h, inv.vid);
             }
@@ -3514,16 +3591,29 @@ impl Daemon {
         );
 
         // Send the current owner-signed announce so the replica learns the set it
-        // joins and can gate later fetches on membership (§7.4 b, W8).
-        let announce = {
+        // joins and can gate later fetches on membership (§7.4 b, W8), then the
+        // matching owner-signed FileGrant (§8.4): the replica retains both so it can
+        // serve them to a recovering owner-device that lost every original device.
+        // The grant body stays HPKE-sealed to the owner's disclosure key, so the
+        // replica gains no plaintext by holding it.
+        let (announce, grant) = {
             let s = self.shared.read().expect("shared lock");
-            s.announces
+            let announce = s
+                .announces
                 .iter()
                 .find(|a| a.vid == vid)
                 .cloned()
-                .context("no announce for vault being placed")?
+                .context("no announce for vault being placed")?;
+            let grant = s
+                .grants
+                .iter()
+                .find(|g| g.vid == vid && g.epoch == epoch)
+                .cloned()
+                .context("no epoch-matched grant for vault being placed")?;
+            (announce, grant)
         };
         write_msg(&mut send, &announce).await?;
+        write_msg(&mut send, &grant).await?;
 
         write_u64(&mut send, blobs.len() as u64).await?;
         for b in blobs {
@@ -5709,6 +5799,8 @@ fn drop_replica_vid(s: &mut Shared, vid: &[u8; 32]) {
     s.held.remove(vid);
     s.replica_owner.remove(vid);
     s.replica_members.remove(vid);
+    s.replica_announce.remove(vid);
+    s.replica_grants.remove(vid);
     s.replica_chunks.retain(|_, v| v != vid);
 }
 
@@ -6250,6 +6342,16 @@ impl ClaimantDevice {
     #[must_use]
     pub fn new_node(&self) -> [u8; 32] {
         self.node_key.verifying_key().to_bytes()
+    }
+
+    /// The node signing seed for this device (§8.4): after [`recover`](Self::recover)
+    /// yields `K_root`, `State::from_seeds(claimant.node_seed(), *recovered.k_root)`
+    /// stands the recovered device up as a full [`Daemon`] on the exact node identity
+    /// this claimant delegated in [`Recovered::node_deleg`], so it can then fetch and
+    /// reconstruct its vaults from a surviving replica.
+    #[must_use]
+    pub fn node_seed(&self) -> [u8; 32] {
+        self.node_key.to_bytes()
     }
 
     /// Collect the raw sealed `CeremonyShare`s the approving trustees release (§8.5
