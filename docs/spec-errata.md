@@ -501,3 +501,65 @@ held **for that subject** (`held_share_subjects`), so no current friend can dest
 unrelated owner's share by naming its rsid. The `FriendshipEnd` receiver likewise honors an
 end only when it names **us** (`end.user == self_user`) and rides the signer's own
 connection (`end.by == remote`). Regression coverage: `crates/carapaced/tests/unfriend.rs`.
+
+## Note — full-spec conformance sweep: residual dispositions
+
+A clause-by-clause sweep of the whole spec (§2-§14, 186 normative clauses) against the
+code produced code fixes for the real MUST-level gaps it found (§8.5 abort durability,
+§8.3 over-cap extend warning, §11 push-to-replicas on publish, §8.4 recovery manifest/chunk
+fetch) and one security fix (§8.5). The following residuals are deliberate divergences,
+SHOULD-level items, physical-world advisories, or wire-schema entries superseded by other
+mechanisms. Each is documented here rather than code-changed.
+
+- **§4 manifest authorship is node-key-signed, not user-key-signed.** The spec says the user
+  key signs manifest authorship; the impl signs each `ManifestEnvelope` with the per-device
+  **node** key (`carapace-vault` `seal_manifest`), tied to the user through the node
+  delegation chain (§4). Same rationale as E1 (friendship signing): per-device attribution
+  is revocable without touching identity, and a lost device is revoked by dropping its
+  delegation rather than rotating `K_root`. Authorship still resolves to the user, just
+  indirectly. Deliberate.
+- **§6 "≥1 stable-named relay per friend cluster" (SHOULD).** The capability exists
+  (`--relay-host`/`cfg.relay_host` for a DDNS or static-IP relay), but whether a given friend
+  cluster actually contains one is a cross-node deployment property no single daemon can
+  observe or enforce. Left to operators; the `< 2 distinct networks` warning (W10) is the
+  in-app nudge.
+- **§9.3 FriendshipEnd "learned via the sender's next card version" fallback.** Only the
+  direct-receipt path is a distinct mechanism (`serve_friendship_end`, best-effort send). An
+  offline ex-friend is not chased with an explicit end-signal folded into a re-fetched card;
+  it simply stops appearing once contact lapses, and the teardown is idempotent on eventual
+  receipt. The card-version fallback is descriptive, not a separate code path.
+- **§9.3.4 "old paper cards should be physically destroyed and replaced" (physical SHOULD).**
+  Paper-card printing exists (W15); the specific reminder to physically destroy superseded
+  cards as each new one is delivered is a real-world action the software cannot enforce and
+  is not surfaced as a per-card prompt in the re-split UI.
+- **§10.1 "owners SHOULD watch response-time distributions" (anti-proxy heuristic).** Not
+  implemented at runtime; anti-proxy rests on jittered audit timing and occasional
+  wide-coverage rounds, as §10.1 itself allows. Residual friend-proxying is an availability
+  risk explicitly accepted by the trust model.
+- **§10.2 drift-toward-M extend/re-split is surfaced, not auto-executed.** `decide()` computes
+  `Extend{needed}` (below M+slack, with cap headroom) or `ResplitLargerM` (at the §8.3 soft
+  cap) and the daemon reports it via `recovery_health`, but attestation-liveness drift does
+  not autonomously start an extend or re-split (only the unfriend path auto-drives a re-split,
+  under the destroy gate). This matches the §9.3.4 decision to prompt the owner rather than
+  act unattended: the recommendation is surfaced, the owner starts it via the recovery API.
+- **§14 split-state at-rest sealing is correct but not exercised.** The seal primitive is
+  `HKDF(K_root, "carapace/v1/split-state")` + XChaCha20-Poly1305 with `aad = rsid‖M`
+  (`state_seal`), unit-tested, but the daemon holds split-state only in memory (all daemon
+  runtime state is in-memory, no persistence yet), so nothing is ever written unsealed. When
+  persistence lands, seal on write. Endpoint compromise of an owner device is out of scope
+  (§14).
+- **§14 weakest-split rule "K_root split once" (SHOULD) is not enforced.** `recovery_split`
+  accepts more than one root split; nothing rejects a second `K_root` door. The scope
+  distinction (`RecoveryScope::Root` vs `Vault`) exists and the default flow splits once, but
+  a guard/warning against a second root split is a candidate future hardening, not present.
+- **§12 `Hello` is sent but not consumed for negotiation.** `Hello` (card versions +
+  capabilities) is emitted as the stream preamble and the W9 suite/version-mismatch refusal,
+  and `Hello.protocol == 1` is checked (W9), but no daemon reader consumes an inbound
+  `Hello`'s `card_version`/`roles` for capability negotiation; version reconciliation runs on
+  the anti-entropy card/announce exchange (§6) instead. `card_version`/`roles` are hardcoded.
+- **§12 `ManifestOffer` and `AuditNotice` are defined and golden-vectored but not wired at
+  runtime.** Both are superseded by mechanisms the spec describes elsewhere: the manifest
+  flows as an iroh blob addressed by `VaultAnnounce.manifestDigest` (§7.2/§7.3), so a separate
+  offer message is redundant; and PoR issues direct BLAKE3-verified `iroh-blobs` range
+  requests (§10.1), so no separate audit-notice frame is needed. Retained in `carapace-wire`
+  with their Appendix B vectors for wire-schema completeness and possible future use.
