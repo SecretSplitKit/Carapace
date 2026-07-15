@@ -166,3 +166,63 @@ async fn friend_gate_replica_placement_repair_and_recovery() -> Result<()> {
     }
     Ok(())
 }
+
+/// §11 regression: a routine local edit must push the new epoch to the CURRENT
+/// enrolled replica set, not just re-announce. Owner A places a replica on friend C,
+/// then edits the tree and republishes (epoch bumps). The enrolled replica C must end
+/// up holding the NEW epoch's manifest + chunks, so a fresh delegated device can
+/// reconstruct the edited vault with its ciphertext served entirely off C.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routine_edit_pushes_new_epoch_to_enrolled_replica() -> Result<()> {
+    const ROOT_A: u8 = 0xA0;
+    let a = Daemon::start(daemon_seeds(0x03, ROOT_A)).await?;
+    // A fresh delegated device of A that has never held this vault, so every blob it
+    // reconstructs must be fetched from the replica (nothing in its own store).
+    let a2 = Daemon::start(daemon_seeds(0x04, ROOT_A)).await?;
+    let c = Daemon::start(daemon_seeds(0x22, 0xC0)).await?;
+
+    // C befriends A.
+    let ticket = a.issue_ticket()?;
+    let fr = c.befriend(a.addr()?, &ticket, None).await?;
+    fr.verify().context("friendship must be dual-signed")?;
+    assert!(a.is_friend(&c.user_id()) && c.is_friend(&a.user_id()));
+
+    // Publish epoch 1 and place a replica on C.
+    let (src, _expected) = make_tree();
+    let (vid, _nonce) = a.new_vid();
+    let epoch1 = a.publish_vault(src.path(), vid).await?;
+    let placed = a.place_replicas(vid, &[c.addr()?], 1).await?;
+    assert_eq!(placed, vec![c.node_id()], "C accepted the placement");
+    assert!(c.holds_replica(&vid), "C stored the epoch-1 blobs");
+
+    // Routine local edit: add a new file, then republish. The epoch must bump AND the
+    // new manifest + chunk must be pushed to the enrolled replica C.
+    let added = b"a routine edit that must reach the replica".to_vec();
+    std::fs::write(src.path().join("added.txt"), &added)?;
+    let epoch2 = a.publish_vault(src.path(), vid).await?;
+    assert!(epoch2 > epoch1, "a real edit bumps the epoch");
+
+    // Reconstruct on the fresh delegated device: documents (the epoch-2 announce +
+    // grant) from A, but ALL ciphertext strictly from the replica C. If the epoch push
+    // failed, C lacks the epoch-2 manifest envelope + new chunk and this errors out /
+    // omits the vault.
+    let out = tempfile::tempdir()?;
+    let reconstructed = a2
+        .reconstruct_from_replica(a.addr()?, c.addr()?, out.path())
+        .await?;
+    let got = reconstructed
+        .iter()
+        .find(|r| r.vid == vid)
+        .context("replica C must serve the NEW epoch so A2 can reconstruct it")?;
+    let recovered = std::fs::read(got.out_dir.join("added.txt"))
+        .context("the edited-in file must be reconstructible off the replica")?;
+    assert_eq!(
+        recovered, added,
+        "replica served the new-epoch content, not the stale placement-time epoch"
+    );
+
+    for daemon in [a, a2, c] {
+        daemon.shutdown().await;
+    }
+    Ok(())
+}

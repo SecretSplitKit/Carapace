@@ -2058,40 +2058,90 @@ impl Daemon {
             }
         }
 
-        let mut s = self.shared.write().expect("shared lock");
-        // Commit the bumped epoch (read-prev..commit is atomic under the vid lock).
-        s.epochs.insert(vid, epoch);
-        // W2: retain every published ChunkID in the owner-gated set across epoch
-        // bumps, so superseded chunks keep the §7.4 owner gate (see `owned_chunks`).
-        for id in &chunk_ids {
-            s.owned_chunks.insert(*id, vid);
-        }
-        s.vault_blobs.insert(
-            vid,
-            VaultBlobs {
-                digest: ingest.digest,
-                chunk_ids,
-                manifest: ingest.manifest.clone(),
-            },
-        );
-        // Retain the per-chunk secrets so a later `disclose_files` can seal a subset
-        // of files into a friend-facing grant without re-ingesting (§7.4).
-        s.vault_keys.insert(vid, ingest.keys);
-        let replicas = replica_list(self.node_id(), s.members.get(&vid));
-        let mut ann = VaultAnnounce {
-            vid,
-            epoch,
-            replicas,
+        let vb = VaultBlobs {
             digest: ingest.digest,
-            by: [0; 32],
-            sig: [0; 64],
+            chunk_ids,
+            manifest: ingest.manifest.clone(),
         };
-        ann.sign(&self.node_key);
-        // Replace any older announce/grant for this vid (monotonic epoch).
-        s.announces.retain(|a| a.vid != vid);
-        s.announces.push(ann);
-        s.grants.retain(|g| g.vid != vid);
-        s.grants.push(grant);
+
+        let push_targets = {
+            let mut s = self.shared.write().expect("shared lock");
+            // Commit the bumped epoch (read-prev..commit is atomic under the vid lock).
+            s.epochs.insert(vid, epoch);
+            // W2: retain every published ChunkID in the owner-gated set across epoch
+            // bumps, so superseded chunks keep the §7.4 owner gate (see `owned_chunks`).
+            for id in &vb.chunk_ids {
+                s.owned_chunks.insert(*id, vid);
+            }
+            s.vault_blobs.insert(vid, vb.clone());
+            // Retain the per-chunk secrets so a later `disclose_files` can seal a subset
+            // of files into a friend-facing grant without re-ingesting (§7.4).
+            s.vault_keys.insert(vid, ingest.keys);
+            let replicas = replica_list(self.node_id(), s.members.get(&vid));
+            let mut ann = VaultAnnounce {
+                vid,
+                epoch,
+                replicas,
+                digest: ingest.digest,
+                by: [0; 32],
+                sig: [0; 64],
+            };
+            ann.sign(&self.node_key);
+            // Replace any older announce/grant for this vid (monotonic epoch).
+            s.announces.retain(|a| a.vid != vid);
+            s.announces.push(ann);
+            s.grants.retain(|g| g.vid != vid);
+            s.grants.push(grant);
+
+            // §11: the new epoch must reach the CURRENT enrolled replica set, or those
+            // replicas keep serving the stale placement-time epoch and §10.1 read
+            // redundancy collapses to just this owner. Snapshot the members (excluding
+            // our own devices - they sync via the owner-device path) to their dialable
+            // addresses now, while we hold the lock, then push after releasing it.
+            let now = unix_now();
+            let self_user = self.user_id();
+            s.members
+                .get(&vid)
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter(|n| **n != self.node_id())
+                        .filter(|n| {
+                            !s.cards
+                                .iter()
+                                .any(|c| c.user == self_user && card_delegates_node(c, n, now))
+                        })
+                        .filter_map(|n| resolve_peer(&s.peer_addrs, n))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        // Push the new epoch to enrolled replicas OUTSIDE the shared lock. Best-effort:
+        // iroh blobs are content-addressed so a replica only pulls the chunks it lacks
+        // (dedup), and an offline replica is caught by the existing PoR/repair path, so
+        // a failed push MUST NOT fail the publish (mirror the other best-effort sends).
+        if !push_targets.is_empty() {
+            match self.gather_blob_bytes(&vb).await {
+                Ok(blobs) => {
+                    let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+                    for peer in &push_targets {
+                        if let Err(e) = self.invite_and_push(peer, vid, epoch, total, &blobs).await
+                        {
+                            eprintln!(
+                                "carapaced: epoch push of {} to replica {} failed (best-effort): {e:#}",
+                                hex32(&vid),
+                                hex32(peer.id.as_bytes())
+                            );
+                        }
+                    }
+                }
+                Err(e) => eprintln!(
+                    "carapaced: could not gather blobs to push epoch of {} to replicas: {e:#}",
+                    hex32(&vid)
+                ),
+            }
+        }
         Ok(epoch)
     }
 
@@ -4502,7 +4552,7 @@ impl Daemon {
         rsid: u64,
         count: u8,
         allow_over_cap: bool,
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, Vec<PolicyWarning>)> {
         let mut s = self.shared.write().expect("shared lock");
         let set = s
             .split_states
@@ -4512,9 +4562,9 @@ impl Daemon {
             RecoveryScope::Root => self.k_root.clone(),
             RecoveryScope::Vault(vid) => Zeroizing::new(*kdf::k_vaultroot(&*self.k_root, &vid)),
         };
-        let shares = extend_split(&mut set.state, &secret, count, allow_over_cap)
+        let (shares, warnings) = extend_split(&mut set.state, &secret, count, allow_over_cap)
             .map_err(|e| anyhow::anyhow!("recovery extend failed: {e:?}"))?;
-        Ok(shares.iter().map(share_to_json).collect())
+        Ok((shares.iter().map(share_to_json).collect(), warnings))
     }
 
     /// Split a recovery secret `M`-of-`N` (N = `trustees.len()`) and mint + deliver one

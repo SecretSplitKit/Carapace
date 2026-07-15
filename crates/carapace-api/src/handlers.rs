@@ -650,12 +650,18 @@ async fn do_split(st: &AppState, req: &SplitReq) -> Result<Json<Value>, ApiError
                 allow_over_cap,
             )
             .await?;
-        return Ok(Json(json!({
+        let warnings: Vec<String> = report.warnings.iter().map(|w| format!("{w:?}")).collect();
+        let mut body = json!({
             "rsid": report.rsid,
             "delivered": report.delivered.iter().map(|u| hexs(u)).collect::<Vec<_>>(),
             "undelivered": report.undelivered.iter().map(|u| hexs(u)).collect::<Vec<_>>(),
-            "warnings": report.warnings.iter().map(|w| format!("{w:?}")).collect::<Vec<_>>(),
-        })));
+            "warnings": warnings,
+        });
+        // §8.3: an over-cap issuance MUST surface "re-split with a larger M".
+        if warnings.iter().any(|w| w == "OverSoftCap") {
+            body["recommendation"] = json!("re-split with a larger M");
+        }
+        return Ok(Json(body));
     }
 
     // Bare-words path (no trustee set): return each share's JSON carrier.
@@ -665,10 +671,16 @@ async fn do_split(st: &AppState, req: &SplitReq) -> Result<Json<Value>, ApiError
     let (shares, warnings) = st
         .daemon
         .recovery_split(req.rsid, scope, req.m, n, allow_over_cap)?;
-    Ok(Json(json!({
+    let warnings: Vec<String> = warnings.iter().map(|w| format!("{w:?}")).collect();
+    let mut body = json!({
         "shares": shares,
-        "warnings": warnings.iter().map(|w| format!("{w:?}")).collect::<Vec<_>>(),
-    })))
+        "warnings": warnings,
+    });
+    // §8.3: an over-cap issuance MUST surface "re-split with a larger M".
+    if warnings.iter().any(|w| w == "OverSoftCap") {
+        body["recommendation"] = json!("re-split with a larger M");
+    }
+    Ok(Json(body))
 }
 
 /// `POST /api/recovery/split`: split `K_root` or `K_vaultroot(vid)` M-of-N. With a
@@ -702,10 +714,20 @@ pub async fn recovery_extend(
     State(st): State<AppState>,
     Json(req): Json<ExtendReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let shares =
+    let (shares, warnings) =
         st.daemon
             .recovery_extend(req.rsid, req.count, req.allow_over_cap.unwrap_or(false))?;
-    Ok(Json(json!({ "shares": shares })))
+    let warnings: Vec<String> = warnings.iter().map(|w| format!("{w:?}")).collect();
+    let mut body = json!({
+        "shares": shares,
+        "warnings": warnings,
+    });
+    // §8.3: an over-cap issuance MUST surface "re-split with a larger M" as the
+    // recommended alternative alongside the warning.
+    if warnings.iter().any(|w| w == "OverSoftCap") {
+        body["recommendation"] = json!("re-split with a larger M");
+    }
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]

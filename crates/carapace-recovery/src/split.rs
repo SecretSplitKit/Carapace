@@ -167,8 +167,8 @@ pub fn extend_split(
     secret_key: &[u8; 32],
     count: u8,
     allow_over_cap: bool,
-) -> Result<Vec<Share>, RecoveryError> {
-    check_issuance(
+) -> Result<(Vec<Share>, Vec<PolicyWarning>), RecoveryError> {
+    let warnings = check_issuance(
         state.threshold(),
         state.issued_count(),
         count,
@@ -179,13 +179,14 @@ pub fn extend_split(
         mnemonic: &mnemonic,
         passphrase: "",
     };
-    Ok(extend(
+    let shares = extend(
         state,
         &input,
         count,
         allow_over_cap,
         OutputMode::Bip39Wordlist,
-    )?)
+    )?;
+    Ok((shares, warnings))
 }
 
 /// Add a trustee (protocol §8.1): unseal the split-state, issue one new share at a fresh unused
@@ -206,7 +207,7 @@ pub fn add_trustee(
     allow_over_cap: bool,
 ) -> Result<(Share, SealedSplitState), RecoveryError> {
     let mut state = open_split_state(k_root, sealed)?;
-    let mut shares = extend_split(&mut state, secret_key, 1, allow_over_cap)?;
+    let (mut shares, _warnings) = extend_split(&mut state, secret_key, 1, allow_over_cap)?;
     let resealed = seal_split_state(k_root, &state)?;
     // `count = 1` always yields exactly one share.
     let share = shares.pop().ok_or(RecoveryError::ShareCount)?;
@@ -346,6 +347,16 @@ mod tests {
         ));
         // Override proceeds.
         let (_new, _resealed) = add_trustee(&K_ROOT, &K_ROOT, &sealed, true).unwrap();
+    }
+
+    #[test]
+    fn extend_over_cap_with_override_returns_warning() {
+        // §8.3: an over-cap extend with the override set must SUCCEED and surface the
+        // OverSoftCap warning, so the daemon/GUI can raise the resplit-larger-M prompt.
+        let (_shares, mut state, _w) = split_root(&K_ROOT, 2, Some(5), false).unwrap();
+        let (shares, warnings) = extend_split(&mut state, &K_ROOT, 1, true).unwrap();
+        assert_eq!(shares.len(), 1);
+        assert!(warnings.contains(&PolicyWarning::OverSoftCap));
     }
 
     #[test]
