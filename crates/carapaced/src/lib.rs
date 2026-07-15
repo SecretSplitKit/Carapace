@@ -451,6 +451,22 @@ struct Shared {
     /// even on the subject's own devices and friends (who hold no grant to track a
     /// full ceremony). The anti-silent-takeover signal.
     ceremony_alarms: HashMap<[u8; 16], AlarmRecord>,
+    /// Signature-valid subject aborts seen for a ceremony id, retained even when no
+    /// ceremony/alarm is tracked yet (§8.5 step 3). Best-effort per-peer fan-out has no
+    /// ordering, so a subject-signed `CeremonyAbort` can reach a trustee BEFORE that
+    /// trustee's `RecoveryOpen` (and the same open is re-sent later as the claimant's
+    /// share request). Without a durable record the early abort would be dropped and the
+    /// later open would re-track a fresh, non-aborted ceremony that releases at
+    /// delay-expiry - the exact silent takeover step 3 exists to stop. Populated
+    /// UNCONDITIONALLY by `serve_ceremony_abort` and consulted by `serve_recovery_open`
+    /// before any release. Authoritative only when a stored abort's `by` equals the
+    /// open's subject (a stranger cannot abort someone else's recovery). Kept as a
+    /// per-signer-deduped list, NOT a single slot: a stranger's inert abort must not be
+    /// able to crowd out the authoritative subject abort that arrives before the open.
+    /// ponytail: tiny metadata (16-byte id + a signed abort per distinct signer),
+    /// retained for the daemon's lifetime; no persistence (all daemon state is in-memory
+    /// per the documented deferral).
+    aborted_ceremonies: HashMap<[u8; 16], Vec<CeremonyAbort>>,
     /// Injected wall clock for the ceremony delay gate (0 = real time). Test-only knob
     /// (`set_test_clock`) so the 72 h abort delay is exercised without ever sleeping:
     /// only the network-triggered ceremony paths (track `first_seen`, release gate)
@@ -1352,6 +1368,23 @@ impl ControlHandler {
                     aborted: false,
                     takeover: false,
                 });
+            // A subject-signed abort may have arrived BEFORE this open (fan-out has no
+            // ordering, and the same open is re-sent as the claimant's later share
+            // request). It is authoritative iff its signer is THIS open's subject - only
+            // now, with the open in hand, can we resolve the subject to apply the
+            // `by == subject` check. Apply it so the ceremony can NEVER release, mirroring
+            // the normal open-then-abort path (§8.5 step 3). A stranger's stored abort
+            // fails the subject check and stays inert.
+            let subject_abort = s
+                .aborted_ceremonies
+                .get(&open.ceremony_id)
+                .and_then(|aborts| aborts.iter().find(|a| a.by == open.subject).cloned());
+            if subject_abort.is_some() {
+                if let Some(al) = s.ceremony_alarms.get_mut(&open.ceremony_id) {
+                    al.aborted = true;
+                    al.takeover = true;
+                }
+            }
             // Trustee role: track (once) and, if the gate is open, seal our share.
             if let Some(grant) = s.held_grants.get(&open.subject).cloned() {
                 // Track once, anchoring `first_seen` at the first observation - a re-send
@@ -1365,6 +1398,15 @@ impl ControlHandler {
                             approved: false,
                             takeover: false,
                         });
+                    }
+                }
+                // Fold in an abort that beat the open: cancel the freshly (or previously)
+                // tracked ceremony permanently before any release is even considered.
+                if let Some(ab) = &subject_abort {
+                    if let Some(tc) = s.ceremonies.get_mut(&open.ceremony_id) {
+                        if tc.state.abort(ab).is_ok() {
+                            tc.takeover = true;
+                        }
                     }
                 }
                 if let Some(tc) = s.ceremonies.get(&open.ceremony_id) {
@@ -1417,6 +1459,16 @@ impl ControlHandler {
     async fn serve_ceremony_abort(&self, ab: CeremonyAbort, send: &mut SendStream) -> Result<()> {
         if ab.verify().is_ok() {
             let mut s = self.shared.write().expect("shared lock");
+            // Record every signature-valid abort keyed by ceremony id, EVEN IF nothing is
+            // tracked yet: fan-out has no ordering, so this abort may precede our own
+            // `RecoveryOpen`. `serve_recovery_open` consults this before any release and
+            // decides authority (by == subject) once the open supplies the subject. A
+            // stranger's abort is kept but is inert there. Dedup by signer so a griefing
+            // stranger cannot crowd out the authoritative subject abort. (§8.5 step 3.)
+            let seen = s.aborted_ceremonies.entry(ab.ceremony_id).or_default();
+            if !seen.iter().any(|a| a.by == ab.by) {
+                seen.push(ab.clone());
+            }
             if let Some(tc) = s.ceremonies.get_mut(&ab.ceremony_id) {
                 if tc.state.abort(&ab).is_ok() {
                     tc.takeover = true;

@@ -273,6 +273,83 @@ async fn subject_abort_cancels_and_flags_takeover() -> Result<()> {
     Ok(())
 }
 
+/// §8.5 step 3, message-reordering vector: a subject-signed `CeremonyAbort` that reaches
+/// a trustee BEFORE that trustee's `RecoveryOpen` (fan-out is best-effort per-peer with no
+/// ordering) MUST still cancel the ceremony permanently. Without the durable
+/// `aborted_ceremonies` record the early abort is dropped, the later open re-tracks a
+/// fresh non-aborted ceremony, and an approving trustee releases its share at delay-expiry
+/// despite an authoritative abort - the exact silent takeover step 3 exists to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn abort_before_open_still_cancels() -> Result<()> {
+    let (a, b, c, d, _k_root) = setup().await?;
+    let subject = a.user_id();
+    for t in [&b, &c, &d] {
+        t.set_test_clock(T0);
+    }
+    let claimant = ClaimantDevice::new()?;
+
+    // Sponsor B opens (tracks locally) so the ceremony id exists to sign an abort against.
+    let (open, id) = b.ceremony_sponsor_open(
+        subject,
+        "impostor".into(),
+        claimant.ceremony_enc(),
+        claimant.new_node(),
+        "silent takeover via reordering".into(),
+        T0,
+    )?;
+
+    // The subject signs the authoritative abort and it reaches C and D FIRST - BEFORE
+    // either has seen the open. They hold no tracked ceremony and no alarm yet.
+    let ab = a.ceremony_abort(id)?;
+    assert_eq!(ab.by, subject, "abort is signed by the subject user key");
+    for t in [&c, &d] {
+        a.send_ceremony_abort(&t.addr()?, &ab).await?;
+        assert!(
+            t.ceremony_statuses().is_empty(),
+            "no ceremony/alarm is tracked yet - only the durable abort record exists"
+        );
+    }
+
+    // Only NOW does the open arrive at C and D (the reordering). The abort must win.
+    b.deliver_recovery_open(&c.addr()?, &open).await?;
+    b.deliver_recovery_open(&d.addr()?, &open).await?;
+
+    // C and D each approve and reach M=2 among themselves - the ceremony WOULD release
+    // if the pre-open abort had been dropped.
+    let ap_c = c.ceremony_approve(id, T0 + 10)?;
+    c.send_ceremony_approve(&d.addr()?, &ap_c).await?;
+    let ap_d = d.ceremony_approve(id, T0 + 20)?;
+    d.send_ceremony_approve(&c.addr()?, &ap_d).await?;
+
+    // The abort that beat the open flagged both trustees as an attempted takeover.
+    for t in [&c, &d] {
+        let row = t.ceremony_statuses();
+        let r = row.iter().find(|r| r.ceremony_id == id).unwrap();
+        assert_eq!(
+            r.approvals, 2,
+            "M approvals reached (would release if not aborted)"
+        );
+        assert!(
+            r.takeover,
+            "an abort delivered before the open still flags a takeover"
+        );
+        assert_eq!(r.phase, "aborted", "aborted permanently despite reordering");
+    }
+
+    // Past the delay, with M approvals, NEITHER reordered trustee releases a share.
+    for t in [&c, &d] {
+        t.set_test_clock(T0 + DELAY);
+    }
+    let shares = claimant.collect_raw(&open, &[c.addr()?, d.addr()?]).await?;
+    assert!(
+        shares.is_empty(),
+        "a subject abort that arrived before the open must still prevent every release"
+    );
+
+    teardown([a, b, c, d]).await;
+    Ok(())
+}
+
 /// Only a trustee may open (§8.5 step 1): a daemon holding no grant for the subject is
 /// refused when it tries to sponsor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
