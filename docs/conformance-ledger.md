@@ -6,6 +6,11 @@ cause across most recovery/social gaps: **library primitives are written and
 unit-tested but never wired to the daemon control stream or a background loop**
 (same class as the §6 relay that shipped green). Status updated as items land.
 
+**STATUS: all 15 work items DONE + committed. A full-spec re-sweep (§2-§14, 186
+normative clauses) then ran as the capstone; the real MUST-level gaps it found are
+also fixed (see "Full-spec sweep" below); defensible residuals are in
+`spec-errata.md`.**
+
 | # | Item | Sev | Crates | Status |
 |---|------|-----|--------|--------|
 | W1 | §11 version vectors + conflict-keep + tombstones + manifest merge (silent data loss today) | BLOCKER | vault, wire, net/sync, daemon | DONE |
@@ -37,3 +42,31 @@ erasure-coded cold tier, K_root at-rest policy.
 - **P2 ceremony e2e**: W2, W15.
 - **P3 lifecycle**: W5 (needs W4 counts + W3 grants), W6 relay lifecycle.
 - **P4 polish**: W13, GUI copy verification for §7.4 snapshot/irrevocable wording.
+
+## Full-spec sweep (capstone)
+
+After W1-W15 landed, an independent clause-by-clause sweep of the entire spec
+(§2-§14, 186 normative clauses, one auditor per section + a completeness critic
+against the §13 profiles and §12 defaults) ran to catch anything missed or
+regressed. Every §12 default constant was correct and no §13 profile obligation was
+unimplemented. It surfaced one security blocker and several MUST-level gaps, now all
+fixed and committed:
+
+- **§8.5 (BLOCKER, security):** recovery-ceremony abort was not durable against
+  message reordering — a subject `CeremonyAbort` arriving before the `RecoveryOpen`
+  was dropped, so a later open could release a share despite a valid abort. Fixed
+  with a durable per-signer abort set consulted at open time.
+- **§8.4:** recovery stopped at `K_root` and never fetched the user's data. Now
+  replicas retain + serve the (HPKE-sealed) `FileGrant` to a recovering owner-device
+  (Option A), and recovery reconstructs actual file content — proven by the new
+  `recovery_reconstruct` ceremony→replica→reconstruct e2e. Option B (chunk keys in
+  the manifest) deferred as a spec-level wire-format decision.
+- **§11:** a routine edit did not push the new epoch to enrolled replicas (they
+  served stale content); `publish_vault` now pushes the new manifest+chunks.
+- **§8.3:** the over-cap *extend* path dropped the mandated warning + re-split
+  recommendation; now surfaced consistently across split and extend.
+
+Defensible divergences, SHOULD-level items, physical advisories, and superseded
+wire messages (§4 node-key manifest authorship, §6/§10 SHOULDs, §9 fallbacks, §10.2
+drift surface-not-auto, §14 at-rest sealing + single-root, §12 Hello/ManifestOffer/
+AuditNotice) are documented in `spec-errata.md`, not code-changed.
