@@ -9,7 +9,6 @@ use chela_engine::{
     SplitState,
 };
 
-use crate::state_seal::{open_split_state, seal_split_state, SealedSplitState};
 use crate::{key_to_mnemonic, mnemonic_to_key, RecoveryError};
 
 /// The soft cap on lifetime issuance for a threshold: `3·M − 1` shares (protocol §8.3). Beyond
@@ -111,8 +110,9 @@ pub fn split_root(
 }
 
 /// Split `K_vaultroot(vid)` for an additional / outer-circle trustee set (scoped split, §8.2). A
-/// quorum recovers *that vault only*, never the identity. The state is still sealed under
-/// `K_root` (see [`seal_split_state`]); only the split *secret* is the vault key.
+/// quorum recovers *that vault only*, never the identity. The state is still secret-equivalent
+/// (persisted sealed under `K_root` by the daemon's state-row seal); only the split *secret* is
+/// the vault key.
 ///
 /// `n = None` defaults the initial issuance to `N₀ = M + 1` (§8.3/§12); pass `Some(n)` to pick an
 /// explicit `N`, which is always honored as given.
@@ -189,41 +189,12 @@ pub fn extend_split(
     Ok((shares, warnings))
 }
 
-/// Add a trustee (protocol §8.1): unseal the split-state, issue one new share at a fresh unused
-/// x-coordinate on the same polynomial, and re-seal. Existing shareholders are untouched. Returns
-/// the new share and the re-sealed state (the old sealed blob should be replaced with it).
-///
-/// # Concurrency
-///
-/// This is a read-modify-write on the sealed blob (open -> extend -> reseal) and is NOT safe to run
-/// concurrently against the same recovery set. Two overlapping runs each draw a fresh x against the
-/// same `issued_count`, and last-writer-wins on the re-sealed blob drops one run's issuance record;
-/// no key leaks (a re-issued coordinate on the same polynomial is a byte-identical share), but the
-/// §8.3 soft-cap accounting drifts. Callers MUST serialize seal->open->extend->reseal per set.
-pub fn add_trustee(
-    k_root: &[u8; 32],
-    secret_key: &[u8; 32],
-    sealed: &SealedSplitState,
-    allow_over_cap: bool,
-) -> Result<(Share, SealedSplitState), RecoveryError> {
-    let mut state = open_split_state(k_root, sealed)?;
-    let (mut shares, _warnings) = extend_split(&mut state, secret_key, 1, allow_over_cap)?;
-    let resealed = seal_split_state(k_root, &state)?;
-    // `count = 1` always yields exactly one share.
-    let share = shares.pop().ok_or(RecoveryError::ShareCount)?;
-    Ok((share, resealed))
-}
-
-/// Replace a lost share (protocol §8.1). Identical operation to [`add_trustee`]: the lost share
-/// stays *valid-if-found* and remains in the issued-count, so this is a new share, not a revocation.
-pub fn replace_lost_share(
-    k_root: &[u8; 32],
-    secret_key: &[u8; 32],
-    sealed: &SealedSplitState,
-    allow_over_cap: bool,
-) -> Result<(Share, SealedSplitState), RecoveryError> {
-    add_trustee(k_root, secret_key, sealed, allow_over_cap)
-}
+// Adding a trustee / replacing a lost share (§8.1) is `extend_split` on the in-memory
+// `SplitState` (issue one more share at a fresh x on the same polynomial); the daemon owns
+// the state's at-rest sealing through the single redb state-row seal (design §3.4 "one
+// mechanism"). The former `add_trustee`/`replace_lost_share` wrappers (which sealed the
+// state a SECOND way, via the retired `state_seal` module) are gone - callers use
+// `extend_split` directly (see `Daemon::recovery_extend`).
 
 #[cfg(test)]
 mod tests {
@@ -262,10 +233,10 @@ mod tests {
     }
 
     #[test]
-    fn add_trustee_then_recover_from_mixed_set() {
-        let (mut shares, state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
-        let sealed = seal_split_state(&K_ROOT, &state).unwrap();
-        let (new_share, _resealed) = add_trustee(&K_ROOT, &K_ROOT, &sealed, false).unwrap();
+    fn extend_then_recover_from_mixed_set() {
+        let (mut shares, mut state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
+        let (mut new, _warnings) = extend_split(&mut state, &K_ROOT, 1, false).unwrap();
+        let new_share = new.pop().unwrap();
         // New share is on the same polynomial (same rsid + M) at a fresh x.
         assert_eq!(new_share.recovery_set_id, shares[0].recovery_set_id);
         assert_eq!(new_share.threshold, shares[0].threshold);
@@ -339,14 +310,14 @@ mod tests {
     #[test]
     fn extend_over_cap_needs_override() {
         // M=2, N0=5 (= cap). One more extension projects to 6 > cap.
-        let (_shares, state, _w) = split_root(&K_ROOT, 2, Some(5), false).unwrap();
-        let sealed = seal_split_state(&K_ROOT, &state).unwrap();
+        let (_shares, mut state, _w) = split_root(&K_ROOT, 2, Some(5), false).unwrap();
         assert!(matches!(
-            add_trustee(&K_ROOT, &K_ROOT, &sealed, false),
+            extend_split(&mut state, &K_ROOT, 1, false),
             Err(RecoveryError::OverSoftCap)
         ));
-        // Override proceeds.
-        let (_new, _resealed) = add_trustee(&K_ROOT, &K_ROOT, &sealed, true).unwrap();
+        // Override proceeds (the failed attempt left the state unchanged).
+        let (new, _warnings) = extend_split(&mut state, &K_ROOT, 1, true).unwrap();
+        assert_eq!(new.len(), 1);
     }
 
     #[test]
@@ -373,11 +344,10 @@ mod tests {
 
     #[test]
     fn every_m_subset_round_trips_after_extension() {
-        let (shares, state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
-        let sealed = seal_split_state(&K_ROOT, &state).unwrap();
-        let (new_share, _r) = add_trustee(&K_ROOT, &K_ROOT, &sealed, false).unwrap();
+        let (shares, mut state, _w) = split_root(&K_ROOT, 3, Some(5), false).unwrap();
+        let (mut new, _warnings) = extend_split(&mut state, &K_ROOT, 1, false).unwrap();
         let mut all = shares;
-        all.push(new_share);
+        all.append(&mut new);
         // verify_split_roundtrip covers sliding windows; do a full-set check.
         verify_split_roundtrip(&all, &K_ROOT).unwrap();
     }

@@ -1,9 +1,7 @@
 //! carapace-recovery: recovery-via-Chela orchestration (protocol §8).
 //!
-//! Carapace consumes Chela's extendable-split profile through five concerns, one module each:
+//! Carapace consumes Chela's extendable-split profile through four concerns, one module each:
 //!
-//! - [`state_seal`]: AEAD-seal a [`SplitState`] under `HKDF(K_root, "carapace/v1/split-state")`
-//!   (§8.1). A leaked sealed blob reveals nothing without `K_root`.
 //! - [`split`]: split `K_root` (inner circle) and `K_vaultroot(vid)` (scoped, §8.2); extend to
 //!   add a trustee / replace a lost share; the §8.3 issuance cap; owner-side round-trip
 //!   verification (§10.2).
@@ -19,7 +17,6 @@ use zeroize::Zeroizing;
 pub mod ceremony;
 pub mod grant;
 pub mod split;
-pub mod state_seal;
 
 pub use ceremony::{
     build_ceremony_share, open_ceremony_share, open_recovery, verify_recovery_open, CeremonyPhase,
@@ -31,10 +28,9 @@ pub use grant::{
     self_validate_share, share_from_json, share_to_json, verify_attestation, verify_share_grant,
 };
 pub use split::{
-    add_trustee, check_initial_issuance, extend_split, recover_key_from_shares, replace_lost_share,
-    soft_cap, split_root, split_vault, verify_split_roundtrip, PolicyWarning,
+    check_initial_issuance, extend_split, recover_key_from_shares, soft_cap, split_root,
+    split_vault, verify_split_roundtrip, PolicyWarning,
 };
-pub use state_seal::{open_split_state, seal_split_state, SealedSplitState};
 
 /// Every failure mode of the recovery layer. Each wrapped error keeps its source so a caller
 /// can distinguish a bad signature from a wrong-secret from an AEAD failure.
@@ -54,9 +50,7 @@ pub enum RecoveryError {
     Import(chela_share::ImportError),
     /// A BIP-39 entropy<->mnemonic conversion error.
     Bip39(chela_bip39::Bip39Error),
-    /// Split-state AEAD seal failed.
-    Seal,
-    /// Split-state AEAD open failed (wrong `K_root`, tampered blob, or tampered `rsid`/`M`).
+    /// An AEAD open failed (wrong `K_root` or tampered blob), e.g. a ceremony share.
     Open,
     /// A key was not exactly 32 bytes.
     BadKeyLength,
@@ -94,8 +88,7 @@ impl core::fmt::Display for RecoveryError {
             Self::State(e) => write!(f, "chela split-state error: {e}"),
             Self::Import(e) => write!(f, "chela share import error: {e}"),
             Self::Bip39(e) => write!(f, "bip39 error: {e}"),
-            Self::Seal => f.write_str("split-state seal failed"),
-            Self::Open => f.write_str("split-state open failed (wrong K_root or tampered blob)"),
+            Self::Open => f.write_str("AEAD open failed (wrong K_root or tampered blob)"),
             Self::BadKeyLength => f.write_str("key must be exactly 32 bytes"),
             Self::InvalidThreshold => f.write_str("invalid threshold/total: require 2 <= M <= N <= 32"),
             Self::OverSoftCap => f.write_str(

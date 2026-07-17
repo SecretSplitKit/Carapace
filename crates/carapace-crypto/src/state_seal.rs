@@ -53,11 +53,18 @@ impl std::fmt::Display for StateSealError {
 
 impl std::error::Error for StateSealError {}
 
-/// `aad = FORMAT_VERSION ‖ table_name ‖ canonical_redb_key_bytes` (design §3.4).
+/// `aad = FORMAT_VERSION ‖ len(table).be4 ‖ table_name ‖ len(key).be4 ‖ canonical_redb_key_bytes`
+/// (design §3.4). The `table`/`key` parts are LENGTH-PREFIXED so their boundary is
+/// unambiguous: a bare concatenation would let `(table="ab", key="c")` and
+/// `(table="a", key="bc")` produce identical aad, so a row could open under the wrong
+/// (table, key) binding. Today both parts are fixed compile-time constants, but the
+/// prefix removes the footgun for any future variable-length key.
 fn aad(table: &[u8], key: &[u8]) -> Vec<u8> {
-    let mut a = Vec::with_capacity(1 + table.len() + key.len());
+    let mut a = Vec::with_capacity(1 + 4 + table.len() + 4 + key.len());
     a.push(FORMAT_VERSION);
+    a.extend_from_slice(&(table.len() as u32).to_be_bytes());
     a.extend_from_slice(table);
+    a.extend_from_slice(&(key.len() as u32).to_be_bytes());
     a.extend_from_slice(key);
     a
 }
@@ -204,5 +211,14 @@ mod tests {
             !sealed.windows(SECRET.len()).any(|w| w == SECRET),
             "plaintext secret must not appear in the sealed blob"
         );
+    }
+
+    #[test]
+    fn table_key_boundary_is_unambiguous() {
+        // Without length-prefixed aad parts these two splits would share aad bytes and
+        // cross-open. With the prefix, opening under the shifted boundary must fail.
+        let sealed = seal(&K, b"ab", b"c", SECRET).unwrap();
+        assert_eq!(open(&K, b"a", b"bc", &sealed), Err(StateSealError::Open));
+        assert_eq!(&*open(&K, b"ab", b"c", &sealed).unwrap(), SECRET);
     }
 }

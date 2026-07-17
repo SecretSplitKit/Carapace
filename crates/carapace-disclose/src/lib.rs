@@ -312,10 +312,11 @@ impl DisclosureTable {
     /// friends get denied after restart, breaking §7.4 "disclosure is forever."
     ///
     /// Lossless: every `(chunk, audience-user)` authorization round-trips, so the
-    /// audience-arm fetch-gate decides identically after restart. The caller
-    /// seals the returned bytes at rest; no encryption happens here. Entries and
-    /// per-chunk users are sorted, so equal tables encode to identical bytes
-    /// (stable input to the redb persistence funnel).
+    /// audience-arm fetch-gate decides identically after restart. The contents are
+    /// PLAIN - ChunkIDs and audience user PUBKEYS only, no secret - so the persistence
+    /// funnel stores these bytes in the clear (a PLAIN redb row, not a SEAL row); nothing
+    /// here needs sealing. Entries and per-chunk users are sorted, so equal tables encode
+    /// to identical bytes (stable input to the redb persistence funnel).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut chunks: Vec<(&[u8; 32], &HashSet<[u8; 32]>)> = self.by_chunk.iter().collect();
         chunks.sort_unstable_by(|a, b| a.0.cmp(b.0));

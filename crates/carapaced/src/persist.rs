@@ -20,6 +20,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 // Types + serialization helpers reached through the crate root (child modules see the
 // parent's private items and its `use` imports).
@@ -100,6 +101,15 @@ pub(crate) struct R<'a> {
 impl<'a> R<'a> {
     pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
+    }
+    /// A safe pre-allocation size for `n` upcoming elements: capped by the bytes still
+    /// unconsumed (audit #11). Every element consumes at least one byte, so a legitimate
+    /// count can never exceed the remaining length; a hostile length prefix
+    /// (e.g. `0xFFFFFFFF` on an unauthenticated PLAIN row) is clamped to the real input
+    /// size instead of triggering a multi-GB eager `with_capacity` OOM before the loop
+    /// errors on truncation.
+    fn cap(&self, n: usize) -> usize {
+        n.min(self.b.len().saturating_sub(self.pos))
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).context("persist length overflow")?;
@@ -266,7 +276,7 @@ fn enc_set32(w: &mut W, set: &HashSet<[u8; 32]>) {
 }
 fn dec_set32(r: &mut R) -> Result<HashSet<[u8; 32]>> {
     let n = r.len()?;
-    let mut set = HashSet::with_capacity(n);
+    let mut set = HashSet::with_capacity(r.cap(n));
     for _ in 0..n {
         set.insert(r.arr32()?);
     }
@@ -282,7 +292,7 @@ fn enc_map32_32(w: &mut W, m: &HashMap<[u8; 32], [u8; 32]>) {
 }
 fn dec_map32_32(r: &mut R) -> Result<HashMap<[u8; 32], [u8; 32]>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         m.insert(r.arr32()?, r.arr32()?);
     }
@@ -298,7 +308,7 @@ fn enc_map32_u64(w: &mut W, m: &HashMap<[u8; 32], u64>) {
 }
 fn dec_map32_u64(r: &mut R) -> Result<HashMap<[u8; 32], u64>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         m.insert(r.arr32()?, r.u64()?);
     }
@@ -317,11 +327,11 @@ fn enc_map32_veclist(w: &mut W, m: &HashMap<[u8; 32], Vec<[u8; 32]>>) {
 }
 fn dec_map32_veclist(r: &mut R) -> Result<HashMap<[u8; 32], Vec<[u8; 32]>>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let k = r.arr32()?;
         let cnt = r.len()?;
-        let mut v = Vec::with_capacity(cnt);
+        let mut v = Vec::with_capacity(r.cap(cnt));
         for _ in 0..cnt {
             v.push(r.arr32()?);
         }
@@ -339,7 +349,7 @@ fn enc_frame_list<M: Message>(w: &mut W, items: impl Iterator<Item = M>) {
 }
 fn dec_frame_list<M: Message>(r: &mut R) -> Result<Vec<M>> {
     let n = r.len()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(M::decode_frame(r.bytes()?).map_err(|e| anyhow!("decode framed row: {e}"))?);
     }
@@ -357,7 +367,7 @@ fn enc_map32_frame<M: Message>(w: &mut W, m: &HashMap<[u8; 32], M>) {
 }
 fn dec_map32_frame<M: Message>(r: &mut R) -> Result<HashMap<[u8; 32], M>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let k = r.arr32()?;
         m.insert(
@@ -408,7 +418,7 @@ fn enc_refs(w: &mut W, refs: &[AnnounceRef]) {
 }
 fn dec_refs(r: &mut R) -> Result<Vec<AnnounceRef>> {
     let n = r.len()?;
-    let mut v = Vec::with_capacity(n);
+    let mut v = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         v.push(dec_ref(r)?);
     }
@@ -623,7 +633,13 @@ pub(crate) fn persist_all(
     put(&mut t, cat::DISCLOSURE, disclosure.to_bytes())?;
     put(&mut t, cat::POR, por.to_bytes())?;
     put(&mut t, cat::CEREMONIES, enc_ceremonies(ceremonies))?;
-    put(&mut t, cat::CEREMONY_ALARMS, enc_alarms(ceremony_alarms))?;
+    // C1: bound the durable alarm map to qualifying sponsors (unauthenticated dialers
+    // write these, so a stranger's alarm stays RAM-only).
+    put(
+        &mut t,
+        cat::CEREMONY_ALARMS,
+        enc_alarms(ceremony_alarms, held_grants, friends, docs),
+    )?;
     // C1: bound the durable abort map to qualifying signers.
     put(
         &mut t,
@@ -692,9 +708,27 @@ pub(crate) fn persist_all(
 /// RAM mutation and the durable write share one critical section, and calls it BEFORE
 /// any externally visible effect (§3.2.3-4).
 pub(crate) fn commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u8; 32]) {
-    let txn = db.begin_write().expect("begin redb write txn");
-    persist_all(&txn, s, docs, k_root).expect("persist_all");
-    txn.commit().expect("commit redb state txn");
+    if let Err(e) = try_commit_all(db, s, docs, k_root) {
+        // §3.2.5: the daemon DIES on a commit failure - never continue with RAM ahead of
+        // disk. `abort()` (not a panic): a panic here fires while the caller holds the
+        // `shared` write lock, poisoning it and wedging the daemon half-alive on every
+        // later `.expect("shared lock")`. `abort()` takes the whole process down at once,
+        // no unwinding, no poisoned lock.
+        eprintln!(
+            "carapace: FATAL redb state commit failed ({e:#}); aborting the daemon \
+             (design §3.2.5: never continue with RAM ahead of disk)."
+        );
+        std::process::abort();
+    }
+}
+
+/// One durable state commit: open a write txn, persist the whole state, and commit.
+/// Any failure is returned so [`commit_all`] can abort the process loudly.
+fn try_commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u8; 32]) -> Result<()> {
+    let txn = db.begin_write().context("begin redb write txn")?;
+    persist_all(&txn, s, docs, k_root)?;
+    txn.commit().context("commit redb state txn")?;
+    Ok(())
 }
 
 /// Run `f` against a fresh writer and return the bytes.
@@ -753,6 +787,11 @@ fn put_sealed(
     k_root: &[u8; 32],
     plaintext: Vec<u8>,
 ) -> Result<()> {
+    // The category plaintext (share JSON, polynomial bytes, share-grant bodies) is
+    // secret-equivalent. Wrap the caller's buffer (moved in, no copy) so it is WIPED after
+    // sealing rather than left in freed heap - the seal-side edge of audit #10. Covers
+    // every SEAL category, since all of them route through here.
+    let plaintext = Zeroizing::new(plaintext);
     let sealed = state_seal::seal(k_root, SEAL_TABLE, key.as_bytes(), &plaintext)
         .map_err(|e| anyhow!("seal {key}: {e}"))?;
     put(t, key, sealed)
@@ -802,10 +841,39 @@ fn enc_ceremonies(m: &HashMap<[u8; 16], TrackedCeremony>) -> Vec<u8> {
     })
 }
 
-fn enc_alarms(m: &HashMap<[u8; 16], AlarmRecord>) -> Vec<u8> {
+/// C1: a party we have standing to trust - an owner whose share we hold
+/// (`held_grants` subject), an established friend, or ourselves (`docs.card`). Shared by
+/// the abort and alarm bounds: an unauthenticated dispatch from a stranger must never be
+/// able to write a durable row (durable disk-fill DoS otherwise).
+fn signer_qualifies(
+    signer: &[u8; 32],
+    held_grants: &HashMap<[u8; 32], ShareGrant>,
+    friends: &HashMap<[u8; 32], ContactCard>,
+    docs: &DocStore,
+) -> bool {
+    held_grants.contains_key(signer) || friends.contains_key(signer) || docs.card(signer).is_some()
+}
+
+/// C1: persist only alarms whose SPONSOR (the `RecoveryOpen` signer) is a qualifying
+/// party (see [`signer_qualifies`]). A stranger can self-sign a `RecoveryOpen` for any
+/// subject and dial us unauthenticated (`serve_recovery_open`); without this bound each
+/// such open would append an attacker-chosen ~1MiB alarm to disk unbounded. A stranger's
+/// alarm stays RAM-only (still visible to `/api/status` for the session, just not
+/// durable). The subject is deliberately NOT a qualifier: it is public, so an attacker
+/// would just set `subject = our pubkey` to bypass the bound.
+fn enc_alarms(
+    m: &HashMap<[u8; 16], AlarmRecord>,
+    held_grants: &HashMap<[u8; 32], ShareGrant>,
+    friends: &HashMap<[u8; 32], ContactCard>,
+    docs: &DocStore,
+) -> Vec<u8> {
     enc(|w| {
-        w.len(m.len());
-        for (id, a) in m {
+        let rows: Vec<(&[u8; 16], &AlarmRecord)> = m
+            .iter()
+            .filter(|(_, a)| signer_qualifies(&a.sponsor, held_grants, friends, docs))
+            .collect();
+        w.len(rows.len());
+        for (id, a) in rows {
             w.fixed(id);
             w.fixed(&a.subject);
             w.fixed(&a.sponsor);
@@ -818,8 +886,7 @@ fn enc_alarms(m: &HashMap<[u8; 16], AlarmRecord>) -> Vec<u8> {
     })
 }
 
-/// C1: persist only aborts whose signer is a party we have standing to trust -
-/// `held_grants` subjects (owners whose share we hold), established friends, or self.
+/// C1: persist only aborts whose signer is a qualifying party (see [`signer_qualifies`]).
 /// A stranger's abort stays RAM-only so an unauthenticated dispatch cannot fill disk.
 fn enc_aborted(
     m: &HashMap<[u8; 16], Vec<CeremonyAbort>>,
@@ -827,11 +894,8 @@ fn enc_aborted(
     friends: &HashMap<[u8; 32], ContactCard>,
     docs: &DocStore,
 ) -> Vec<u8> {
-    let qualifies = |signer: &[u8; 32]| -> bool {
-        held_grants.contains_key(signer)
-            || friends.contains_key(signer)
-            || docs.card(signer).is_some()
-    };
+    let qualifies =
+        |signer: &[u8; 32]| -> bool { signer_qualifies(signer, held_grants, friends, docs) };
     enc(|w| {
         // First collect rows that have at least one qualifying abort so the count matches.
         let rows: Vec<(&[u8; 16], Vec<&CeremonyAbort>)> = m
@@ -1163,10 +1227,13 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
 
 /// Open a SEAL row under `k_root`. Absent -> `None`; present-but-unopenable -> loud
 /// error (design §3.4/§3.5: never skip a share that will not decrypt).
-fn read_sealed(db: &Database, key: &str, k_root: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+fn read_sealed(db: &Database, key: &str, k_root: &[u8; 32]) -> Result<Option<Zeroizing<Vec<u8>>>> {
     match read_row(db, key)? {
         None => Ok(None),
         Some(sealed) => {
+            // Return the `Zeroizing` buffer state_seal::open produced (do NOT `to_vec()` it
+            // into a plain Vec that drops unwiped): the decoder borrows it and it is wiped
+            // when the caller's binding drops - the read-side edge of audit #10.
             let opened =
                 state_seal::open(k_root, SEAL_TABLE, key.as_bytes(), &sealed).map_err(|e| {
                     anyhow!(
@@ -1174,7 +1241,7 @@ fn read_sealed(db: &Database, key: &str, k_root: &[u8; 32]) -> Result<Option<Vec
                      rather than silently lose secret state"
                 )
                 })?;
-            Ok(Some(opened.to_vec()))
+            Ok(Some(opened))
         }
     }
 }
@@ -1198,7 +1265,7 @@ fn rebuild_share_sets(granted: &HashMap<u64, OwnerGrants>) -> HashMap<u64, Attes
 
 fn dec_friendships(r: &mut R) -> Result<HashMap<[u8; 32], Friendship>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let k = r.arr32()?;
         m.insert(k, dec_friendship(r)?);
@@ -1208,7 +1275,7 @@ fn dec_friendships(r: &mut R) -> Result<HashMap<[u8; 32], Friendship>> {
 
 fn dec_working_dirs(r: &mut R) -> Result<HashMap<[u8; 32], PathBuf>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let k = r.arr32()?;
         m.insert(k, PathBuf::from(dec_str(r)?));
@@ -1218,7 +1285,7 @@ fn dec_working_dirs(r: &mut R) -> Result<HashMap<[u8; 32], PathBuf>> {
 
 fn dec_replica_target(r: &mut R) -> Result<HashMap<[u8; 32], usize>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let k = r.arr32()?;
         m.insert(k, r.u64()? as usize);
@@ -1228,7 +1295,7 @@ fn dec_replica_target(r: &mut R) -> Result<HashMap<[u8; 32], usize>> {
 
 fn dec_held_share_subjects(r: &mut R) -> Result<HashMap<u64, [u8; 32]>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let k = r.u64()?;
         m.insert(k, r.arr32()?);
@@ -1238,7 +1305,7 @@ fn dec_held_share_subjects(r: &mut R) -> Result<HashMap<u64, [u8; 32]>> {
 
 fn dec_ceremonies(r: &mut R) -> Result<HashMap<[u8; 16], TrackedCeremony>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let id = r.arr16()?;
         let state =
@@ -1259,7 +1326,7 @@ fn dec_ceremonies(r: &mut R) -> Result<HashMap<[u8; 16], TrackedCeremony>> {
 
 fn dec_alarms(r: &mut R) -> Result<HashMap<[u8; 16], AlarmRecord>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let id = r.arr16()?;
         let subject = r.arr32()?;
@@ -1287,11 +1354,11 @@ fn dec_alarms(r: &mut R) -> Result<HashMap<[u8; 16], AlarmRecord>> {
 
 fn dec_aborted(r: &mut R) -> Result<HashMap<[u8; 16], Vec<CeremonyAbort>>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let id = r.arr16()?;
         let cnt = r.len()?;
-        let mut v = Vec::with_capacity(cnt);
+        let mut v = Vec::with_capacity(r.cap(cnt));
         for _ in 0..cnt {
             v.push(
                 CeremonyAbort::decode_frame(r.bytes()?)
@@ -1305,12 +1372,12 @@ fn dec_aborted(r: &mut R) -> Result<HashMap<[u8; 16], Vec<CeremonyAbort>>> {
 
 fn dec_pending_resplits(r: &mut R) -> Result<HashMap<u64, PendingResplit>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let rsid = r.u64()?;
         let ex_trustee = r.arr32()?;
         let cnt = r.len()?;
-        let mut suggested = Vec::with_capacity(cnt);
+        let mut suggested = Vec::with_capacity(r.cap(cnt));
         for _ in 0..cnt {
             suggested.push(r.arr32()?);
         }
@@ -1327,10 +1394,10 @@ fn dec_pending_resplits(r: &mut R) -> Result<HashMap<u64, PendingResplit>> {
 
 fn dec_pending_delete_sends(r: &mut R) -> Result<Vec<(Vec<EndpointAddr>, Placement)>> {
     let n = r.len()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         let acount = r.len()?;
-        let mut addrs = Vec::with_capacity(acount);
+        let mut addrs = Vec::with_capacity(r.cap(acount));
         for _ in 0..acount {
             let node = r.arr32()?;
             // Reconstruct a bare-id EndpointAddr; direct addrs resolve via relay/hole-punch.
@@ -1339,7 +1406,7 @@ fn dec_pending_delete_sends(r: &mut R) -> Result<Vec<(Vec<EndpointAddr>, Placeme
             }
         }
         let vcount = r.len()?;
-        let mut replica_vids = Vec::with_capacity(vcount);
+        let mut replica_vids = Vec::with_capacity(r.cap(vcount));
         for _ in 0..vcount {
             replica_vids.push(r.arr32()?);
         }
@@ -1357,12 +1424,12 @@ fn dec_pending_delete_sends(r: &mut R) -> Result<Vec<(Vec<EndpointAddr>, Placeme
 
 fn dec_vault_blob_sources(r: &mut R) -> Result<Vec<VaultBlobSource>> {
     let n = r.len()?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         let vid = r.arr32()?;
         let digest = r.arr32()?;
         let cnt = r.len()?;
-        let mut chunk_ids = Vec::with_capacity(cnt);
+        let mut chunk_ids = Vec::with_capacity(r.cap(cnt));
         for _ in 0..cnt {
             chunk_ids.push(r.arr32()?);
         }
@@ -1373,7 +1440,7 @@ fn dec_vault_blob_sources(r: &mut R) -> Result<Vec<VaultBlobSource>> {
 
 fn dec_held_shares(r: &mut R) -> Result<HashMap<u64, (Share, ShareMonitor)>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let rsid = r.u64()?;
         let share = share_from_json(&dec_str(r)?).map_err(|e| anyhow!("decode held share: {e}"))?;
@@ -1385,13 +1452,13 @@ fn dec_held_shares(r: &mut R) -> Result<HashMap<u64, (Share, ShareMonitor)>> {
 
 fn dec_granted(r: &mut R) -> Result<HashMap<u64, OwnerGrants>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let rsid = r.u64()?;
         let subject = r.arr32()?;
         let recovery_delay = r.u64()?;
         let tcount = r.len()?;
-        let mut trustees = Vec::with_capacity(tcount);
+        let mut trustees = Vec::with_capacity(r.cap(tcount));
         for _ in 0..tcount {
             trustees.push(dec_granted_trustee(r)?);
         }
@@ -1411,7 +1478,7 @@ fn dec_granted(r: &mut R) -> Result<HashMap<u64, OwnerGrants>> {
 
 fn dec_split_states(r: &mut R) -> Result<HashMap<u64, RecoverySet>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let rsid = r.u64()?;
         let scope = dec_scope(r)?;
@@ -1424,7 +1491,7 @@ fn dec_split_states(r: &mut R) -> Result<HashMap<u64, RecoverySet>> {
 
 fn dec_resplits(r: &mut R) -> Result<HashMap<u64, OpenResplit>> {
     let n = r.len()?;
-    let mut m = HashMap::with_capacity(n);
+    let mut m = HashMap::with_capacity(r.cap(n));
     for _ in 0..n {
         let key = r.u64()?;
         let rs = Resplit::from_bytes(r.bytes()?).map_err(|e| anyhow!("decode resplit: {e}"))?;
@@ -1433,23 +1500,23 @@ fn dec_resplits(r: &mut R) -> Result<HashMap<u64, OpenResplit>> {
         let old_rsid = r.u64()?;
         let new_rsid = r.u64()?;
         let npc = r.len()?;
-        let mut new_peers = Vec::with_capacity(npc);
+        let mut new_peers = Vec::with_capacity(r.cap(npc));
         for _ in 0..npc {
             new_peers.push(dec_resplit_peer(r)?);
         }
         let opc = r.len()?;
-        let mut old_peers = Vec::with_capacity(opc);
+        let mut old_peers = Vec::with_capacity(r.cap(opc));
         for _ in 0..opc {
             old_peers.push(dec_resplit_peer(r)?);
         }
         let delivered = dec_set32(r)?;
         let nrc = r.len()?;
-        let mut new_records = Vec::with_capacity(nrc);
+        let mut new_records = Vec::with_capacity(r.cap(nrc));
         for _ in 0..nrc {
             new_records.push(dec_granted_trustee(r)?);
         }
         let rc = r.len()?;
-        let mut roster = HashMap::with_capacity(rc);
+        let mut roster = HashMap::with_capacity(r.cap(rc));
         for _ in 0..rc {
             let k = r.arr32()?;
             roster.insert(k, r.u64()?);

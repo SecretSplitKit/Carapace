@@ -426,6 +426,17 @@ impl AuditTracker {
         }
     }
 
+    /// Update ONLY the cadence scalars (`interval`, `fail_limit`, `wide_every`), KEEPING
+    /// every per-replica round/fail/schedule map (design §10.1 F4). The maintenance loop
+    /// stamps its configured interval at start; using this instead of a fresh
+    /// [`AuditTracker::new`] preserves the round counters `load_all` restored, so a reboot
+    /// never re-issues an already-used (predictable) PoR challenge for a replica.
+    pub fn restamp(&mut self, interval: u64, fail_limit: u32, wide_every: u64) {
+        self.interval = interval;
+        self.fail_limit = fail_limit;
+        self.wide_every = wide_every.max(1);
+    }
+
     /// The current round counter for a replica/vault - use as the audit's `round`
     /// nonce when building the next challenge.
     pub fn round(&self, replica: [u8; 32], vid: [u8; 32]) -> u64 {
@@ -475,8 +486,37 @@ impl AuditTracker {
         outcome: AuditOutcome,
         now: u64,
     ) -> AuditAction {
+        *self.round.entry((replica, vid)).or_insert(0) += 1;
+        self.record_outcome(replica, vid, outcome, now)
+    }
+
+    /// Mark a challenge as ISSUED to `replica` for the current round: advance the round
+    /// counter (the unpredictability nonce) and reschedule. The owner MUST persist this
+    /// BEFORE revealing the challenge on the wire (design §10.1 / audit #6), so a crash
+    /// after the reveal can never re-issue the same - now predictable - round to the same
+    /// replica. Does NOT touch the failure streak: that is judged on the answer via
+    /// [`AuditTracker::record_outcome`]. Callers that both build and grade a challenge
+    /// atomically (no crash window between reveal and grade) can use [`AuditTracker::record`]
+    /// instead, which advances the round and grades in one step.
+    pub fn mark_issued(&mut self, replica: [u8; 32], vid: [u8; 32], now: u64) {
+        *self.round.entry((replica, vid)).or_insert(0) += 1;
+        self.schedule(replica, vid, now);
+    }
+
+    /// Record the CONTENT outcome of an audit whose round was already advanced at issue
+    /// time via [`AuditTracker::mark_issued`]: reschedule and update the consecutive-failure
+    /// streak ONLY (never the round counter, which was committed at issue time). On
+    /// [`AuditOutcome::Pass`] the streak resets; on failure it increments and, at the
+    /// limit, returns [`AuditAction::Lost`] (and resets the streak, since the caller will
+    /// repair and drop the replica).
+    pub fn record_outcome(
+        &mut self,
+        replica: [u8; 32],
+        vid: [u8; 32],
+        outcome: AuditOutcome,
+        now: u64,
+    ) -> AuditAction {
         let key = (replica, vid);
-        *self.round.entry(key).or_insert(0) += 1;
         self.schedule(replica, vid, now);
 
         if outcome.is_pass() {

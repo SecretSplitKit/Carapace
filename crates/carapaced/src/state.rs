@@ -45,6 +45,11 @@ pub struct State {
     /// so a from-seeds test daemon persists nowhere permanent. A reboot test uses
     /// [`State::load_or_generate`] twice against the same dir.
     pub dir: Option<PathBuf>,
+    /// True iff this run FRESHLY generated the identity (neither `node.key` nor
+    /// `root.key` existed before). The daemon's §3.5 startup tripwire uses this to tell a
+    /// genuine first start (an empty `state.redb` is expected) from a WIPED `state.redb`
+    /// beside a surviving identity - the worst variant, where firing loudly matters.
+    pub keys_freshly_generated: bool,
 }
 
 impl State {
@@ -55,12 +60,19 @@ impl State {
         std::fs::create_dir_all(dir).with_context(|| format!("create state dir {dir:?}"))?;
         let passphrase = std::env::var(PASSPHRASE_ENV).ok().map(Zeroizing::new);
         let pass = passphrase.as_ref().map(|p| p.as_bytes());
-        let node_seed = load_or_generate_seed(&dir.join("node.key"), pass)?;
-        let root = load_or_generate_seed(&dir.join("root.key"), pass)?;
+        let node_path = dir.join("node.key");
+        let root_path = dir.join("root.key");
+        // Fresh identity iff NEITHER key existed before this call (a genuine first run).
+        // Captured before `load_or_generate_seed` writes them, so the §3.5 tripwire can
+        // distinguish a first start from a wiped `state.redb` beside a surviving identity.
+        let keys_freshly_generated = !node_path.exists() && !root_path.exists();
+        let node_seed = load_or_generate_seed(&node_path, pass)?;
+        let root = load_or_generate_seed(&root_path, pass)?;
         Ok(Self {
             node_key: SigningKey::from_bytes(&node_seed),
             k_root: Zeroizing::new(root),
             dir: Some(dir.to_path_buf()),
+            keys_freshly_generated,
         })
     }
 
@@ -72,6 +84,9 @@ impl State {
             node_key: SigningKey::from_bytes(&node_seed),
             k_root: Zeroizing::new(k_root),
             dir: None,
+            // Seed-only: this constructor never writes key files, so the §3.5 tripwire for
+            // it keys on the durable `blobs/` presence, not a fresh-identity flag.
+            keys_freshly_generated: false,
         }
     }
 
@@ -83,6 +98,9 @@ impl State {
             node_key: SigningKey::from_bytes(&node_seed),
             k_root: Zeroizing::new(k_root),
             dir: Some(dir.to_path_buf()),
+            // Seed-only (does not write key files): the reboot tests using this rely on
+            // the durable `blobs/` presence for the tripwire, not a fresh-identity flag.
+            keys_freshly_generated: false,
         }
     }
 

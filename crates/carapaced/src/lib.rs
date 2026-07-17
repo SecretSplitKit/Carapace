@@ -1436,8 +1436,27 @@ impl ControlHandler {
             let mut s = self.shared.write().expect("shared lock");
             let now = ceremony_now(&s);
             let is_self = open.subject == self.self_user;
+            // Does the SPONSOR (the RecoveryOpen signer) qualify for a durable alarm?
+            // Mirrors persist::enc_alarms's C1 bound (a stranger's alarm stays RAM-only),
+            // and gates whether a stranger's open may force a full-state redb commit at
+            // all: without it an unauthenticated dialer spraying fresh ceremony ids would
+            // fsync the whole state per dial (I/O-amplification DoS). The subject is NOT a
+            // qualifier - it is public, so an attacker would just set it to our pubkey.
+            let sponsor_qualifies = s.held_grants.contains_key(&open.by)
+                || s.friends.contains_key(&open.by)
+                || self
+                    .docs
+                    .lock()
+                    .expect("docs lock")
+                    .card(&open.by)
+                    .is_some();
+            // Track whether anything DURABLE actually changed, so a no-op open (a re-send,
+            // or a stranger's open we neither alarm-persist nor track) skips the commit.
+            let mut dirty = false;
             // Alarm for every observer, deduped by ceremony id (a re-send never clears
-            // an abort flag). This is what /api/status surfaces.
+            // an abort flag). This is what /api/status surfaces. Only a qualifying-sponsor
+            // alarm is durable (enc_alarms filters the rest), so only that is `dirty`.
+            let alarm_new = !s.ceremony_alarms.contains_key(&open.ceremony_id);
             s.ceremony_alarms
                 .entry(open.ceremony_id)
                 .or_insert_with(|| AlarmRecord {
@@ -1449,6 +1468,9 @@ impl ControlHandler {
                     aborted: false,
                     takeover: false,
                 });
+            if alarm_new && sponsor_qualifies {
+                dirty = true;
+            }
             // A subject-signed abort may have arrived BEFORE this open (fan-out has no
             // ordering, and the same open is re-sent as the claimant's later share
             // request). It is authoritative iff its signer is THIS open's subject - only
@@ -1465,6 +1487,10 @@ impl ControlHandler {
                     al.aborted = true;
                     al.takeover = true;
                 }
+                // A persisted (qualifying) alarm's flags changed.
+                if sponsor_qualifies {
+                    dirty = true;
+                }
             }
             // Trustee role: track (once) and, if the gate is open, seal our share.
             if let Some(grant) = s.held_grants.get(&open.subject).cloned() {
@@ -1479,6 +1505,8 @@ impl ControlHandler {
                             approved: false,
                             takeover: false,
                         });
+                        // A tracked ceremony (persisted, the E4 delay anchor) was created.
+                        dirty = true;
                     }
                 }
                 // Fold in an abort that beat the open: cancel the freshly (or previously)
@@ -1487,6 +1515,7 @@ impl ControlHandler {
                     if let Some(tc) = s.ceremonies.get_mut(&open.ceremony_id) {
                         if tc.state.abort(ab).is_ok() {
                             tc.takeover = true;
+                            dirty = true;
                         }
                     }
                 }
@@ -1508,8 +1537,12 @@ impl ControlHandler {
             // §3.2.3 / §8.5: commit the ceremony tracking (the E4 `first_seen` delay
             // anchor, the alarm, and any beat-the-open abort/takeover flag) BEFORE
             // sending our share, so a reboot cannot forget an abort and later re-track a
-            // fresh, non-aborted ceremony that releases at delay-expiry.
-            self.persist_locked(&s);
+            // fresh, non-aborted ceremony that releases at delay-expiry. Skipped when the
+            // open changed nothing durable (a re-send, or a stranger's RAM-only alarm) so
+            // an unauthenticated dialer cannot force a commit per dial (audit #3).
+            if dirty {
+                self.persist_locked(&s);
+            }
         }
         if let Some(cs) = share_to_send {
             write_msg(send, &cs).await?;
@@ -1965,6 +1998,7 @@ impl Daemon {
         let node_key = state.node_key.clone();
         let user_key = state.user_key();
         let k_root = state.k_root.clone();
+        let keys_freshly_generated = state.keys_freshly_generated;
         let self_user = user_key.verifying_key().to_bytes();
         let self_node = node_key.verifying_key().to_bytes();
 
@@ -1982,14 +2016,22 @@ impl Daemon {
         // Startup order is strict - load BEFORE the router accepts, or a peer could
         // replay a card against an empty store and legitimize it (§3.5).
         let db_path = state_dir.join("state.redb");
-        // Tripwire (§3.5/req 10): blobs present but state.redb absent => a wiped or
-        // mismatched state dir. Warn loudly rather than silently start fresh (which
-        // would re-open the default-deny/rollback/abort vectors).
-        if !persist::db_exists(&db_path) && state_dir.join("blobs").exists() {
+        // Tripwire (§3.5/req 10): state.redb absent beside a SURVIVING durable artifact -
+        // served blobs OR the identity keys (`root.key`/`node.key`). The keys arm catches
+        // the worst variant an audit flagged: intact identity + wiped state (e.g. a pure
+        // trustee holding shares but owning no blobs, whose `state.redb` is lost). Firing
+        // only on a fresh identity would silently start fresh and re-open the
+        // default-deny/rollback/abort/PoR vectors, so guard on `keys_freshly_generated`
+        // to avoid a false positive on a genuine first run.
+        let survivor_present = state_dir.join("blobs").exists()
+            || state_dir.join("root.key").exists()
+            || state_dir.join("node.key").exists();
+        if !persist::db_exists(&db_path) && survivor_present && !keys_freshly_generated {
             eprintln!(
-                "carapace: WARNING blobs/ present but {db_path:?} is absent - starting with EMPTY \
-                 durable state (rollback/abort/PoR history and the fetch gate are reset). If this \
-                 is not a fresh install, restore state.redb before serving."
+                "carapace: WARNING durable artifacts (blobs/ or identity keys) present but \
+                 {db_path:?} is absent - starting with EMPTY durable state (rollback/abort/PoR \
+                 history and the fetch gate are reset). If this is not a fresh install, restore \
+                 state.redb before serving."
             );
         }
         let db = Arc::new(persist::open_db(&db_path)?);
@@ -2152,6 +2194,18 @@ impl Daemon {
         // that vault owner's delegated devices (proved by the card the dialer
         // presents on our control stream) or a current replica-set member from the
         // owner's announce — an arbitrary dialer is refused.
+        // F3 (design §6): persist the freshly minted own-card version floor BEFORE the
+        // router starts accepting, so a peer can never observe a card version that has not
+        // reached disk. Otherwise a crash between the first serve and the startup snapshot
+        // would let the floor rewind and re-mint a version a friend's DocStore already
+        // rejected (clock-rollback self-DoS). The post-relay-probe re-issue is captured by
+        // the `persist_snapshot` after the daemon is built.
+        {
+            let s = shared.read().expect("shared lock");
+            let d = docs.lock().expect("docs lock");
+            persist::commit_all(&db, &s, &d, &k_root);
+        }
+
         let gate_shared = Arc::clone(&shared);
         let events = authorizing_event_sender(move |node, chunk_id| {
             let s = gate_shared.read().expect("shared lock");
@@ -2230,6 +2284,19 @@ impl Daemon {
     /// Count of owner-side recorded recovery split-states (SEAL category, design §3.3).
     pub fn split_state_count(&self) -> usize {
         self.shared.read().expect("shared lock").split_states.len()
+    }
+
+    /// The current PoR round counter (the challenge-unpredictability nonce, §10.1) for
+    /// `(node, vid)`. Test accessor for the audit #1/#6 reboot regression: a reboot must
+    /// resume from this counter, never rewind to a spent round, and the maintenance-loop
+    /// restamp must keep it.
+    #[doc(hidden)]
+    pub fn por_round(&self, node: [u8; 32], vid: [u8; 32]) -> u64 {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .por
+            .round(node, vid)
     }
 
     /// Whether this daemon holds an owned-vault chunk in the owner-gated fetch set
@@ -2830,10 +2897,20 @@ impl Daemon {
         // sync), fall back to `out_root/<vid>` and adopt it as the working dir.
         let out_dir = {
             let mut s = self.shared.write().expect("shared lock");
-            s.working_dirs
+            let adopting = !s.working_dirs.contains_key(vid);
+            let dir = s
+                .working_dirs
                 .entry(*vid)
                 .or_insert_with(|| out_root.join(hex32(vid)))
-                .clone()
+                .clone();
+            // §11 (audit #4): `working_dirs` is a persisted category. When we adopt a new
+            // working dir for a pure receiver's first sync, commit it now - a later
+            // `publish_merged`/`persist_sync_baseline` may not run (a no-op re-sync), and
+            // a lost working dir strands this vault's future edits.
+            if adopting {
+                self.persist_locked(&s);
+            }
+            dir
         };
         reconstruct(&manifest, &store, &keys, &out_dir)?;
         // §11: apply tombstone deletions so a propagated delete removes a file a
@@ -2898,6 +2975,10 @@ impl Daemon {
                 manifest: manifest.clone(),
             },
         );
+        // MAJOR 4 (audit #4): epochs + vault_blobs are persisted categories (vault_keys is
+        // EPH, re-derived at load). Commit the baseline so a post-reboot local edit still
+        // diffs against the incoming state instead of re-minting every file as new.
+        self.persist_locked(&s);
     }
 
     /// §11: adopt an already-merged manifest as this device's new published
@@ -2969,6 +3050,11 @@ impl Daemon {
                 manifest: manifest.clone(),
             },
         );
+        // §11 (audit #4): this inserted persisted gate categories (epochs, owned_chunks
+        // incl. the envelope digest, announces, grants, vault_blobs). Commit them under
+        // the held write lock, or a reboot default-denies our own re-served blobs and
+        // rolls back our own-announce for this vault.
+        self.persist_locked(&s);
         Ok(())
     }
 
@@ -3625,11 +3711,12 @@ impl Daemon {
     /// Add `node` to the owner-side replica deny-list: this daemon will never place
     /// a replica on it, even if it is an established friend (S4).
     pub fn deny_replica_peer(&self, node: [u8; 32]) {
-        self.shared
-            .write()
-            .expect("shared lock")
-            .replica_deny
-            .insert(node);
+        let mut s = self.shared.write().expect("shared lock");
+        s.replica_deny.insert(node);
+        // `replica_deny` is a persisted S4 policy category: commit it so the deny
+        // survives a reboot (audit #5), else a denied peer could be re-placed after
+        // restart.
+        self.persist_locked(&s);
     }
 
     /// S4 owner-side placement gate: a candidate node may be invited only if it is
@@ -3927,17 +4014,23 @@ impl Daemon {
 
         let mut round = PorRound::default();
         for (node, addr) in members {
-            let (due, r, wide) = {
-                let s = self.shared.read().expect("shared lock");
-                (
-                    s.por.due(*node, vid, now),
-                    s.por.round(*node, vid),
-                    s.por.is_wide_round(*node, vid),
-                )
+            // Read the round to issue + the wide flag, then IMMEDIATELY advance and
+            // persist the round counter (a "challenge issued" mark) BEFORE building or
+            // revealing the challenge on the wire (§10.1 / audit #6). Otherwise a crash
+            // after the reveal but before the result is recorded would leave the round
+            // counter at `r`, and the next boot would re-issue the identical - now
+            // observed, hence predictable - challenge to the same replica.
+            let (r, wide) = {
+                let mut s = self.shared.write().expect("shared lock");
+                if !s.por.due(*node, vid, now) {
+                    continue;
+                }
+                let r = s.por.round(*node, vid);
+                let wide = s.por.is_wide_round(*node, vid);
+                s.por.mark_issued(*node, vid, now);
+                self.persist_locked(&s);
+                (r, wide)
             };
-            if !due {
-                continue;
-            }
             let audit = if wide {
                 build_wide_audit(&k_audit, vid, epoch, r, &manifest, WIDE_AUDIT_COVERAGE)
             } else {
@@ -3946,20 +4039,20 @@ impl Daemon {
             // C1: an unreachable replica (connect failed) is a transport failure,
             // not a retention answer - it must never advance the loss streak, or a
             // transiently-offline friend would be evicted without grace. Only a peer
-            // that actually answered is judged on content via `record`.
+            // that actually answered is judged on content via `record_outcome`. The
+            // round counter was already advanced + persisted at issue time above, so
+            // neither branch bumps it again.
             let action = match self.fetch_audit_samples(addr, &audit).await {
                 None => {
                     let mut s = self.shared.write().expect("shared lock");
                     let a = s.por.record_unreachable(*node, vid, now);
-                    // §10.1: persist the advanced PoR round counter so a reboot never
-                    // re-issues an already-used (predictable) challenge for this replica.
                     self.persist_locked(&s);
                     a
                 }
                 Some(responses) => {
                     let outcome = verify_audit_response(&audit, &responses);
                     let mut s = self.shared.write().expect("shared lock");
-                    let a = s.por.record(*node, vid, outcome, now);
+                    let a = s.por.record_outcome(*node, vid, outcome, now);
                     self.persist_locked(&s);
                     a
                 }
@@ -4031,6 +4124,13 @@ impl Daemon {
     /// slack, lifetime issued-share count, and cadence (build it with
     /// [`AttestTracker::new`] for defaults, or `with_params` to tune the round /
     /// freshness intervals).
+    ///
+    /// NON-DURABLE TEST HELPER (audit #9): bypasses the write-through funnel, and
+    /// `share_sets` is a DERIVE category anyway (rebuilt from `granted` at load), so a
+    /// value set here does not survive a reboot. The production path populates
+    /// `share_sets` via `serve_grant`/`rebuild_share_sets`. Kept only for the
+    /// attestation-drift tests.
+    #[doc(hidden)]
     pub fn register_recovery_set(&self, rsid: u64, tracker: AttestTracker) {
         self.shared
             .write()
@@ -4042,6 +4142,12 @@ impl Daemon {
     /// Store a share this daemon holds as a trustee for another owner, enabling it
     /// to answer that owner's `ShareAttestChallenge`s and to run continuous local
     /// CRC self-validation (§10.2). Keyed by the share's recovery-set id.
+    ///
+    /// NON-DURABLE TEST HELPER (audit #9): bypasses the write-through funnel, so the
+    /// stored share is NOT persisted and does not survive a reboot. The production
+    /// trustee path stores + commits held shares in `ControlHandler::serve_grant`. Kept
+    /// only for the attestation-drift tests.
+    #[doc(hidden)]
     pub fn store_share(&self, share: Share) {
         let rsid = u64::from(share.recovery_set_id);
         self.shared
@@ -4270,12 +4376,18 @@ impl Daemon {
         {
             // The loop owns the PoR audit cadence: stamp it at start, before any audit
             // runs, so no accumulated per-replica schedule is discarded mid-flight.
+            // `restamp` updates ONLY the cadence scalars and KEEPS the round/fail/schedule
+            // maps that `load_all` restored - a fresh `AuditTracker::new` here would wipe
+            // the per-(replica,vid) round counters and reopen the §10.1 PoR replay vector
+            // (audit #1).
             let mut s = self.shared.write().expect("shared lock");
-            s.por = AuditTracker::new(
+            s.por.restamp(
                 cfg.por_interval.as_secs(),
                 DEFAULT_POR_FAIL_LIMIT,
                 DEFAULT_WIDE_EVERY,
             );
+            // A persisted category (`por`) changed: commit it before the loop spawns.
+            self.persist_locked(&s);
         }
         let weak: Weak<Self> = Arc::downgrade(&self);
         // Release this strong ref so the loop's Weak never keeps the daemon alive.
@@ -4334,6 +4446,21 @@ impl Daemon {
     pub fn known_announce(&self, vid: &[u8; 32]) -> Option<([u8; 32], u64)> {
         let d = self.docs.lock().expect("docs lock");
         d.announce_for_vid(vid).map(|a| (a.by, a.epoch))
+    }
+
+    /// Test-only: this daemon's own current announce digest (the manifest-envelope
+    /// ChunkID) for `vid`, or `None`. A `publish_merged` inserts this digest into
+    /// `owned_chunks`; used by the audit #4 reboot regression to probe the fetch gate on
+    /// a merge-unique chunk.
+    #[doc(hidden)]
+    pub fn own_announce_digest(&self, vid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .announces
+            .iter()
+            .find(|a| a.vid == *vid)
+            .map(|a| a.digest)
     }
 
     /// Test-only: record `node` as a replica member of `vid` without pushing it the
@@ -4876,16 +5003,24 @@ impl Daemon {
         allow_over_cap: bool,
     ) -> Result<(Vec<String>, Vec<PolicyWarning>)> {
         let mut s = self.shared.write().expect("shared lock");
-        let set = s
-            .split_states
-            .get_mut(&rsid)
-            .context("no recovery split recorded for this recovery-set id")?;
-        let secret = match set.scope {
-            RecoveryScope::Root => self.k_root.clone(),
-            RecoveryScope::Vault(vid) => Zeroizing::new(*kdf::k_vaultroot(&*self.k_root, &vid)),
+        let (shares, warnings) = {
+            let set = s
+                .split_states
+                .get_mut(&rsid)
+                .context("no recovery split recorded for this recovery-set id")?;
+            let secret = match set.scope {
+                RecoveryScope::Root => self.k_root.clone(),
+                RecoveryScope::Vault(vid) => Zeroizing::new(*kdf::k_vaultroot(&*self.k_root, &vid)),
+            };
+            extend_split(&mut set.state, &secret, count, allow_over_cap)
+                .map_err(|e| anyhow::anyhow!("recovery extend failed: {e:?}"))?
         };
-        let (shares, warnings) = extend_split(&mut set.state, &secret, count, allow_over_cap)
-            .map_err(|e| anyhow::anyhow!("recovery extend failed: {e:?}"))?;
+        // `split_states` is a SEAL category and `extend_split` advanced its issued-x
+        // counter. Persist BEFORE returning the new shares (mirroring `recovery_split`),
+        // so a crash cannot rewind the counter and re-issue a byte-identical share at the
+        // same x to a different trustee - which breaks M-of-N distinct-point accounting
+        // and the §9.3 stranding invariant (audit #2).
+        self.persist_locked(&s);
         Ok((shares.iter().map(share_to_json).collect(), warnings))
     }
 
@@ -5281,6 +5416,10 @@ impl Daemon {
                     takeover: false,
                 },
             );
+            // §8.5 (audit #7): ceremonies + ceremony_alarms are persisted. Commit our own
+            // opened ceremony so the E4 delay anchor and alarm survive a reboot mid-flight
+            // (the sponsor's own card qualifies the alarm for durability, C1).
+            self.persist_locked(&s);
         }
         Ok((open, ceremony_id))
     }
@@ -5352,14 +5491,19 @@ impl Daemon {
         };
         ap.sign(&self.user_key);
         let mut s = self.shared.write().expect("shared lock");
-        let tc = s
-            .ceremonies
-            .get_mut(&ceremony_id)
-            .context("unknown ceremony (no RecoveryOpen received)")?;
-        tc.state
-            .approve(&ap)
-            .map_err(|e| anyhow::anyhow!("ceremony approve rejected: {e:?}"))?;
-        tc.approved = true;
+        {
+            let tc = s
+                .ceremonies
+                .get_mut(&ceremony_id)
+                .context("unknown ceremony (no RecoveryOpen received)")?;
+            tc.state
+                .approve(&ap)
+                .map_err(|e| anyhow::anyhow!("ceremony approve rejected: {e:?}"))?;
+            tc.approved = true;
+        }
+        // §8.5 (audit #7): persist our recorded approval so the release gate's approval
+        // count survives a reboot mid-ceremony.
+        self.persist_locked(&s);
         Ok(ap)
     }
 
@@ -5418,6 +5562,9 @@ impl Daemon {
                 al.takeover = true;
             }
         }
+        // §8.5 abort durability (audit #7): persist the takeover/abort flags so a reboot
+        // cannot un-wedge an in-flight recovery this device aborted.
+        self.persist_locked(&s);
         Ok(ab)
     }
 
