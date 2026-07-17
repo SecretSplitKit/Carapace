@@ -617,6 +617,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "notify",
+ "redb",
  "tempfile",
  "tokio",
  "zeroize",

@@ -18,6 +18,7 @@
 //! third party with no `K_content` gets explicit per-chunk keys, never
 //! `K_manifest`.
 
+mod persist;
 mod state;
 
 pub use state::State;
@@ -858,6 +859,13 @@ struct ControlHandler {
     node_key: SigningKey,
     user_key: SigningKey,
     self_user: [u8; 32],
+    /// The user master key (design §3.2): needed to SEAL secret state rows when a
+    /// control handler persists after a mutation (e.g. `serve_grant` storing a share).
+    k_root: Zeroizing<[u8; 32]>,
+    /// The redb source of truth on disk, shared with the owning [`Daemon`]. Control
+    /// handlers commit the WHOLE state through it BEFORE any externally visible effect
+    /// (design §3.2.3), e.g. `serve_share_destroy` commits the removal before the ack.
+    db: Arc<redb::Database>,
     blobs: IrohBlobStore,
     shared: Arc<RwLock<Shared>>,
     /// Default per-friend storage grant (bytes) recorded when this node ACCEPTS a
@@ -878,6 +886,16 @@ struct ControlHandler {
 }
 
 impl ControlHandler {
+    /// Persist the WHOLE `Shared` + `DocStore` in one txn and commit (design §3.2). The
+    /// caller holds the `shared` write lock and passes the guard, so RAM and disk mutate
+    /// in one critical section; the commit happens BEFORE any ack / network effect
+    /// (§3.2.3). `docs` is locked internally (lock order `shared`->`docs`). Fail-loud on
+    /// commit failure.
+    fn persist_locked(&self, s: &Shared) {
+        let docs = self.docs.lock().expect("docs lock");
+        persist::commit_all(&self.db, s, &docs, &self.k_root);
+    }
+
     async fn serve(&self, conn: Connection) -> Result<()> {
         let remote = *conn.remote_id().as_bytes();
         // W6/§6 peer-dialback: if this friend reached us over our own advertised
@@ -1134,6 +1152,11 @@ impl ControlHandler {
             // `befriend` path can agree a different amount explicitly.
             s.friend_grants
                 .insert(requester_user, self.default_grant_bytes);
+            // §3.2.3: commit the friendship (friends/friendships/grant) BEFORE sending
+            // FriendAccept, so a crash cannot leave the requester believing it befriended
+            // a node that forgot the friendship. (Tickets are EPH; a lost single-use
+            // ticket just yields TicketUnknown on retry, §3.3.)
+            self.persist_locked(&s);
             accept
         };
 
@@ -1268,6 +1291,11 @@ impl ControlHandler {
             for h in &stored {
                 s.replica_chunks.insert(*h, inv.vid);
             }
+            // §3.2.3: commit the replica bookkeeping (blobs already durable in FsStore)
+            // BEFORE acking storage, so the owner never records membership for a replica
+            // relationship a crash would erase. Also arms the default-deny fetch gate for
+            // these chunks durably (F1).
+            self.persist_locked(&s);
         }
         // Ack: tell the owner storage is durable before it records membership.
         write_u64(send, count).await?;
@@ -1369,6 +1397,10 @@ impl ControlHandler {
                 // Bind this rsid to its owner so an inbound ShareDestroy naming this
                 // rsid must also name this subject (§9.3 step 3c authorization).
                 s.held_share_subjects.insert(rsid, subject);
+                // §3.2.3: commit the held share/grant BEFORE acking, so a crash can
+                // never ack a grant we did not durably store (the owner treats an
+                // un-acked grant as undelivered and re-delivers).
+                self.persist_locked(&s);
                 true
             }
         };
@@ -1473,6 +1505,11 @@ impl ControlHandler {
                     }
                 }
             }
+            // §3.2.3 / §8.5: commit the ceremony tracking (the E4 `first_seen` delay
+            // anchor, the alarm, and any beat-the-open abort/takeover flag) BEFORE
+            // sending our share, so a reboot cannot forget an abort and later re-track a
+            // fresh, non-aborted ceremony that releases at delay-expiry.
+            self.persist_locked(&s);
         }
         if let Some(cs) = share_to_send {
             write_msg(send, &cs).await?;
@@ -1492,8 +1529,14 @@ impl ControlHandler {
     ) -> Result<()> {
         if ap.verify().is_ok() {
             let mut s = self.shared.write().expect("shared lock");
-            if let Some(tc) = s.ceremonies.get_mut(&ap.ceremony_id) {
-                let _ = tc.state.approve(&ap);
+            let approved = match s.ceremonies.get_mut(&ap.ceremony_id) {
+                Some(tc) => tc.state.approve(&ap).is_ok(),
+                None => false,
+            };
+            if approved {
+                // Persist the folded-in co-trustee approval so the release gate's
+                // approval count survives a reboot mid-ceremony (§8.5).
+                self.persist_locked(&s);
             }
         }
         send.finish()?;
@@ -1529,6 +1572,10 @@ impl ControlHandler {
                     al.takeover = true;
                 }
             }
+            // §8.5 abort durability: persist the recorded abort (bounded to qualifying
+            // signers, C1) + any takeover flag BEFORE finishing, so the abort still blocks
+            // a release after a reboot - even if it arrived before our own RecoveryOpen.
+            self.persist_locked(&s);
         }
         send.finish()?;
         Ok(())
@@ -1575,6 +1622,10 @@ impl ControlHandler {
                     if placed && !td.ex_addrs.is_empty() {
                         s.pending_delete_sends.push((td.ex_addrs, td.placement));
                     }
+                    // §3.2.2: the teardown (friend graph drop, deletes, pending re-split
+                    // marks) + the pending_delete_sends push are ONE compound mutation;
+                    // commit them together so a crash cannot half-apply the unfriend.
+                    self.persist_locked(&s);
                 }
             }
         }
@@ -1605,6 +1656,9 @@ impl ControlHandler {
             match owner {
                 Some(owner_user) => {
                     apply_delete_request(&mut s, &req, &owner_user);
+                    // §3.2.3: commit the deletion of the owner's replica data BEFORE
+                    // acking, so a crash cannot ack a delete we did not durably apply.
+                    self.persist_locked(&s);
                     Some(build_delete_ack(&self.node_key, &req, now))
                 }
                 None => None,
@@ -1656,6 +1710,10 @@ impl ControlHandler {
                 if drop_grant {
                     s.held_grants.remove(&ds.subject);
                 }
+                // §3.2.3 + §9.3 stranding: commit the share REMOVAL BEFORE acking, so a
+                // crash cannot resurrect a "destroyed" share whose ack the owner already
+                // counted (which would leave the old set live past a re-split).
+                self.persist_locked(&s);
                 Some(build_share_destroy_ack(
                     &self.node_key,
                     ds.subject,
@@ -1739,9 +1797,14 @@ pub struct Daemon {
     /// mapped/bound address (§6), from [`NetConfig::relay_host`]. Preferred over the
     /// port-mapper's external address when set (an operator's stable DDNS name).
     relay_host: Option<String>,
-    /// The durable state directory (design §3): holds `blobs/` (FsStore) and, once
-    /// wired, `state.redb`. Retained so background/reboot paths can locate durable state.
+    /// The durable state directory (design §3): holds `blobs/` (FsStore) and
+    /// `state.redb`. Retained so background/reboot paths can locate durable state.
     state_dir: PathBuf,
+    /// The redb source of truth on disk (design §3.2). Every compound mutation funnels
+    /// the WHOLE `Shared` + `DocStore` back through [`persist::persist_all`] into one txn
+    /// and commits BEFORE any externally visible effect. Wrapped in `Arc` so background
+    /// tasks persist without borrowing `self`.
+    db: Arc<redb::Database>,
     /// Cleanup guard for a `from_seeds` daemon's process-unique ephemeral state dir:
     /// `Some` only when `State::dir` was `None`. Removes the whole tree on drop so a
     /// seed-only test daemon leaves nothing behind.
@@ -1829,6 +1892,44 @@ impl Drop for MaintenanceHandle {
 }
 
 impl Daemon {
+    /// Re-derive an owned vault's decrypted [`Manifest`] from the envelope blob in
+    /// FsStore + `K_manifest` (design §3.5/A1). The decoded manifest (paths + `pt_hash`)
+    /// is never persisted in clear, so it is rebuilt at load from the sealed envelope.
+    async fn rederive_manifest(
+        blobs: &IrohBlobStore,
+        k_root: &[u8; 32],
+        vid: [u8; 32],
+        digest: [u8; 32],
+    ) -> Result<Manifest> {
+        let env_bytes = blobs
+            .get_bytes(digest)
+            .await
+            .with_context(|| format!("manifest envelope {} absent from FsStore", hex32(&digest)))?;
+        let envelope = ManifestEnvelope::from_bytes(&env_bytes)?;
+        let vkeys = VaultKeys::derive(k_root, vid);
+        let manifest = open_envelope(&envelope, &vkeys.k_manifest)?;
+        ensure!(manifest.vid == vid, "re-derived manifest vid mismatch");
+        Ok(manifest)
+    }
+
+    /// Persist the WHOLE `Shared` + `DocStore` in one redb txn and commit it (design
+    /// §3.2). The caller MUST already hold the `shared` write lock and pass the guard so
+    /// the RAM mutation and the durable write share one critical section (§3.2.4). A
+    /// commit failure CRASHES the daemon (§3.2.5 fail-loud: never continue with RAM ahead
+    /// of disk). Commit happens BEFORE any externally visible effect at every call site
+    /// (§3.2.3). `docs` is locked internally (lock order: `shared` then `docs`).
+    fn persist_locked(&self, s: &Shared) {
+        let docs = self.docs.lock().expect("docs lock");
+        self.persist_locked_with(s, &docs);
+    }
+
+    /// As [`persist_locked`] but for a caller that already holds the `docs` lock too
+    /// (e.g. a control handler that just mutated the `DocStore`), preserving the single
+    /// `shared`->`docs` lock order.
+    fn persist_locked_with(&self, s: &Shared, docs: &DocStore) {
+        persist::commit_all(&self.db, s, docs, &self.k_root);
+    }
+
     /// Bind the endpoint from `state`, start serving the blob store and the
     /// `carapace/1` control protocol, and publish this device's `ContactCard`
     /// (with a user-signed delegation of the node key). Uses the default
@@ -1877,10 +1978,29 @@ impl Daemon {
             }
         };
 
-        // The friend/replica state the relay's access gate and the daemon's
-        // handlers share. Created up front so the relay can be friend-gated
-        // against the live friend set (C1).
-        let shared = Arc::new(RwLock::new(Shared::default()));
+        // Open the durable state (design §3.2/§3.5): the redb source of truth on disk.
+        // Startup order is strict - load BEFORE the router accepts, or a peer could
+        // replay a card against an empty store and legitimize it (§3.5).
+        let db_path = state_dir.join("state.redb");
+        // Tripwire (§3.5/req 10): blobs present but state.redb absent => a wiped or
+        // mismatched state dir. Warn loudly rather than silently start fresh (which
+        // would re-open the default-deny/rollback/abort vectors).
+        if !persist::db_exists(&db_path) && state_dir.join("blobs").exists() {
+            eprintln!(
+                "carapace: WARNING blobs/ present but {db_path:?} is absent - starting with EMPTY \
+                 durable state (rollback/abort/PoR history and the fetch gate are reset). If this \
+                 is not a fresh install, restore state.redb before serving."
+            );
+        }
+        let db = Arc::new(persist::open_db(&db_path)?);
+        let loaded = persist::load_all(&db, &k_root)?;
+        let card_version_floor = loaded.card_version;
+        let vault_blob_sources = loaded.vault_blob_sources;
+
+        // The friend/replica state the relay's access gate and the daemon's handlers
+        // share, populated from disk (EPH fields default; rebuilt below/on reconnect).
+        // Created up front so the relay can be friend-gated against the live friend set (C1).
+        let shared = Arc::new(RwLock::new(loaded.shared));
 
         // Run the embedded relay first (if requested) so its URL can be folded
         // into both the endpoint's relay set (as this node's home relay) and the
@@ -1933,26 +2053,61 @@ impl Daemon {
         // surviving restart. Blobs are already ciphertext, so no extra sealing.
         let blobs = IrohBlobStore::load(&state_dir.join("blobs")).await?;
 
+        // DERIVE (design §3.5/A1): re-derive each owned vault's decrypted `Manifest` from
+        // the envelope in FsStore + `K_manifest` (never persisted in clear). A vault whose
+        // envelope is absent/unopenable is left out - it becomes needs-refetch and the
+        // owner can republish from its working dir (reconciliation, not a startup abort).
+        // The FsStore fetch is async, so re-derive OFF the lock, then insert under it.
+        let mut rebuilt_vaults = Vec::new();
+        for (vid, digest, chunk_ids) in vault_blob_sources {
+            match Self::rederive_manifest(&blobs, &k_root, vid, digest).await {
+                Ok(manifest) => {
+                    // EPH rebuild (§3.3): re-derive the per-chunk keys from the manifest's
+                    // pt_hash + K_content so a post-reboot disclose/republish works without
+                    // re-ingesting. Never persisted (a key dump).
+                    let vkeys = VaultKeys::derive(&*k_root, vid);
+                    let keys = chunk_keys_from_manifest(&manifest, &*vkeys.k_content);
+                    rebuilt_vaults.push((vid, digest, chunk_ids, manifest, keys));
+                }
+                Err(e) => eprintln!(
+                    "carapace: WARNING vault {} manifest could not be re-derived at startup \
+                     ({e}); marked needs-refetch (republish or anti-entropy will repair)",
+                    hex32(&vid)
+                ),
+            }
+        }
+        {
+            let mut s = shared.write().expect("shared lock");
+            for (vid, digest, chunk_ids, manifest, keys) in rebuilt_vaults {
+                s.vault_keys.insert(vid, keys);
+                s.vault_blobs.insert(
+                    vid,
+                    VaultBlobs {
+                        digest,
+                        chunk_ids,
+                        manifest,
+                    },
+                );
+            }
+        }
+
         // This device's ContactCard starts WITHOUT a relay URL (W6/§6: a relay is
         // never advertised unconditionally at startup). The advertise happens only
         // after a liveness probe confirms the relay is up - the initial
-        // `drive_relay_health` below, then every maintenance round. `relay_url`
-        // stays in lockstep with `relay_health.advertised_url`, so each
-        // advertise/withdraw is a card re-issue with a bumped monotonic version.
+        // `drive_relay_health` below, then every maintenance round.
         let mut card = build_card(&user_key, &node_key, &k_root, None);
-        // W6 rollback survival: seed the OWN card's initial version from a
-        // wall-clock floor (unix seconds) rather than 1. All state is in-memory,
-        // so a restart would otherwise re-issue at v1 and every relay flap the
-        // prior run made (each +1) would leave friends' DocStore rejecting the
-        // fresh card as a rollback (§6). A later restart's base (a larger
-        // timestamp) exceeds the prior run's flap-bumped versions in the common
-        // case (elapsed seconds >> number of flaps); the residual (rapid restart
-        // under heavy flapping) needs a persisted counter, deferred with the rest
-        // of in-memory-state persistence (see docs/spec-errata.md, W6).
-        card.version = unix_now();
+        // F3 (design §3.5): the own-card version is a persisted monotonic counter. On
+        // boot the fresh card is minted at `max(unix_now(), persisted + 1)` so it
+        // STRICTLY exceeds every version the prior run reached (even a rapid restart
+        // under heavy relay flapping), and a friend's DocStore never rejects it as a
+        // rollback (§6). The wall-clock floor keeps versions human-meaningful.
+        card.version = unix_now().max(card_version_floor.saturating_add(1));
         card.sign(&user_key);
         {
             let mut s = shared.write().expect("shared lock");
+            // Replace any persisted prior own card (do NOT accumulate duplicates across
+            // reboots); the friend arm keys on `friends`, `cards` holds only own cards.
+            s.cards.retain(|c| c.by != self_user);
             s.cards.push(card);
             s.rate = RateLimiter::new(limits.rate_capacity, limits.rate_refill_per_sec);
             s.relay_health.local_url = local_relay_url;
@@ -1960,8 +2115,9 @@ impl Daemon {
 
         // The rollback-guarded document store, shared between the daemon's own pull
         // path (`sync_from`) and the accept handler's `serve_docs` so learned docs are
-        // re-served during anti-entropy (store-and-forward, §6/W7).
-        let docs = Arc::new(Mutex::new(DocStore::new()));
+        // re-served during anti-entropy (store-and-forward, §6/W7). Loaded from disk so
+        // the §6 rollback high-water marks survive restart.
+        let docs = Arc::new(Mutex::new(loaded.docs));
 
         let hello = Hello {
             protocol: 1,
@@ -1973,6 +2129,8 @@ impl Daemon {
             node_key: node_key.clone(),
             user_key: user_key.clone(),
             self_user,
+            k_root: k_root.clone(),
+            db: Arc::clone(&db),
             blobs: blobs.clone(),
             shared: Arc::clone(&shared),
             default_grant_bytes: limits.quota_bytes,
@@ -2022,6 +2180,7 @@ impl Daemon {
             relay,
             relay_host: cfg.relay_host,
             state_dir,
+            db,
             _ephemeral_dir: ephemeral_dir,
             _router: router,
         };
@@ -2035,12 +2194,52 @@ impl Daemon {
             daemon.drive_relay_health(alive);
         }
 
+        // Persist the startup snapshot so the F3 own-card version floor (bumped above,
+        // and possibly again by the relay-health card re-issue) reaches disk, and any
+        // load-time normalization (own-card dedupe, share_sets rebuild) is captured.
+        daemon.persist_snapshot();
+
         Ok(daemon)
+    }
+
+    /// Persist the current in-RAM state (a read-lock snapshot). Used at startup and by
+    /// mutation paths that do not already hold the `shared` write lock across the commit.
+    fn persist_snapshot(&self) {
+        let s = self.shared.read().expect("shared lock");
+        self.persist_locked(&s);
     }
 
     /// This device's node id (= iroh endpoint id).
     pub fn node_id(&self) -> [u8; 32] {
         self.ep.node_id()
+    }
+
+    /// The current own-card version (F3 monotonic counter); strictly increases across
+    /// a restart (design §6/F3).
+    pub fn own_card_version(&self) -> u64 {
+        let s = self.shared.read().expect("shared lock");
+        let self_user = self.user_id();
+        s.cards
+            .iter()
+            .filter(|c| c.by == self_user)
+            .map(|c| c.version)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Count of owner-side recorded recovery split-states (SEAL category, design §3.3).
+    pub fn split_state_count(&self) -> usize {
+        self.shared.read().expect("shared lock").split_states.len()
+    }
+
+    /// Whether this daemon holds an owned-vault chunk in the owner-gated fetch set
+    /// (design §3.5 default-deny gate, armed from persisted state after a reboot).
+    pub fn owns_chunk(&self, chunk_id: &[u8; 32]) -> bool {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .owned_chunks
+            .contains_key(chunk_id)
     }
 
     /// The durable state directory (design §3): root of `blobs/` (FsStore) and, once
@@ -2198,6 +2397,13 @@ impl Daemon {
             s.announces.push(ann);
             s.grants.retain(|g| g.vid != vid);
             s.grants.push(grant);
+            // §3.2.2-3: commit the whole publish (epoch bump, owned_chunks, vault_blobs,
+            // announce, grant) as ONE txn BEFORE pushing the new epoch to replicas, so a
+            // crash can never leave replicas ahead of our own committed epoch line, and
+            // the default-deny fetch gate is armed durably for the new chunks (F1).
+            // vault_keys is EPH (never persisted; re-derived on demand), so it is fine
+            // that it is inserted here but not in the funnel.
+            self.persist_locked(&s);
 
             // §11: the new epoch must reach the CURRENT enrolled replica set, or those
             // replicas keep serving the stale placement-time epoch and §10.1 read
@@ -2466,6 +2672,10 @@ impl Daemon {
                 learn_card_hints(&hints, card).await;
             }
         }
+        // §6: persist the DocStore rollback high-water marks (and any friend-card
+        // refresh) so a replayed old card is still rejected after a reboot. A whole-state
+        // snapshot; the docs + friends updates above are already applied in RAM.
+        self.persist_snapshot();
 
         // W8/§7.4 a: when the blobs live on a different peer (a replica), first
         // authenticate to that peer's control stream so it can classify us as a
@@ -2938,6 +3148,9 @@ impl Daemon {
             s.friend_grants
                 .insert(acceptor_user, grant_bytes.unwrap_or(DEFAULT_QUOTA_BYTES));
             s.peer_addrs.insert(peer_node, peer_addr);
+            // Commit the friendship before returning it to the caller (the acceptor
+            // already committed its side in serve_friend_accept). peer_addrs is EPH.
+            self.persist_locked(&s);
         }
         // §6: learn the acceptor's card hints (relay + direct addrs) for later
         // dials (anti-entropy, PoR probes) by node id.
@@ -2973,7 +3186,11 @@ impl Daemon {
             if !s.friends.contains_key(&ex_user) && !s.friendships.contains_key(&ex_user) {
                 return Ok(UnfriendOutcome::default());
             }
-            teardown_unfriended_state(&mut s, ex_user)
+            let td = teardown_unfriended_state(&mut s, ex_user);
+            // §3.2.2-3: commit the whole teardown (friend graph drop, deletes, pending
+            // re-split marks) BEFORE signing/sending the FriendshipEnd + DeleteRequests.
+            self.persist_locked(&s);
+            td
         };
 
         // §9.3 step 1: sign a FriendshipEnd (effective for us on send) and push it plus
@@ -3155,6 +3372,8 @@ impl Daemon {
             let mut s = self.shared.write().expect("shared lock");
             s.pending_resplits.remove(&old_rsid);
             s.resplits.entry(old_rsid).or_insert(open);
+            // Commit the stood-up re-split (pending -> open) before driving it over the wire.
+            self.persist_locked(&s);
         }
 
         self.drive_resplit(old_rsid).await;
@@ -3170,7 +3389,13 @@ impl Daemon {
     async fn drive_pending_delete_sends(&self) {
         let batches: Vec<(Vec<EndpointAddr>, Placement)> = {
             let mut s = self.shared.write().expect("shared lock");
-            std::mem::take(&mut s.pending_delete_sends)
+            let taken = std::mem::take(&mut s.pending_delete_sends);
+            if !taken.is_empty() {
+                // Commit the drained queue so a crash mid-send does not resurrect the
+                // batch and double-send DeleteRequests (harmless but avoidable).
+                self.persist_locked(&s);
+            }
+            taken
         };
         for (addrs, placement) in batches {
             let reqs = build_delete_requests(&self.node_key, &placement);
@@ -3231,6 +3456,9 @@ impl Daemon {
                     if let Some(o) = s.resplits.get_mut(&old_rsid) {
                         o.delivered.extend(newly_delivered);
                     }
+                    // §3.2.3: commit the delivered-grant set before the next drive treats
+                    // those trustees as done (a crash must not re-deliver a stale grant).
+                    self.persist_locked(&s);
                 }
 
                 // (b) Challenge the not-yet-attested new trustees for liveness.
@@ -3267,6 +3495,9 @@ impl Daemon {
                                 let _ = o.rs.record_attestation(att, &challenge);
                             }
                         }
+                        // Commit the folded-in attestations so the new-set-live progress
+                        // (which gates the destroy step) survives a reboot.
+                        self.persist_locked(&s);
                     }
                 }
             }
@@ -3304,12 +3535,18 @@ impl Daemon {
                             let _ = o.rs.record_destroy_ack(ack);
                         }
                     }
+                    // §3.2.3: commit the recorded destroy-acks before treating the old
+                    // shares as gone (a crash must not re-issue a destroy already acked).
+                    self.persist_locked(&s);
                 }
                 // §9.3 step 4: once every old honest trustee has destroy-acked the
                 // re-split is Complete - register the NEW set as the active recovery set.
                 {
                     let mut s = self.shared.write().expect("shared lock");
                     register_completed_resplit(&mut s, old_rsid);
+                    // Commit the promotion of the new set to active (granted/split_states
+                    // updated, the old resplit removed) as one txn.
+                    self.persist_locked(&s);
                 }
             }
             ResplitPhase::Complete => {
@@ -3317,6 +3554,7 @@ impl Daemon {
                 // set is registered. Idempotent - a no-op once `registered` is set.
                 let mut s = self.shared.write().expect("shared lock");
                 register_completed_resplit(&mut s, old_rsid);
+                self.persist_locked(&s);
             }
         }
     }
@@ -3463,6 +3701,9 @@ impl Daemon {
             }
             s.replica_target.insert(vid, r);
             reannounce(&mut s, vid, self.node_id(), &self.node_key);
+            // Persist the recorded replica set (members, target, re-announce) so the
+            // placement + its fetch-gate membership survive restart.
+            self.persist_locked(&s);
         }
         Ok(placed)
     }
@@ -3550,6 +3791,9 @@ impl Daemon {
                 }
             }
             reannounce(&mut s, vid, self.node_id(), &self.node_key);
+            // Persist the repaired member set + re-announce so the new placement (and its
+            // fetch-gate membership) survives restart.
+            self.persist_locked(&s);
         }
         Ok(true)
     }
@@ -3706,12 +3950,18 @@ impl Daemon {
             let action = match self.fetch_audit_samples(addr, &audit).await {
                 None => {
                     let mut s = self.shared.write().expect("shared lock");
-                    s.por.record_unreachable(*node, vid, now)
+                    let a = s.por.record_unreachable(*node, vid, now);
+                    // §10.1: persist the advanced PoR round counter so a reboot never
+                    // re-issues an already-used (predictable) challenge for this replica.
+                    self.persist_locked(&s);
+                    a
                 }
                 Some(responses) => {
                     let outcome = verify_audit_response(&audit, &responses);
                     let mut s = self.shared.write().expect("shared lock");
-                    s.por.record(*node, vid, outcome, now)
+                    let a = s.por.record(*node, vid, outcome, now);
+                    self.persist_locked(&s);
+                    a
                 }
             };
             match action {
@@ -4208,6 +4458,9 @@ impl Daemon {
             .map_err(|e| anyhow::anyhow!("build grant: {e}"))?;
         // Authorize this audience for exactly these chunks in the blob-read gate.
         s.disclosure.record(&grant, &body);
+        // Persist the disclosure table so the audience arm of the (default-deny) fetch
+        // gate still admits this grant's audience after a reboot (§3.5 F1).
+        self.persist_locked(&s);
         Ok(grant)
     }
 
@@ -4602,11 +4855,13 @@ impl Daemon {
         }
         .map_err(|e| anyhow::anyhow!("recovery split failed: {e:?}"))?;
         let jsons = shares.iter().map(share_to_json).collect();
-        self.shared
-            .write()
-            .expect("shared lock")
-            .split_states
-            .insert(rsid, RecoverySet { scope, state });
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            s.split_states.insert(rsid, RecoverySet { scope, state });
+            // Persist the SEALed split-state so `recovery_extend` can extend the same
+            // polynomial after a restart (design §3.3).
+            self.persist_locked(&s);
+        }
         Ok((jsons, warnings))
     }
 
@@ -4772,6 +5027,9 @@ impl Daemon {
                     refs,
                 },
             );
+            // Persist the owner-side split record (SEALed split-state + granted shares)
+            // before returning; share_sets is rebuilt from `granted` on reload.
+            self.persist_locked(&s);
         }
         Ok(report)
     }
@@ -4879,9 +5137,17 @@ impl Daemon {
                     s.peer_last_seen.insert(r.node, seen);
                 }
             }
-            if let Some(g) = s.granted.get_mut(&rsid) {
+            let updated = if let Some(g) = s.granted.get_mut(&rsid) {
                 g.trustees = new_records;
                 g.refs = refs;
+                true
+            } else {
+                false
+            };
+            if updated {
+                // Persist the refreshed grant set (SEALed) so the advanced announce refs
+                // + delivery flags survive a restart mid-refresh.
+                self.persist_locked(&s);
             }
             refreshed.push(rsid);
         }
