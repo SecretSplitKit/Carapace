@@ -26,6 +26,74 @@ use ed25519_dalek::SigningKey;
 
 use crate::FriendError;
 
+/// Format tag for [`Resplit::to_bytes`]; bump on any layout change.
+const SERIAL_VERSION: u8 = 1;
+
+fn phase_tag(p: ResplitPhase) -> u8 {
+    match p {
+        ResplitPhase::AwaitingNewSet => 0,
+        ResplitPhase::ReadyToDestroy => 1,
+        ResplitPhase::Complete => 2,
+    }
+}
+
+fn phase_from_tag(t: u8) -> Result<ResplitPhase, FriendError> {
+    match t {
+        0 => Ok(ResplitPhase::AwaitingNewSet),
+        1 => Ok(ResplitPhase::ReadyToDestroy),
+        2 => Ok(ResplitPhase::Complete),
+        _ => Err(FriendError::Corrupt),
+    }
+}
+
+/// Minimal big-endian cursor over persisted bytes. Every read is bounds-checked
+/// and maps a short/invalid buffer to [`FriendError::Corrupt`].
+struct Reader<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], FriendError> {
+        let end = self.pos.checked_add(n).ok_or(FriendError::Corrupt)?;
+        let slice = self.b.get(self.pos..end).ok_or(FriendError::Corrupt)?;
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, FriendError> {
+        Ok(self.take(1)?[0])
+    }
+    fn bool(&mut self) -> Result<bool, FriendError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(FriendError::Corrupt),
+        }
+    }
+    fn u32(&mut self) -> Result<u32, FriendError> {
+        let a: [u8; 4] = self.take(4)?.try_into().map_err(|_| FriendError::Corrupt)?;
+        Ok(u32::from_be_bytes(a))
+    }
+    fn u64(&mut self) -> Result<u64, FriendError> {
+        let a: [u8; 8] = self.take(8)?.try_into().map_err(|_| FriendError::Corrupt)?;
+        Ok(u64::from_be_bytes(a))
+    }
+    fn array32(&mut self) -> Result<[u8; 32], FriendError> {
+        self.take(32)?.try_into().map_err(|_| FriendError::Corrupt)
+    }
+    /// Reject trailing bytes: a well-formed buffer must be fully consumed.
+    fn finish(self) -> Result<(), FriendError> {
+        if self.pos == self.b.len() {
+            Ok(())
+        } else {
+            Err(FriendError::Corrupt)
+        }
+    }
+}
+
 /// Where the re-split completion sequence stands (§9.3 step 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResplitPhase {
@@ -263,6 +331,92 @@ impl Resplit {
             .map(|t| &t.user)
     }
 
+    /// Serialize the complete machine to a deterministic, lossless byte string
+    /// for durable persistence (redb funnel, see the durable-persistence design).
+    /// Every field is captured; decoding with [`Resplit::from_bytes`] reconstructs
+    /// the machine byte-for-byte. The caller seals these bytes at rest - this
+    /// method does **not** encrypt.
+    ///
+    /// Layout (all multi-byte integers big-endian, to match the wire crate):
+    /// `[version:1][subject:32][m:1][slack:1][new_rsid:8][old_rsid:8][phase:1]`
+    /// `[new_len:4][ NewTrustee{user:32,card_number:8,attested:1} ]*`
+    /// `[old_len:4][ OldTrustee{user:32,destroyed:1} ]*`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(56 + self.new_set.len() * 41 + 4 + self.old_set.len() * 33);
+        out.push(SERIAL_VERSION);
+        out.extend_from_slice(&self.subject);
+        out.push(self.m);
+        out.push(self.slack);
+        out.extend_from_slice(&self.new_rsid.to_be_bytes());
+        out.extend_from_slice(&self.old_rsid.to_be_bytes());
+        out.push(phase_tag(self.phase));
+        // new_set: length-prefixed, order preserved.
+        out.extend_from_slice(&(self.new_set.len() as u32).to_be_bytes());
+        for t in &self.new_set {
+            out.extend_from_slice(&t.user);
+            out.extend_from_slice(&t.card_number.to_be_bytes());
+            out.push(u8::from(t.attested));
+        }
+        // old_set: length-prefixed, order preserved.
+        out.extend_from_slice(&(self.old_set.len() as u32).to_be_bytes());
+        for t in &self.old_set {
+            out.extend_from_slice(&t.user);
+            out.push(u8::from(t.destroyed));
+        }
+        out
+    }
+
+    /// Reconstruct a machine previously produced by [`Resplit::to_bytes`]. Returns
+    /// [`FriendError::Corrupt`] if the bytes are truncated, carry an unknown
+    /// version or phase tag, hold a non-boolean flag, or leave trailing bytes.
+    pub fn from_bytes(b: &[u8]) -> Result<Resplit, FriendError> {
+        let mut r = Reader::new(b);
+        if r.u8()? != SERIAL_VERSION {
+            return Err(FriendError::Corrupt);
+        }
+        let subject = r.array32()?;
+        let m = r.u8()?;
+        let slack = r.u8()?;
+        let new_rsid = r.u64()?;
+        let old_rsid = r.u64()?;
+        let phase = phase_from_tag(r.u8()?)?;
+
+        let new_len = r.u32()? as usize;
+        let mut new_set = Vec::with_capacity(new_len.min(1024));
+        for _ in 0..new_len {
+            let user = r.array32()?;
+            let card_number = r.u64()?;
+            let attested = r.bool()?;
+            new_set.push(NewTrustee {
+                user,
+                card_number,
+                attested,
+            });
+        }
+
+        let old_len = r.u32()? as usize;
+        let mut old_set = Vec::with_capacity(old_len.min(1024));
+        for _ in 0..old_len {
+            let user = r.array32()?;
+            let destroyed = r.bool()?;
+            old_set.push(OldTrustee { user, destroyed });
+        }
+
+        r.finish()?;
+        Ok(Resplit {
+            subject,
+            m,
+            slack,
+            new_rsid,
+            old_rsid,
+            new_set,
+            old_set,
+            phase,
+        })
+    }
+
     /// A snapshot for display (§9.3 step 4).
     #[must_use]
     pub fn progress(&self) -> ResplitProgress {
@@ -478,6 +632,142 @@ mod tests {
         assert!(matches!(
             rs.record_attestation(&att, &challenge),
             Err(FriendError::WrongSet)
+        ));
+    }
+
+    // Persistence: a mid-flight machine (partial attestations, not yet live)
+    // survives a serialize/deserialize round-trip byte-for-byte and drives forward
+    // identically to Complete afterwards (durable-persistence design, redb funnel).
+    #[test]
+    fn resplit_round_trips_mid_flight() {
+        let owner = key(3);
+        let subject = pk(&key(5));
+
+        let new_trustee_keys: Vec<SigningKey> = (0..N).map(|i| key(20 + i)).collect();
+        let new_trustees: Vec<[u8; 32]> = new_trustee_keys.iter().map(pk).collect();
+        let old_honest: Vec<SigningKey> = (0..4).map(|i| key(10 + i)).collect();
+        let old_remaining: Vec<[u8; 32]> = old_honest.iter().map(pk).collect();
+        let old_rsid = 42;
+
+        let (mut rs, new_shares, _grants, _state) = Resplit::begin(
+            &owner,
+            &K_ROOT,
+            subject,
+            M,
+            N,
+            SLACK,
+            false,
+            old_rsid,
+            old_remaining,
+            new_trustees,
+            72 * 3600,
+        )
+        .unwrap();
+
+        // Mid-flight: record 2 of 5 attestations. M+SLACK=4, so still AwaitingNewSet.
+        for i in 0..2 {
+            let challenge = build_attest_challenge(&owner, subject, rs.new_rsid(), [i as u8; 16]);
+            let att =
+                answer_attest_challenge(&new_trustee_keys[i], &challenge, &new_shares[i]).unwrap();
+            rs.record_attestation(&att, &challenge).unwrap();
+        }
+        assert_eq!(rs.phase(), ResplitPhase::AwaitingNewSet);
+        assert_eq!(rs.progress().new_attested, 2);
+
+        // Round-trip.
+        let bytes = rs.to_bytes();
+        let restored = Resplit::from_bytes(&bytes).unwrap();
+
+        // Byte-for-byte: re-serializing the restored machine yields identical bytes,
+        // which fails if any field were dropped or reordered.
+        assert_eq!(restored.to_bytes(), bytes);
+        // Same phase and progress snapshot.
+        assert_eq!(restored.phase(), rs.phase());
+        assert_eq!(restored.progress(), rs.progress());
+        assert_eq!(restored.new_rsid(), rs.new_rsid());
+        // Same pending rosters (order preserved).
+        let pending_new_before: Vec<[u8; 32]> = rs.pending_new().copied().collect();
+        let pending_new_after: Vec<[u8; 32]> = restored.pending_new().copied().collect();
+        assert_eq!(pending_new_after, pending_new_before);
+        let pending_old_before: Vec<[u8; 32]> = rs.pending_old().copied().collect();
+        let pending_old_after: Vec<[u8; 32]> = restored.pending_old().copied().collect();
+        assert_eq!(pending_old_after, pending_old_before);
+
+        // Drive the RESTORED machine forward to completion. This exercises the
+        // recovered per-trustee card numbers (S6 echo check) and destroy rosters.
+        let mut restored = restored;
+        // Old shares cannot be destroyed yet - still below live.
+        assert!(matches!(
+            restored.share_destroy(&owner),
+            Err(FriendError::NewSetNotLive)
+        ));
+        // Attest trustees 2 and 3 -> 4 attested -> live -> ReadyToDestroy.
+        for i in 2..4 {
+            let challenge =
+                build_attest_challenge(&owner, subject, restored.new_rsid(), [i as u8; 16]);
+            let att =
+                answer_attest_challenge(&new_trustee_keys[i], &challenge, &new_shares[i]).unwrap();
+            restored.record_attestation(&att, &challenge).unwrap();
+        }
+        assert_eq!(restored.phase(), ResplitPhase::ReadyToDestroy);
+
+        // Destroy the old honest set -> Complete.
+        let destroy = restored.share_destroy(&owner).unwrap();
+        destroy.verify().unwrap();
+        assert_eq!(destroy.rsid, old_rsid);
+        for tk in &old_honest {
+            let ack = build_share_destroy_ack(tk, subject, old_rsid, 1_700_000_000);
+            restored.record_destroy_ack(&ack).unwrap();
+        }
+        assert_eq!(restored.phase(), ResplitPhase::Complete);
+        assert_eq!(restored.pending_old().count(), 0);
+    }
+
+    // Corrupt / truncated / trailing-byte inputs are refused, not silently accepted.
+    #[test]
+    fn from_bytes_rejects_malformed() {
+        let owner = key(3);
+        let subject = pk(&key(5));
+        let new_trustees: Vec<[u8; 32]> = (0..N).map(|i| pk(&key(20 + i))).collect();
+        let (rs, _shares, _g, _state) = Resplit::begin(
+            &owner,
+            &K_ROOT,
+            subject,
+            M,
+            N,
+            SLACK,
+            false,
+            1,
+            vec![],
+            new_trustees,
+            100,
+        )
+        .unwrap();
+        let good = rs.to_bytes();
+
+        // Truncated.
+        assert!(matches!(
+            Resplit::from_bytes(&good[..good.len() - 1]),
+            Err(FriendError::Corrupt)
+        ));
+        // Trailing byte.
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(matches!(
+            Resplit::from_bytes(&extra),
+            Err(FriendError::Corrupt)
+        ));
+        // Bad version.
+        let mut bad_ver = good.clone();
+        bad_ver[0] = 9;
+        assert!(matches!(
+            Resplit::from_bytes(&bad_ver),
+            Err(FriendError::Corrupt)
+        ));
+        // Empty.
+        assert!(matches!(
+            Resplit::from_bytes(&[]),
+            Err(FriendError::Corrupt)
         ));
     }
 

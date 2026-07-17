@@ -69,6 +69,9 @@ pub enum FriendError {
     UnknownTrustee,
     /// A message referenced the wrong recovery-set id or subject.
     WrongSet,
+    /// Persisted state bytes were truncated, over-long, or otherwise malformed
+    /// and could not be decoded back into a valid machine.
+    Corrupt,
 }
 
 impl core::fmt::Display for FriendError {
@@ -91,6 +94,7 @@ impl core::fmt::Display for FriendError {
             }
             Self::UnknownTrustee => f.write_str("trustee is not part of this re-split"),
             Self::WrongSet => f.write_str("message referenced the wrong subject or recovery set"),
+            Self::Corrupt => f.write_str("persisted re-split state was malformed"),
         }
     }
 }
