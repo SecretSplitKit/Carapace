@@ -2122,6 +2122,12 @@ impl Daemon {
             for id in &vb.chunk_ids {
                 s.owned_chunks.insert(*id, vid);
             }
+            // F1 (design §3.5): the manifest-envelope digest is a served blob too. With
+            // the fetch gate default-DENY, an own-device / replica-member sync fetches it
+            // by digest, so it must be in the owner-gated set (retained across epochs).
+            // The disclosure arm never matches it, so a bare audience friend (no
+            // `K_manifest`) is still refused the envelope.
+            s.owned_chunks.insert(vb.digest, vid);
             s.vault_blobs.insert(vid, vb.clone());
             // Retain the per-chunk secrets so a later `disclose_files` can seal a subset
             // of files into a friend-facing grant without re-ingesting (§7.4).
@@ -2676,6 +2682,9 @@ impl Daemon {
         for id in &chunk_ids {
             s.owned_chunks.insert(*id, *vid);
         }
+        // F1 (design §3.5): gate the served manifest-envelope digest too (see
+        // `publish_vault`), so a default-deny gate still serves it to own devices.
+        s.owned_chunks.insert(digest, *vid);
         s.vault_keys.insert(*vid, keys.clone());
         let replicas = replica_list(self.node_id(), s.members.get(vid));
         let mut ann = VaultAnnounce {
@@ -5298,8 +5307,13 @@ fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
         return owner_device || member;
     }
 
-    // Not an owned-vault chunk and not replica-held: inherited residual.
-    true
+    // F1 (design §3.5) DEFAULT-DENY: a blob in neither the owner-gated set
+    // (`owned_chunks`, incl. each vault's manifest-envelope digest) nor the
+    // replica-held set (`replica_chunks`) is served to NO ONE. With a durable blob
+    // store, the old residual `return true` would re-open every owned blob to any
+    // dialer after a reboot; default-deny turns any future gate-map omission from a
+    // silent public leak into a visible availability failure instead.
+    false
 }
 
 /// Resolve `node` to the *user* pubkey that delegates it: our own user (if one of

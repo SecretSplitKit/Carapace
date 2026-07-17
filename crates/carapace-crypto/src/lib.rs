@@ -16,6 +16,7 @@ pub mod content;
 pub mod identity;
 pub mod kdf;
 pub mod seal;
+pub mod state_seal;
 
 pub use ed25519_dalek;
 

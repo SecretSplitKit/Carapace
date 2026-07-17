@@ -14,6 +14,11 @@ pub const INFO_USERID: &[u8] = b"carapace/v1/user-identity";
 pub const INFO_DISCLOSE: &[u8] = b"carapace/v1/disclosure";
 /// Split-state sealing key (protocol §8.1): AEAD key for the Chela extendable-split state.
 pub const INFO_SPLIT_STATE: &[u8] = b"carapace/v1/split-state";
+/// Durable-state row sealing key (design §3.4): AEAD key under which the daemon seals
+/// secret runtime-state rows (shares, split polynomials, grants) before writing them to
+/// `state.redb`. Deliberately DISTINCT from `INFO_SPLIT_STATE` so the two mechanisms use
+/// independent keys.
+pub const INFO_STATE_SEAL: &[u8] = b"carapace/v1/state-seal";
 
 /// Per-chunk key/nonce info prefixes: `info = PREFIX ‖ pt_hash` (protocol §5).
 pub const CHUNK_KEY_PREFIX: &[u8] = b"chunk-key";
@@ -75,6 +80,13 @@ pub fn k_disclose(k_root: &[u8]) -> Key32 {
 /// under which the daemon seals a Chela split-state before persisting it.
 pub fn k_split_state(k_root: &[u8]) -> Key32 {
     derive32(k_root, INFO_SPLIT_STATE)
+}
+
+/// `K_stateseal = HKDF(K_root, "carapace/v1/state-seal")` (design §3.4). The AEAD key
+/// under which the daemon seals secret runtime-state rows before persisting them to
+/// `state.redb`. Independent of [`k_split_state`].
+pub fn k_state_seal(k_root: &[u8]) -> Key32 {
+    derive32(k_root, INFO_STATE_SEAL)
 }
 
 /// `chunk_key = HKDF(K_content, "chunk-key" ‖ pt_hash)`.
