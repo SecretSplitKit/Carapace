@@ -1739,7 +1739,41 @@ pub struct Daemon {
     /// mapped/bound address (§6), from [`NetConfig::relay_host`]. Preferred over the
     /// port-mapper's external address when set (an operator's stable DDNS name).
     relay_host: Option<String>,
+    /// The durable state directory (design §3): holds `blobs/` (FsStore) and, once
+    /// wired, `state.redb`. Retained so background/reboot paths can locate durable state.
+    state_dir: PathBuf,
+    /// Cleanup guard for a `from_seeds` daemon's process-unique ephemeral state dir:
+    /// `Some` only when `State::dir` was `None`. Removes the whole tree on drop so a
+    /// seed-only test daemon leaves nothing behind.
+    _ephemeral_dir: Option<EphemeralDir>,
     _router: Router,
+}
+
+/// RAII guard that removes a process-unique ephemeral state directory on drop. Used
+/// for `from_seeds` daemons, which have no caller-provided state dir but still need a
+/// real on-disk FsStore/redb path for the daemon's lifetime.
+struct EphemeralDir(PathBuf);
+
+impl Drop for EphemeralDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Allocate (and create) a process-unique ephemeral state directory under the OS temp
+/// dir. Uniqueness comes from pid + a monotonic counter, so concurrent daemons in one
+/// test process never collide.
+fn ephemeral_state_dir() -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "carapaced-{}-{}",
+        std::process::id(),
+        n
+    ));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create ephemeral state dir {dir:?}"))?;
+    Ok(dir)
 }
 
 /// Handle for a live §11 filesystem watcher started by [`Daemon::watch_vault`].
@@ -1837,6 +1871,16 @@ impl Daemon {
         let self_user = user_key.verifying_key().to_bytes();
         let self_node = node_key.verifying_key().to_bytes();
 
+        // Resolve the durable state directory (design §3). A `from_seeds` daemon has
+        // none, so allocate a process-unique ephemeral dir guarded for cleanup on drop.
+        let (state_dir, ephemeral_dir) = match state.dir.clone() {
+            Some(d) => (d, None),
+            None => {
+                let d = ephemeral_state_dir()?;
+                (d.clone(), Some(EphemeralDir(d)))
+            }
+        };
+
         // The friend/replica state the relay's access gate and the daemon's
         // handlers share. Created up front so the relay can be friend-gated
         // against the live friend set (C1).
@@ -1889,7 +1933,9 @@ impl Daemon {
         });
 
         let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await?;
-        let blobs = IrohBlobStore::new();
+        // Durable served blob store (design §3.1): FsStore at `<state_dir>/blobs`,
+        // surviving restart. Blobs are already ciphertext, so no extra sealing.
+        let blobs = IrohBlobStore::load(&state_dir.join("blobs")).await?;
 
         // This device's ContactCard starts WITHOUT a relay URL (W6/§6: a relay is
         // never advertised unconditionally at startup). The advertise happens only
@@ -1960,7 +2006,7 @@ impl Daemon {
         let router = Router::builder(ep.endpoint().clone())
             .accept(
                 iroh_blobs::ALPN,
-                BlobsProtocol::new(blobs.mem(), Some(events)),
+                BlobsProtocol::new(blobs.store(), Some(events)),
             )
             .accept(ALPN, handler)
             .spawn();
@@ -1979,6 +2025,8 @@ impl Daemon {
             resplit_lock: tokio::sync::Mutex::new(()),
             relay,
             relay_host: cfg.relay_host,
+            state_dir,
+            _ephemeral_dir: ephemeral_dir,
             _router: router,
         };
 
@@ -7040,10 +7088,12 @@ mod tests {
             authorize_fetch(&s, &friend_node, &old_chunk),
             "the audience of a grant covering the chunk is still served"
         );
-        // A genuinely foreign chunk (never owned) stays on the inherited residual.
+        // F1 (design §3.5) default-deny: a chunk in neither the owned nor replica set
+        // is served to NO ONE. With a durable blob store the old residual `return true`
+        // was a post-reboot public leak of every owned blob; now it is a hard refusal.
         assert!(
-            authorize_fetch(&s, &[0x99; 32], &[0xAB; 32]),
-            "a non-owned chunk keeps the residual (AEAD + ChunkID secrecy)"
+            !authorize_fetch(&s, &[0x99; 32], &[0xAB; 32]),
+            "an unknown chunk is refused under default-deny (F1)"
         );
     }
 

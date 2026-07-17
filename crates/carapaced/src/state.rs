@@ -23,7 +23,7 @@ use carapace_crypto::atrest::{self, AtRestBlob};
 use carapace_crypto::identity::user_key_from_seed;
 use carapace_crypto::kdf::k_userid;
 use ed25519_dalek::SigningKey;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Environment variable holding the at-rest passphrase (W4). When present, key
@@ -39,6 +39,12 @@ pub struct State {
     pub node_key: SigningKey,
     /// The user master key, shared across a user's devices.
     pub k_root: Zeroizing<[u8; 32]>,
+    /// The state directory holding `node.key`/`root.key` and (design §3) the durable
+    /// `blobs/` store and `state.redb`. `None` for a seed-only [`State::from_seeds`]:
+    /// the daemon then uses a process-unique ephemeral directory (cleaned up on drop),
+    /// so a from-seeds test daemon persists nowhere permanent. A reboot test uses
+    /// [`State::load_or_generate`] twice against the same dir.
+    pub dir: Option<PathBuf>,
 }
 
 impl State {
@@ -54,15 +60,29 @@ impl State {
         Ok(Self {
             node_key: SigningKey::from_bytes(&node_seed),
             k_root: Zeroizing::new(root),
+            dir: Some(dir.to_path_buf()),
         })
     }
 
     /// Build state directly from raw seeds (used in tests and for scripted
-    /// two-device setups that share a `k_root`).
+    /// two-device setups that share a `k_root`). No state directory: the daemon
+    /// persists to a process-unique ephemeral dir it cleans up on drop.
     pub fn from_seeds(node_seed: [u8; 32], k_root: [u8; 32]) -> Self {
         Self {
             node_key: SigningKey::from_bytes(&node_seed),
             k_root: Zeroizing::new(k_root),
+            dir: None,
+        }
+    }
+
+    /// Like [`State::from_seeds`] but pinned to a specific state directory, so a test
+    /// can drop the daemon and reboot a fresh one from the SAME seeds AND the same
+    /// durable `blobs/`/`state.redb` (design §6 reboot-survival tests).
+    pub fn from_seeds_in(dir: &Path, node_seed: [u8; 32], k_root: [u8; 32]) -> Self {
+        Self {
+            node_key: SigningKey::from_bytes(&node_seed),
+            k_root: Zeroizing::new(k_root),
+            dir: Some(dir.to_path_buf()),
         }
     }
 

@@ -12,12 +12,16 @@
 use anyhow::{ensure, Context, Result};
 use carapace_vault::{ChunkStore, StoreError};
 use iroh::endpoint::Connection;
+use iroh_blobs::api::Store;
 use iroh_blobs::provider::events::{
     AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode,
 };
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::Hash;
 use std::collections::HashMap;
+use std::ops::Deref;
+use std::path::Path;
 use tokio::runtime::Handle;
 
 /// Convert a carapace ChunkID into an iroh blob hash (identity mapping: both are
@@ -30,35 +34,79 @@ fn io_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Io(std::io::Error::other(e.to_string()))
 }
 
-/// An iroh-blobs in-memory store presented as a carapace [`ChunkStore`].
+/// The backing iroh-blobs store: either in-memory (scratch / throwaway) or a
+/// durable filesystem store (the daemon's served store, design §3.1). Both deref to
+/// the same [`Store`] API, so every blob operation routes through [`Backing::store`].
+#[derive(Debug, Clone)]
+enum Backing {
+    /// RAM-only. Used for the deliberate scratch stores (ingest, reconstruct/PoR
+    /// re-serve) that must NOT persist third-party ciphertext to disk.
+    Mem(MemStore),
+    /// Durable, at `<state_dir>/blobs`. The daemon's served store: survives restart
+    /// (design §3.1). Blobs are already ciphertext, so no extra sealing.
+    Fs(FsStore),
+}
+
+impl Backing {
+    /// The unified iroh-blobs [`Store`] API both variants deref to.
+    fn store(&self) -> &Store {
+        match self {
+            Backing::Mem(m) => m.deref(),
+            Backing::Fs(f) => f.deref(),
+        }
+    }
+}
+
+/// An iroh-blobs store presented as a carapace [`ChunkStore`].
 ///
 /// Cloning shares the same underlying store and runtime handle (both are
 /// cheap Arc-backed handles), so a clone serves and mutates the same blobs.
 #[derive(Clone)]
 pub struct IrohBlobStore {
-    store: MemStore,
+    backing: Backing,
     handle: Handle,
 }
 
 impl IrohBlobStore {
-    /// A fresh in-memory blob store. Must be called from within a tokio runtime
-    /// (captures the current runtime handle for the sync `ChunkStore` bridge).
+    /// A fresh in-memory blob store (scratch / throwaway). Must be called from
+    /// within a tokio runtime (captures the current runtime handle for the sync
+    /// `ChunkStore` bridge). For the durable served store use [`IrohBlobStore::load`].
     pub fn new() -> Self {
         Self {
-            store: MemStore::new(),
+            backing: Backing::Mem(MemStore::new()),
             handle: Handle::current(),
         }
     }
 
-    /// The underlying iroh-blobs store, e.g. for
-    /// `BlobsProtocol::new(store.mem(), None)`.
-    pub fn mem(&self) -> &MemStore {
-        &self.store
+    /// A durable filesystem-backed blob store rooted at `dir` (design §3.1). Creates
+    /// `dir` (0700 on unix) if absent and loads/recovers any existing blobs, so the
+    /// daemon's served store survives a restart. Must be called from within a tokio
+    /// runtime.
+    pub async fn load(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create blobs dir {dir:?}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 {dir:?}"))?;
+        }
+        let store = FsStore::load(dir)
+            .await
+            .with_context(|| format!("open FsStore at {dir:?}"))?;
+        Ok(Self {
+            backing: Backing::Fs(store),
+            handle: Handle::current(),
+        })
+    }
+
+    /// The underlying iroh-blobs store, e.g. for `BlobsProtocol::new(store.store(), None)`.
+    pub fn store(&self) -> &Store {
+        self.backing.store()
     }
 
     /// Add a blob, returning its hash (= ChunkID). Async; use from async code.
     pub async fn add(&self, data: &[u8]) -> Result<[u8; 32]> {
-        let tag = self.store.add_slice(data).await.context("add_slice")?;
+        let tag = self.store().add_slice(data).await.context("add_slice")?;
         Ok(*tag.hash.as_bytes())
     }
 
@@ -66,7 +114,7 @@ impl IrohBlobStore {
     /// verifies the BLAKE3 bao against `id` during transfer; we additionally
     /// assert the stored bytes re-hash to the requested ChunkID (§5, §6).
     pub async fn fetch(&self, conn: &Connection, id: [u8; 32]) -> Result<()> {
-        self.store
+        self.store()
             .remote()
             .fetch(conn.clone(), hash_of(id))
             .await
@@ -82,7 +130,7 @@ impl IrohBlobStore {
     /// Read a present blob's bytes. Async; use from async code.
     pub async fn get_bytes(&self, id: [u8; 32]) -> Result<Vec<u8>> {
         let bytes = self
-            .store
+            .store()
             .get_bytes(hash_of(id))
             .await
             .context("get_bytes")?;
@@ -166,7 +214,7 @@ impl ChunkStore for IrohBlobStore {
         if got != id {
             return Err(StoreError::IdMismatch { expected: id, got });
         }
-        let store = &self.store;
+        let store = self.store();
         let tag = self
             .handle
             .block_on(async move { store.add_slice(&data).await })
@@ -176,7 +224,7 @@ impl ChunkStore for IrohBlobStore {
     }
 
     fn get(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>, StoreError> {
-        let store = &self.store;
+        let store = self.store();
         let id = *id;
         self.handle.block_on(async move {
             if !store.blobs().has(hash_of(id)).await.map_err(io_err)? {
@@ -188,7 +236,7 @@ impl ChunkStore for IrohBlobStore {
     }
 
     fn has(&self, id: &[u8; 32]) -> Result<bool, StoreError> {
-        let store = &self.store;
+        let store = self.store();
         let id = *id;
         self.handle
             .block_on(async move { store.blobs().has(hash_of(id)).await })
