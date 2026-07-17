@@ -147,7 +147,7 @@ fn two_device_concurrent_edit_keeps_both() {
     // The kept copies must be reconstructable from the store (winner keeps its
     // own chunks; the renamed loser keeps its content, just under a new path).
     for e in &merged.files {
-        for (id, _len) in &e.chunks {
+        for (id, _pt, _len) in &e.chunks {
             assert!(store.has(id).unwrap(), "chunk for surviving copy present");
         }
     }

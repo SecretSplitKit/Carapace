@@ -139,6 +139,7 @@ CEREMONY_ENC = bytes([0x06]) * 32
 NEW_NODE     = bytes([0x07]) * 32
 FILEHASH     = bytes([0xAA]) * 32
 CHUNKID      = bytes([0xC1]) * 32
+PTHASH       = bytes([0xB1]) * 32     # BLAKE3(chunk plaintext), stored in the manifest (Option B)
 CHUNKKEY     = bytes([0x77]) * 32
 CHUNKNONCE   = bytes([0x88]) * 24
 ENV_NONCE    = bytes([0x99]) * 24
@@ -271,7 +272,7 @@ GRANTBODY = {0: [{0: "notes/plan.txt", 1: FILEHASH, 2: 1234,
                   3: [{0: CHUNKID, 1: CHUNKKEY, 2: CHUNKNONCE, 3: 1234}]}]}
 MANIFEST = {0: VID, 1: 42, 2: [USER_A_PUB],
             3: [{0: "notes/plan.txt", 1: 33188, 2: T0, 3: 1234,
-                 4: [{0: CHUNKID, 1: 1234}], 5: FILEHASH,
+                 4: [{0: CHUNKID, 1: PTHASH, 2: 1234}], 5: FILEHASH,
                  6: {NODE_A1_PUB: 3}, 7: False}],
             4: {NODE_A1_PUB: 3}}
 env = {0: VID, 1: 42, 2: ENV_NONCE, 3: ENV_CT, 22: NODE_A1_PUB}

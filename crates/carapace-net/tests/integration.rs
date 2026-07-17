@@ -119,7 +119,7 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
     );
     // Every sealed chunk: blob hash == ChunkID by construction.
     for f in &ingest.manifest.files {
-        for (id, _len) in &f.chunks {
+        for (id, _pt, _len) in &f.chunks {
             let ct = mem.get(id)?.expect("chunk present in source store");
             let h = blobs.add(&ct).await?;
             assert_eq!(&h, id, "iroh blob hash must equal carapace ChunkID");
@@ -191,7 +191,7 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
 
     // Fetch every chunk by ChunkID into the client's iroh store.
     for f in &manifest.files {
-        for (id, _len) in &f.chunks {
+        for (id, _pt, _len) in &f.chunks {
             cstore.fetch(&bconn, *id).await?;
         }
     }

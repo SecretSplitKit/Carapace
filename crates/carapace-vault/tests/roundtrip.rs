@@ -3,7 +3,8 @@
 //! assert byte-identity, ChunkID integrity, and envelope seal/open/verify.
 
 use carapace_vault::{
-    ingest_dir, new_vid, open_envelope, reconstruct, ChunkStore, FsStore, MemoryStore, VaultKeys,
+    chunk_keys_from_manifest, ingest_dir, new_vid, open_envelope, reconstruct, reconstruct_file,
+    ChunkStore, FsStore, MemoryStore, VaultError, VaultKeys,
 };
 use ed25519_dalek::SigningKey;
 use std::fs;
@@ -95,7 +96,7 @@ fn full_roundtrip_memory_store() {
 
     // (b) each stored ciphertext's BLAKE3 == its ChunkID == the chunk ref id.
     for file in &ingest.manifest.files {
-        for (id, _len) in &file.chunks {
+        for (id, _pt, _len) in &file.chunks {
             let ct = store.get(id).unwrap().expect("chunk stored");
             assert_eq!(
                 *blake3::hash(&ct).as_bytes(),
@@ -117,6 +118,55 @@ fn full_roundtrip_memory_store() {
         let got = fs::read(out.path().join(rel)).unwrap();
         assert_eq!(&got, data, "reconstructed {rel} must be byte-identical");
     }
+}
+
+/// Option B (§4.2): a `K_content` holder reconstructs from the sealed manifest
+/// alone by re-deriving every chunk key from the stored `pt_hash` (no FileGrant,
+/// no persisted `ChunkKeys`), and a tampered `pt_hash` is caught.
+#[test]
+fn reconstruct_from_manifest_pt_hash_and_tamper_detected() {
+    let src = TempDir::new("src");
+    let out = TempDir::new("out");
+    let originals = write_tree(src.path());
+    let (keys, node_key) = setup();
+    let mut store = MemoryStore::new();
+    let ingest = ingest_dir(src.path(), &node_key, &keys, 3, None, &mut store).unwrap();
+    let manifest = ingest.manifest.clone();
+
+    // Re-derive keys from K_content + manifest pt_hash (NOT the retained ingest.keys)
+    // and reconstruct byte-exact — this is the owner/recovery path.
+    let derived = chunk_keys_from_manifest(&manifest, &*keys.k_content);
+    reconstruct(&manifest, &store, &derived, out.path()).unwrap();
+    for (rel, data) in &originals {
+        assert_eq!(&fs::read(out.path().join(rel)).unwrap(), data);
+    }
+
+    // Pick a file with at least one chunk to tamper.
+    let file = manifest
+        .files
+        .iter()
+        .find(|f| !f.chunks.is_empty())
+        .expect("a chunked file");
+
+    // (1) Correct key, tampered manifest pt_hash: AEAD opens, BLAKE3 check fails.
+    let mut tampered = file.clone();
+    tampered.chunks[0].1[0] ^= 0xff;
+    let err = reconstruct_file(&tampered, &manifest.vid, &store, &ingest.keys).unwrap_err();
+    assert!(
+        matches!(err, VaultError::ChunkHashMismatch(_)),
+        "tampered pt_hash must fail the BLAKE3 check, got {err:?}"
+    );
+
+    // (2) A manifest with a tampered pt_hash re-derives the WRONG key, so the AEAD
+    // open itself fails (defense in depth: the key binds to pt_hash).
+    let mut tampered_manifest = manifest.clone();
+    for f in &mut tampered_manifest.files {
+        if let Some(c) = f.chunks.first_mut() {
+            c.1[0] ^= 0xff;
+        }
+    }
+    let bad_keys = chunk_keys_from_manifest(&tampered_manifest, &*keys.k_content);
+    assert!(reconstruct(&tampered_manifest, &store, &bad_keys, out.path()).is_err());
 }
 
 #[test]

@@ -257,7 +257,7 @@ fn placement_bytes(manifest: &Manifest, env: &ManifestEnvelope) -> u64 {
     let mut seen = HashSet::new();
     let mut total = env.to_bytes().len() as u64;
     for f in &manifest.files {
-        for (id, len) in &f.chunks {
+        for (id, _pt, len) in &f.chunks {
             if seen.insert(*id) {
                 total += *len;
             }
@@ -272,7 +272,7 @@ fn gather_chunks(store: &impl ChunkStore, manifest: &Manifest) -> Result<Vec<Chu
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for f in &manifest.files {
-        for (id, _) in &f.chunks {
+        for (id, _pt, _) in &f.chunks {
             if seen.insert(*id) {
                 let data = store.get(id)?.ok_or(ReplicaError::MissingChunk(*id))?;
                 out.push((*id, data));

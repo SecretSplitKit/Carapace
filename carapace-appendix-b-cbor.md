@@ -219,10 +219,10 @@ Manifest        = { 0: hash32, 1: uint,   ; vid, epoch
                     2: [* pub32],         ; authors
                     3: [* FileEntry],
                     4: vv }
-FileEntry       = { 0: text, 1: uint, 2: ts, 3: uint,   ; path, mode, mtime, size
-                    4: [* { 0: hash32, 1: uint }],      ; chunks (id, len)
-                    5: hash32,                          ; fileHash
-                    6: vv, 7: bool }                    ; version, deleted
+FileEntry       = { 0: text, 1: uint, 2: ts, 3: uint,        ; path, mode, mtime, size
+                    4: [* { 0: hash32, 1: hash32, 2: uint }], ; chunks (id, pt_hash, len)
+                    5: hash32,                                ; fileHash
+                    6: vv, 7: bool }                          ; version, deleted
 ManifestEnvelope = { 0: hash32, 1: uint,  ; vid, epoch
                      2: nonce24, 3: bstr, ; nonce, ct (AEAD of det_cbor Manifest)
                      by, sig }
@@ -594,15 +594,16 @@ c101582077777777777777777777777777777777777777777777777777777777
 **Manifest (unsigned; AEAD plaintext)** — vv keyed by NODE_A1 pub
 
 ```
-a5005820c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
-c0c0c0c001182a028158208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d
-94121bf3748801b40f6f5c0381a8006e6e6f7465732f706c616e2e7478740119
-81a4021a6955b900031904d20481a2005820c1c1c1c1c1c1c1c1c1c1c1c1c1c1
-c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1011904d2055820aaaaaaaaaaaaaa
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06a15820ed4928
-c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d10307f4
-04a15820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614
-ac8737d103
+a5005820c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+c0c0c0c0c0c001182a028158208a88e3dd7409f195fd52db2d3cba5d72ca
+6709bf1d94121bf3748801b40f6f5c0381a8006e6e6f7465732f706c616e
+2e747874011981a4021a6955b900031904d20481a3005820c1c1c1c1c1c1
+c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1015820b1
+b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
+b1021904d2055820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+aaaaaaaaaaaaaaaaaaaa06a15820ed4928c628d1c2c6eae9033890599561
+2959273a5c63f93636c14614ac8737d10307f404a15820ed4928c628d1c2
+c6eae90338905995612959273a5c63f93636c14614ac8737d103
 ```
 
 **ManifestEnvelope (doc_type 24)** — ct = 0xEE placeholder; sig discipline as B.3 with doc_type 24

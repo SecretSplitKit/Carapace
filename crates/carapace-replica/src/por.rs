@@ -180,7 +180,7 @@ fn unique_chunks(manifest: &Manifest) -> Vec<([u8; 32], u64)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for f in &manifest.files {
-        for (id, len) in &f.chunks {
+        for (id, _pt, len) in &f.chunks {
             if seen.insert(*id) {
                 out.push((*id, *len));
             }

@@ -7,13 +7,16 @@
 //! and decrypt the actual file content off a surviving friend's replica.
 //!
 //! Flow: owner A publishes a multi-file vault and places a replica on friend B (the
-//! placement now also ships the owner-signed announce + FileGrant, §8.4); A splits
-//! `K_root` 2-of-3 to trustees B, C, D. A then "loses every device". A fresh claimant
-//! runs the full ceremony (collect M shares -> recover `K_root`, re-derive identity),
-//! stands itself up as a `Daemon` on the recovered key, and reconstructs the vault
-//! from B - authenticating as an owner-delegated device (`ReplicaDevice`) with a card
-//! its re-derived user key signed. The assertion is CONTENT: every file byte-matches
-//! the source, not merely that `K_root` came back.
+//! placement ships the owner-signed announce; Option B §4 means NO FileGrant is
+//! pushed or retained); A splits `K_root` 2-of-3 to trustees B, C, D. A then "loses
+//! every device". A fresh claimant runs the full ceremony (collect M shares ->
+//! recover `K_root`, re-derive identity), stands itself up as a `Daemon` on the
+//! recovered key, and reconstructs the vault from B - authenticating as an
+//! owner-delegated device (`ReplicaDevice`) with a card its re-derived user key
+//! signed. B serves it the retained announce + owner card (never a grant); the
+//! claimant re-derives every per-chunk key from the manifest's `pt_hash`. The
+//! assertion is CONTENT: every file byte-matches the source, not merely that
+//! `K_root` came back.
 //!
 //! Bounded (§11 lesson): the 72 h abort delay is driven by an INJECTED clock, all
 //! dials are connect-timeout bounded, and every daemon is torn down.
@@ -79,8 +82,9 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
         a_befriends(&a, t).await?;
     }
 
-    // A publishes a real vault and places a replica on friend B. The placement now also
-    // pushes A's owner-signed VaultAnnounce + FileGrant, which B retains (§8.4).
+    // A publishes a real vault and places a replica on friend B. The placement pushes
+    // A's owner-signed VaultAnnounce, which B retains (§8.4). Option B (§4): no
+    // FileGrant is pushed - recovery re-derives keys from the manifest pt_hash.
     let (src, expected) = make_tree();
     let (vid, _nonce) = a.new_vid();
     a.publish_vault(src.path(), vid).await?;
@@ -147,7 +151,9 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
     // K_root + its own node identity, then reconstruct the vault off the surviving
     // replica B. The claimant is a FRESH device (new node key) presenting a card its
     // re-derived owner-user key signed; B admits it as an owner-delegated ReplicaDevice
-    // and serves the retained announce + grant + owner card + blobs. ----
+    // and serves the retained announce + owner card + blobs - NEVER a grant (Option B,
+    // §4): the claimant re-derives every per-chunk key from the manifest pt_hash. B has
+    // no grant to serve - the `replica_grants` retention path was removed entirely. ----
     let recovered_daemon =
         Daemon::start(State::from_seeds(claimant.node_seed(), *recovered.k_root)).await?;
     assert_eq!(

@@ -51,6 +51,9 @@ pub enum VaultError {
     MissingKey([u8; 32]),
     /// Recovered file bytes did not match the manifest's `file_hash`.
     FileHashMismatch(String),
+    /// A decrypted chunk's `BLAKE3(plaintext)` did not match the manifest's stored
+    /// `pt_hash` for that chunk (Option B integrity check, §4.2).
+    ChunkHashMismatch([u8; 32]),
     /// A manifest path was absolute or escaped the output root (`..`).
     UnsafePath(String),
     /// A file's name was not valid UTF-8, so it cannot round-trip through the
@@ -74,6 +77,9 @@ impl std::fmt::Display for VaultError {
             VaultError::MissingChunk(_) => write!(f, "referenced chunk missing from store"),
             VaultError::MissingKey(_) => write!(f, "no key for referenced chunk"),
             VaultError::FileHashMismatch(p) => write!(f, "file hash mismatch for {p}"),
+            VaultError::ChunkHashMismatch(_) => {
+                write!(f, "chunk plaintext hash mismatch (pt_hash)")
+            }
             VaultError::UnsafePath(p) => write!(f, "unsafe manifest path: {p}"),
             VaultError::NonUtf8Path(p) => write!(f, "non-UTF8 file path: {p}"),
             VaultError::BadMtime => write!(f, "invalid file mtime"),
@@ -155,8 +161,10 @@ impl VaultKeys {
 // ---------------- chunk key map -----------------------------------------
 
 /// A chunk's decryption secret. `chunk_key`/`nonce` derive one-way from
-/// `K_content` + plaintext hash, so they cannot be recovered from the manifest
-/// (which stores only `{id, len}`); the owner persists them alongside it.
+/// `K_content` + plaintext hash (`pt_hash`). Since the manifest now stores
+/// `pt_hash` per chunk (Option B, §4), a `K_content` holder re-derives these with
+/// [`chunk_keys_from_manifest`]; the owner no longer needs to persist or grant them
+/// for its own recovery.
 #[derive(Clone)]
 pub struct ChunkSecret {
     /// XChaCha20-Poly1305 key.
@@ -167,6 +175,23 @@ pub struct ChunkSecret {
 
 /// Map from ChunkID to the secret needed to open that blob.
 pub type ChunkKeys = HashMap<[u8; 32], ChunkSecret>;
+
+/// Option B (§4.2): re-derive the per-chunk `ChunkKeys` for a manifest from
+/// `K_content` alone, using each chunk's stored `pt_hash`. This is what lets an
+/// owner (or a `K_root`-holding recovery claimant) reconstruct from the sealed
+/// manifest with no `FileGrant`. Deleted files carry no chunks and are skipped.
+pub fn chunk_keys_from_manifest(manifest: &Manifest, k_content: &[u8]) -> ChunkKeys {
+    let mut keys = HashMap::new();
+    for f in &manifest.files {
+        for (id, pt_hash, _len) in &f.chunks {
+            keys.entry(*id).or_insert_with(|| ChunkSecret {
+                chunk_key: kdf::chunk_key(k_content, pt_hash),
+                nonce: kdf::chunk_nonce(k_content, pt_hash),
+            });
+        }
+    }
+    keys
+}
 
 /// The product of [`ingest_dir`].
 pub struct Ingest {
@@ -225,12 +250,15 @@ pub fn ingest_dir<S: ChunkStore>(
         let data = fs::read(&full)?;
         let file_hash = *blake3::hash(&data).as_bytes();
 
-        let mut chunk_refs: Vec<([u8; 32], u64)> = Vec::new();
+        let mut chunk_refs: Vec<([u8; 32], [u8; 32], u64)> = Vec::new();
         for (off, len) in chunk_ranges(&data) {
             let plaintext = &data[off..off + len];
             let sealed = content::seal_chunk(&*keys.k_content, &keys.vid, plaintext)?;
             store.put(sealed.chunk_id, sealed.ciphertext)?;
-            chunk_refs.push((sealed.chunk_id, len as u64));
+            // Record pt_hash in the manifest (Option B, §4): a K_content holder
+            // re-derives this chunk's key/nonce from it, so owner sync and recovery
+            // never need a FileGrant.
+            chunk_refs.push((sealed.chunk_id, sealed.pt_hash, len as u64));
             key_map.entry(sealed.chunk_id).or_insert(ChunkSecret {
                 chunk_key: sealed.chunk_key,
                 nonce: sealed.nonce,
@@ -388,10 +416,17 @@ pub fn reconstruct_file<S: ChunkStore>(
     keys: &ChunkKeys,
 ) -> Result<Vec<u8>, VaultError> {
     let mut out = Vec::with_capacity(entry.size as usize);
-    for (id, _len) in &entry.chunks {
+    for (id, pt_hash, _len) in &entry.chunks {
         let ct = store.get(id)?.ok_or(VaultError::MissingChunk(*id))?;
         let secret = keys.get(id).ok_or(VaultError::MissingKey(*id))?;
         let pt = content::open_chunk(&secret.chunk_key, &secret.nonce, &ct, vid)?;
+        // Option B free integrity check (§4.2): the manifest's pt_hash must equal
+        // BLAKE3(plaintext). A key/nonce re-derived from a tampered manifest pt_hash
+        // already fails the AEAD open above; this also catches a store that returns
+        // the wrong (but validly-keyed) chunk for this id.
+        if blake3::hash(&pt).as_bytes() != pt_hash {
+            return Err(VaultError::ChunkHashMismatch(*id));
+        }
         out.extend_from_slice(&pt);
     }
     if *blake3::hash(&out).as_bytes() != entry.file_hash {

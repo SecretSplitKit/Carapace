@@ -577,7 +577,7 @@ fn b8_24_manifest_doc() {
             mode: 33188,
             mtime: T0,
             size: 1234,
-            chunks: vec![(rep(0xC1), 1234)],
+            chunks: vec![(rep(0xC1), rep(0xB1), 1234)],
             file_hash: rep(0xAA),
             version: vec![(node_a1, 3)],
             deleted: false,
@@ -585,7 +585,7 @@ fn b8_24_manifest_doc() {
         vv: vec![(node_a1, 3)],
     };
     assert_eq!(
-        "a5005820c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c001182a028158208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0381a8006e6e6f7465732f706c616e2e747874011981a4021a6955b900031904d20481a2005820c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1011904d2055820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06a15820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d10307f404a15820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d103",
+        "a5005820c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c001182a028158208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0381a8006e6e6f7465732f706c616e2e747874011981a4021a6955b900031904d20481a3005820c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1015820b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1021904d2055820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa06a15820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d10307f404a15820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d103",
         hex::encode(m.to_bytes())
     );
     assert_eq!(m, Manifest::from_bytes(&m.to_bytes()).unwrap());

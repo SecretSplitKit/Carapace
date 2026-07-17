@@ -1748,8 +1748,10 @@ pub struct FileEntry {
     pub mtime: u64,
     /// size.
     pub size: u64,
-    /// chunks (id, len).
-    pub chunks: Vec<([u8; 32], u64)>,
+    /// chunks (id, pt_hash, len). `pt_hash = BLAKE3(chunk plaintext)` lets a
+    /// `K_content` holder re-derive the chunk key/nonce from the manifest alone
+    /// (Option B, spec §4), so owner sync and recovery need no `FileGrant`.
+    pub chunks: Vec<([u8; 32], [u8; 32], u64)>,
     /// file hash.
     pub file_hash: [u8; 32],
     /// version vector.
@@ -1769,10 +1771,11 @@ impl FileEntry {
             Value::Array(
                 self.chunks
                     .iter()
-                    .map(|(id, len)| {
+                    .map(|(id, pt_hash, len)| {
                         let mut cm = Map::new();
                         cm.u(0, vb(id));
-                        cm.u(1, Value::Uint(*len));
+                        cm.u(1, vb(pt_hash));
+                        cm.u(2, Value::Uint(*len));
                         Value::Map(cm)
                     })
                     .collect(),
@@ -1796,9 +1799,10 @@ impl FileEntry {
             .map(|x| {
                 let mut cm = x.into_map()?;
                 let id = cm.take(0)?.into_array_n()?;
-                let len = cm.take(1)?.into_uint()?;
+                let pt_hash = cm.take(1)?.into_array_n()?;
+                let len = cm.take(2)?.into_uint()?;
                 cm.finish()?;
-                Ok((id, len))
+                Ok((id, pt_hash, len))
             })
             .collect::<Result<_, Error>>()?;
         let file_hash = m.take(5)?.into_array_n()?;

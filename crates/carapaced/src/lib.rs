@@ -6,17 +6,17 @@
 //! Two owner devices share the SAME user master key (`k_root`, hence the same
 //! `K_manifest`/`K_content`/`K_disclose`) but hold DIFFERENT node keys, each
 //! delegated by the user key (§4). Device A publishes a vault (ingest, seal
-//! manifest, seal a per-chunk access grant, sign a [`VaultAnnounce`] +
-//! [`FileGrant`]); device B discovers the announce over anti-entropy, fetches
-//! the manifest envelope + every chunk by ChunkID, opens the grant, and
+//! manifest, sign a [`VaultAnnounce`]); device B discovers the announce over
+//! anti-entropy, fetches the manifest envelope + every chunk by ChunkID, and
 //! reconstructs the identical tree (§6, §7, §11).
 //!
-//! Chunk keys/nonces derive one-way from `K_content ‖ pt_hash`, so the wire
-//! `Manifest` (only `{id, len}`) cannot re-derive them at reconstruct time. The
-//! owner therefore ships them out of band: a det-CBOR [`GrantBody`] HPKE-sealed
-//! to the user's disclosure key and carried in a signed [`FileGrant`] on the
-//! control stream (the spec's §7.4 grant mechanism, reused here for the
-//! same-user two-device case).
+//! Chunk keys/nonces derive one-way from `K_content ‖ pt_hash`. Option B (§4):
+//! the wire `Manifest` stores `pt_hash` per chunk, so any holder of `K_content`
+//! (an owner device, or a `K_root`-recovering claimant) re-derives every chunk
+//! key from the sealed manifest alone - no `FileGrant`, no owner liveness. The
+//! §7.4 [`FileGrant`]/[`GrantBody`] mechanism remains for DISCLOSURE only: a
+//! third party with no `K_content` gets explicit per-chunk keys, never
+//! `K_manifest`.
 
 mod state;
 
@@ -58,8 +58,8 @@ use carapace_share::{
     ShareHealth, ShareMonitor,
 };
 use carapace_vault::{
-    ingest_dir, merge_manifests, new_vid, open_envelope, reconstruct, seal_manifest, vv_equal,
-    ChunkKeys, ChunkSecret, MemoryStore, VaultKeys,
+    chunk_keys_from_manifest, ingest_dir, merge_manifests, new_vid, open_envelope, reconstruct,
+    seal_manifest, vv_equal, ChunkKeys, MemoryStore, VaultKeys,
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
@@ -373,15 +373,10 @@ struct Shared {
     /// at placement/epoch-push (§8.4). Kept - not just its `replicas` list - so this
     /// replica can serve it back to a recovering owner-device that lost every original
     /// device: the announce drives that device's `select_targets`, and its old-node
-    /// signer satisfies the C1 delegated-signer check.
+    /// signer satisfies the C1 delegated-signer check. With Option B (§4) the recovering
+    /// device re-derives per-chunk keys from the manifest's `pt_hash`, so no `FileGrant`
+    /// is retained or served - only this announce + the owner card.
     replica_announce: HashMap<[u8; 32], VaultAnnounce>,
-    /// For each vid held as a replica, the owner's node-signed `FileGrant` for the
-    /// stored epoch (§8.4). The grant body is HPKE-sealed to the owner's disclosure
-    /// key, so this replica cannot open it; it is served only to that owner's
-    /// delegated device (a `ReplicaDevice(owner)` dialer, which proved an owner-user
-    /// signature) so a recovering owner can re-derive the per-chunk secrets and
-    /// decrypt. Confidentiality holds because opening still requires `K_root`.
-    replica_grants: HashMap<[u8; 32], FileGrant>,
     /// Owner-side deny-list of peer node ids this daemon refuses to place on (S4).
     replica_deny: HashSet<[u8; 32]>,
     /// Last-known dialable address per peer node id, recorded whenever this daemon
@@ -1016,9 +1011,10 @@ impl ControlHandler {
             // Friend/self (W5): own docs plus the store-and-forward third-party docs.
             Authorized(Vec<ContactCard>, Vec<VaultAnnounce>, Vec<FileGrant>),
             // §8.4 recovery: a delegated device of an owner whose vaults we replicate.
-            // Serve ONLY that owner's card + the announce + grant we retained for its
-            // vaults - never any other owner's, and no store-and-forward dump.
-            ReplicaOwner(Vec<ContactCard>, Vec<VaultAnnounce>, Vec<FileGrant>),
+            // Serve ONLY that owner's card + the announce we retained for its vaults -
+            // never any other owner's, no grant (Option B: the recovering device
+            // re-derives keys from the manifest pt_hash), and no store-and-forward dump.
+            ReplicaOwner(Vec<ContactCard>, Vec<VaultAnnounce>),
             No,
         }
         let serve = {
@@ -1033,30 +1029,26 @@ impl ControlHandler {
                 // ReplicaDevice classification so its raw iroh-blobs fetches of that
                 // owner's replica-held chunks are admitted, AND serve back the owner
                 // docs we retained at placement so a recovering owner-device that lost
-                // every original device can: drive `select_targets` (the announce),
+                // every original device can: drive `select_targets` (the announce) and
                 // satisfy the C1 delegated-signer check on that old-node-signed announce
-                // (the owner card delegating the original signer), and re-derive the
-                // per-chunk secrets (the grant - still HPKE-sealed to the owner's
-                // disclosure key, so opening it still requires `K_root`).
+                // (the owner card delegating the original signer). Option B (§4): the
+                // recovering device re-derives per-chunk keys from the manifest's
+                // `pt_hash`, so no `FileGrant` is served - this is the claimant's ONLY
+                // authorization + announce path, so it stays.
                 None => match replica_owner_device(&s, card, remote, now) {
                     Some(owner) => {
                         s.blob_auth.insert(*remote, BlobAuth::ReplicaDevice(owner));
                         let cards: Vec<ContactCard> =
                             s.friends.get(&owner).cloned().into_iter().collect();
                         // Only this exact owner's vaults - never leak another owner's
-                        // announce/grant to this device. Announce + grant were stored
-                        // together per vid, so pair them by vid.
+                        // announce to this device.
                         let mut announces: Vec<VaultAnnounce> = Vec::new();
-                        let mut grants: Vec<FileGrant> = Vec::new();
                         for (vid, ann) in &s.replica_announce {
                             if s.replica_owner.get(vid) == Some(&owner) {
                                 announces.push(ann.clone());
-                                if let Some(g) = s.replica_grants.get(vid) {
-                                    grants.push(g.clone());
-                                }
                             }
                         }
-                        Serve::ReplicaOwner(cards, announces, grants)
+                        Serve::ReplicaOwner(cards, announces)
                     }
                     None => Serve::No,
                 },
@@ -1068,7 +1060,7 @@ impl ControlHandler {
                 return Ok(());
             }
             Serve::Authorized(c, a, g) => (c, true, a, g),
-            Serve::ReplicaOwner(c, a, g) => (c, false, a, g),
+            Serve::ReplicaOwner(c, a) => (c, false, a, Vec::new()),
         };
         // Own/owner docs first, then (friend path only) the learned third-party docs we
         // re-serve. Overlap is harmless: the receiver dedups/rolls-back per signer.
@@ -1215,7 +1207,9 @@ impl ControlHandler {
 
         // The owner pushes the current owner-signed VaultAnnounce so this replica
         // learns the replica set it belongs to (§7.4 b, W8). Verify it binds the
-        // inviting owner and this vault before trusting its member list.
+        // inviting owner and this vault before trusting its member list. Option B (§4):
+        // no FileGrant follows - a recovering owner-device re-derives per-chunk keys
+        // from the manifest's pt_hash, so the replica retains only the announce.
         let announce = read_msg::<VaultAnnounce>(recv).await?;
         announce
             .verify()
@@ -1227,27 +1221,6 @@ impl ControlHandler {
         ensure!(
             announce.by == inv.by,
             "replica announce signer is not the inviting owner"
-        );
-
-        // §8.4: the owner also pushes the epoch's owner-signed FileGrant so this
-        // replica can later serve it to a recovering owner-device (which alone can
-        // open its disclosure-sealed body). Verify the node signature and bind it to
-        // this vault, epoch, and owner before storing - never retain an unverified doc.
-        let grant = read_msg::<FileGrant>(recv).await?;
-        grant
-            .verify()
-            .map_err(|e| anyhow::anyhow!("replica grant bad sig: {e}"))?;
-        ensure!(
-            grant.vid == inv.vid,
-            "replica grant named a different vault"
-        );
-        ensure!(
-            grant.by == inv.by,
-            "replica grant signer is not the inviting owner"
-        );
-        ensure!(
-            grant.epoch == announce.epoch,
-            "replica grant epoch != announce epoch"
         );
 
         // Receive the pushed blobs: envelope first (verified), then each chunk.
@@ -1289,10 +1262,9 @@ impl ControlHandler {
                 s.replica_owner.insert(inv.vid, owner);
             }
             s.replica_members.insert(inv.vid, announce.replicas.clone());
-            // §8.4: retain the full signed announce + grant so a recovering
-            // owner-device can pull them back off this replica.
+            // §8.4: retain the full signed announce so a recovering owner-device can
+            // pull it back off this replica (Option B needs no grant).
             s.replica_announce.insert(inv.vid, announce);
-            s.replica_grants.insert(inv.vid, grant);
             for h in &stored {
                 s.replica_chunks.insert(*h, inv.vid);
             }
@@ -2112,7 +2084,7 @@ impl Daemon {
             "envelope blob hash != manifestDigest"
         );
         for f in &ingest.manifest.files {
-            for (id, _len) in &f.chunks {
+            for (id, _pt, _len) in &f.chunks {
                 let ct = carapace_vault::ChunkStore::get(&mem, id)?
                     .with_context(|| "chunk missing from source store")?;
                 let h = self.blobs.add(&ct).await?;
@@ -2128,7 +2100,7 @@ impl Daemon {
         let mut seen = HashSet::new();
         let mut chunk_ids = Vec::new();
         for f in &ingest.manifest.files {
-            for (id, _len) in &f.chunks {
+            for (id, _pt, _len) in &f.chunks {
                 if seen.insert(*id) {
                     chunk_ids.push(*id);
                 }
@@ -2372,21 +2344,14 @@ impl Daemon {
 
         let mut recv_cards: Vec<ContactCard> = Vec::new();
         let mut recv_announces: Vec<VaultAnnounce> = Vec::new();
-        let mut grants: HashMap<[u8; 32], FileGrant> = HashMap::new();
+        // Option B (§4): reconstruction targets come from announces alone; per-chunk
+        // keys are re-derived from the manifest `pt_hash`, so no FileGrant is pulled
+        // here. A friend peer may still forward its own self-grants (disclosure-only);
+        // they are ignored by this sync path.
         while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
             match ty {
                 ContactCard::TYPE => recv_cards.push(ContactCard::from_map(body)?),
                 VaultAnnounce::TYPE => recv_announces.push(VaultAnnounce::from_map(body)?),
-                FileGrant::TYPE => {
-                    let g = FileGrant::from_map(body)?;
-                    // Keep the highest-epoch grant per vid within this batch.
-                    match grants.get(&g.vid) {
-                        Some(prev) if g.epoch <= prev.epoch => {}
-                        _ => {
-                            grants.insert(g.vid, g);
-                        }
-                    }
-                }
                 _ => {}
             }
         }
@@ -2416,14 +2381,7 @@ impl Daemon {
                     newer_cards.push(card.clone());
                 }
             }
-            let targets = select_targets(
-                &mut docs,
-                &self_user,
-                &recv_cards,
-                &recv_announces,
-                &grants,
-                now,
-            );
+            let targets = select_targets(&mut docs, &self_user, &recv_cards, &recv_announces, now);
             (targets, newer_cards)
         };
 
@@ -2464,13 +2422,9 @@ impl Daemon {
         // ---- per-vault: fetch, open, reconstruct ----
         // W3: one poisoned/unfetchable vault must not abort the others; collect
         // the error and move on.
-        let (disclose_priv, _disclose_pub) = self.disclose_keypair();
         let mut out = Vec::new();
-        for (vid, ann, grant) in &targets {
-            match self
-                .reconstruct_one(&blob_peer, vid, ann, grant, &disclose_priv, out_root)
-                .await
-            {
+        for (vid, ann) in &targets {
+            match self.reconstruct_one(&blob_peer, vid, ann, out_root).await {
                 Ok(r) => out.push(r),
                 Err(e) => eprintln!("carapaced: skipping vault {}: {e:#}", hex32(vid)),
             }
@@ -2486,8 +2440,6 @@ impl Daemon {
         blob_peer: &EndpointAddr,
         vid: &[u8; 32],
         ann: &VaultAnnounce,
-        grant: &FileGrant,
-        disclose_priv: &HpkePrivateKey,
         out_root: &Path,
     ) -> Result<Reconstructed> {
         let vkeys = VaultKeys::derive(&*self.k_root, *vid);
@@ -2515,8 +2467,11 @@ impl Daemon {
             "manifest epoch != announce epoch"
         );
 
-        // Open the grant -> per-chunk secrets for the incoming manifest.
-        let incoming_keys = self.open_file_grant(grant, disclose_priv, *vid)?;
+        // Option B (§4.2): we hold `K_root` for this vault (the envelope opened with
+        // our derived `K_manifest`), so re-derive every per-chunk key from the
+        // manifest's `pt_hash` + `K_content`. No FileGrant, no owner liveness; the
+        // BLAKE3(plaintext)==pt_hash check happens inside `reconstruct`.
+        let incoming_keys = chunk_keys_from_manifest(&incoming, &*vkeys.k_content);
 
         // §11 / MAJOR 5: take the vid's publish lock BEFORE reading our local
         // baseline and hold it through the reconstruct + commit below, so a
@@ -2585,7 +2540,7 @@ impl Daemon {
             if f.deleted {
                 continue;
             }
-            for (id, _len) in &f.chunks {
+            for (id, _pt, _len) in &f.chunks {
                 if carapace_vault::ChunkStore::has(&store, id)? {
                     continue;
                 }
@@ -2659,7 +2614,7 @@ impl Daemon {
         let mut seen = HashSet::new();
         let mut chunk_ids = Vec::new();
         for f in &manifest.files {
-            for (id, _len) in &f.chunks {
+            for (id, _pt, _len) in &f.chunks {
                 if seen.insert(*id) {
                     chunk_ids.push(*id);
                 }
@@ -2702,7 +2657,7 @@ impl Daemon {
             if f.deleted {
                 continue;
             }
-            for (id, _len) in &f.chunks {
+            for (id, _pt, _len) in &f.chunks {
                 if !seen.insert(*id) {
                     continue;
                 }
@@ -3591,29 +3546,19 @@ impl Daemon {
         );
 
         // Send the current owner-signed announce so the replica learns the set it
-        // joins and can gate later fetches on membership (§7.4 b, W8), then the
-        // matching owner-signed FileGrant (§8.4): the replica retains both so it can
-        // serve them to a recovering owner-device that lost every original device.
-        // The grant body stays HPKE-sealed to the owner's disclosure key, so the
-        // replica gains no plaintext by holding it.
-        let (announce, grant) = {
+        // joins and can gate later fetches on membership (§7.4 b, W8), and can serve it
+        // back to a recovering owner-device that lost every original device. Option B
+        // (§4): no FileGrant is pushed - the recovering device re-derives per-chunk keys
+        // from the manifest pt_hash, so own-device sync and recovery need no grant.
+        let announce = {
             let s = self.shared.read().expect("shared lock");
-            let announce = s
-                .announces
+            s.announces
                 .iter()
                 .find(|a| a.vid == vid)
                 .cloned()
-                .context("no announce for vault being placed")?;
-            let grant = s
-                .grants
-                .iter()
-                .find(|g| g.vid == vid && g.epoch == epoch)
-                .cloned()
-                .context("no epoch-matched grant for vault being placed")?;
-            (announce, grant)
+                .context("no announce for vault being placed")?
         };
         write_msg(&mut send, &announce).await?;
-        write_msg(&mut send, &grant).await?;
 
         write_u64(&mut send, blobs.len() as u64).await?;
         for b in blobs {
@@ -4144,34 +4089,6 @@ impl Daemon {
         };
         fg.sign(&self.node_key);
         Ok(fg)
-    }
-
-    fn open_file_grant(
-        &self,
-        grant: &FileGrant,
-        disclose_priv: &HpkePrivateKey,
-        vid: [u8; 32],
-    ) -> Result<ChunkKeys> {
-        let user_pub = self.user_key.verifying_key().to_bytes();
-        let sealed = grant
-            .sealed
-            .iter()
-            .find(|s| s.to == user_pub)
-            .context("grant has no sealed body for this user")?;
-        ensure!(
-            sealed.ct.len() >= 32,
-            "sealed grant too short for encap key"
-        );
-        let (enc, ct) = sealed.ct.split_at(32);
-        // S2: aad binds vid, epoch, and grant_id (matches `build_file_grant`).
-        let aad = disclose::grant_aad(&vid, grant.epoch, &grant.grant_id);
-        // S7: the opened plaintext carries every chunk key; scrub it on drop.
-        let pt = Zeroizing::new(
-            seal::open(disclose_priv, enc, INFO_DISCLOSE, &aad, ct)
-                .map_err(|e| anyhow::anyhow!("grant open: {e}"))?,
-        );
-        let body = GrantBody::from_bytes(&pt)?;
-        Ok(keys_from_grant(&body))
     }
 
     // ---- selective disclosure to an audience (§7.4) --------------------
@@ -5293,7 +5210,7 @@ fn select_grant_body(manifest: &Manifest, keys: &ChunkKeys, paths: &[&str]) -> R
             continue;
         }
         let mut chunks = Vec::with_capacity(f.chunks.len());
-        for (id, len) in &f.chunks {
+        for (id, _pt, len) in &f.chunks {
             let secret = keys
                 .get(id)
                 .with_context(|| format!("missing chunk key for {}", f.path))?;
@@ -5453,9 +5370,8 @@ fn select_targets(
     self_user: &[u8; 32],
     recv_cards: &[ContactCard],
     announces: &[VaultAnnounce],
-    grants: &HashMap<[u8; 32], FileGrant>,
     now: u64,
-) -> Vec<([u8; 32], VaultAnnounce, FileGrant)> {
+) -> Vec<([u8; 32], VaultAnnounce)> {
     // The set of node ids our user delegates. The `DocStore` keeps only ONE card per
     // user, so with 3+ same-user devices that stored card alone names a single
     // sibling and every other sibling's announce would be refused - silently
@@ -5497,15 +5413,15 @@ fn select_targets(
             let _ = docs.offer_announce(ann);
             continue;
         }
-        // A matching-epoch grant from a delegated node is required to open it.
-        let grant = match grants.get(&ann.vid) {
-            Some(g) if g.epoch == ann.epoch && delegated.contains(&g.by) => g,
-            _ => continue,
-        };
+        // Option B (§4): a delegated-signer announce is a full reconstruction target
+        // on its own - `reconstruct_one` re-derives per-chunk keys from the manifest
+        // `pt_hash` (holder of `K_root`), so no matching FileGrant is required. This is
+        // what lets a `K_root`-recovering claimant reconstruct off a replica that
+        // serves only the announce + owner card, never a grant.
         // W2: persistent rollback — accept only an epoch strictly newer than the
         // highest ever seen from this signer for this vid (also re-verifies sig).
         if matches!(docs.offer_announce(ann), Ok(true)) {
-            out.push((ann.vid, ann.clone(), grant.clone()));
+            out.push((ann.vid, ann.clone()));
         }
     }
     out
@@ -5800,7 +5716,6 @@ fn drop_replica_vid(s: &mut Shared, vid: &[u8; 32]) {
     s.replica_owner.remove(vid);
     s.replica_members.remove(vid);
     s.replica_announce.remove(vid);
-    s.replica_grants.remove(vid);
     s.replica_chunks.retain(|_, v| v != vid);
 }
 
@@ -6696,7 +6611,7 @@ fn grant_body(manifest: &Manifest, keys: &ChunkKeys) -> Result<GrantBody> {
             continue;
         }
         let mut chunks = Vec::with_capacity(f.chunks.len());
-        for (id, len) in &f.chunks {
+        for (id, _pt, len) in &f.chunks {
             let s = keys
                 .get(id)
                 .with_context(|| format!("missing chunk key for {}", f.path))?;
@@ -6715,23 +6630,6 @@ fn grant_body(manifest: &Manifest, keys: &ChunkKeys) -> Result<GrantBody> {
         });
     }
     Ok(GrantBody { files })
-}
-
-/// Rebuild the `ChunkKeys` map from an opened `GrantBody`.
-fn keys_from_grant(body: &GrantBody) -> ChunkKeys {
-    let mut m = HashMap::new();
-    for f in &body.files {
-        for c in &f.chunks {
-            m.insert(
-                c.chunk_id,
-                ChunkSecret {
-                    chunk_key: Zeroizing::new(c.chunk_key),
-                    nonce: Zeroizing::new(c.nonce),
-                },
-            );
-        }
-    }
-    m
 }
 
 /// This device's ContactCard: display name, disclosure enc key, and a single
@@ -6823,26 +6721,6 @@ mod tests {
         a
     }
 
-    fn grant(node: &SigningKey, vid: [u8; 32], epoch: u64) -> FileGrant {
-        let mut g = FileGrant {
-            grant_id: [0; 16],
-            vid,
-            epoch,
-            audience: vec![],
-            sealed: vec![],
-            by: [0; 32],
-            sig: [0; 64],
-        };
-        g.sign(node);
-        g
-    }
-
-    fn one_grant(node: &SigningKey, vid: [u8; 32], epoch: u64) -> HashMap<[u8; 32], FileGrant> {
-        let mut m = HashMap::new();
-        m.insert(vid, grant(node, vid, epoch));
-        m
-    }
-
     // C1: an announce is honored only if its signer node is delegated by the
     // vault-owning user's newest card; a rogue/undelegated node is refused.
     #[test]
@@ -6855,14 +6733,7 @@ mod tests {
 
         let mut docs = DocStore::new();
         docs.offer_card(&card).unwrap();
-        let targets = select_targets(
-            &mut docs,
-            &self_user,
-            &[],
-            &[announce(&node, vid, 1)],
-            &one_grant(&node, vid, 1),
-            NOW,
-        );
+        let targets = select_targets(&mut docs, &self_user, &[], &[announce(&node, vid, 1)], NOW);
         assert_eq!(targets.len(), 1, "delegated signer must be accepted");
 
         // A rogue node, not present in the user's card, is refused even though it
@@ -6870,14 +6741,7 @@ mod tests {
         let rogue = kp(0x42);
         let mut docs = DocStore::new();
         docs.offer_card(&card).unwrap();
-        let targets = select_targets(
-            &mut docs,
-            &self_user,
-            &[],
-            &[announce(&rogue, vid, 1)],
-            &one_grant(&rogue, vid, 1),
-            NOW,
-        );
+        let targets = select_targets(&mut docs, &self_user, &[], &[announce(&rogue, vid, 1)], NOW);
         assert!(
             targets.is_empty(),
             "undelegated signer must be refused (C1)"
@@ -6896,7 +6760,6 @@ mod tests {
             &self_user,
             &[card2],
             &[announce(&node2, vid, 1)],
-            &one_grant(&node2, vid, 1),
             NOW,
         );
         assert_eq!(
@@ -6916,7 +6779,6 @@ mod tests {
             &self_user,
             &[rogue_card],
             &[announce(&rogue, vid, 1)],
-            &one_grant(&rogue, vid, 1),
             NOW,
         );
         assert!(
@@ -6939,14 +6801,11 @@ mod tests {
 
         let mut docs = DocStore::new();
         docs.offer_card(&card).unwrap();
-        let mut grants = one_grant(&node, good, 1);
-        grants.insert(bad, grant(&rogue, bad, 1));
         let targets = select_targets(
             &mut docs,
             &self_user,
             &[],
             &[announce(&rogue, bad, 1), announce(&node, good, 1)],
-            &grants,
             NOW,
         );
         assert_eq!(targets.len(), 1);
@@ -7316,37 +7175,16 @@ mod tests {
         docs.offer_card(&card).unwrap();
 
         // sync 1: accept epoch 2 (delegation comes from the stored card)
-        let t = select_targets(
-            &mut docs,
-            &self_user,
-            &[],
-            &[announce(&node, vid, 2)],
-            &one_grant(&node, vid, 2),
-            NOW,
-        );
+        let t = select_targets(&mut docs, &self_user, &[], &[announce(&node, vid, 2)], NOW);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].1.epoch, 2);
 
         // sync 2: a real, signed epoch-1 announce (stale replica) is refused
-        let t = select_targets(
-            &mut docs,
-            &self_user,
-            &[],
-            &[announce(&node, vid, 1)],
-            &one_grant(&node, vid, 1),
-            NOW,
-        );
+        let t = select_targets(&mut docs, &self_user, &[], &[announce(&node, vid, 1)], NOW);
         assert!(t.is_empty(), "epoch-1 rollback refused after epoch 2 (W2)");
 
         // equal epoch is not newer either
-        let t = select_targets(
-            &mut docs,
-            &self_user,
-            &[],
-            &[announce(&node, vid, 2)],
-            &one_grant(&node, vid, 2),
-            NOW,
-        );
+        let t = select_targets(&mut docs, &self_user, &[], &[announce(&node, vid, 2)], NOW);
         assert!(t.is_empty(), "equal epoch is refused");
     }
 

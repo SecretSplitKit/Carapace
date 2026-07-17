@@ -564,28 +564,43 @@ mechanisms. Each is documented here rather than code-changed.
   requests (§10.1), so no separate audit-notice frame is needed. Retained in `carapace-wire`
   with their Appendix B vectors for wire-schema completeness and possible future use.
 
-## Note — §8.4 recovery data-fetch: replicas retain and serve the FileGrant (Option A)
+## Note — §8.4 recovery data-fetch: self-sufficient manifest (Option B)
 
 §8.4 ("recover K_root, then fetch the latest manifest + chunks from any replica") requires the
-recovering, key-less claimant to obtain the per-chunk decryption keys, which live only in the
-`FileGrant` (`GrantChunk { chunk_key, nonce }`), not in the manifest. Previously the grant was
-served only by the live owner, so a dead-owner claimant could fetch ciphertext but not decrypt
-it. Implemented as **Option A**: on replica placement/repair/epoch-push the owner now pushes the
-epoch-matched `FileGrant` alongside the announce; the replica verifies it (`grant.verify()`,
-`vid`/`by`/`epoch` bound to the placement) and retains it (`replica_grants`, `replica_announce`);
-and a dialer classified `ReplicaDevice(owner)` (which requires presenting an owner-user-key-signed
-card delegating its node - unforgeable without `K_root`) is served that one owner's card, announce,
-and grant so it can drive `select_targets` and reconstruct. Confidentiality is unchanged: the grant
-body is HPKE-sealed to the owner's `K_disclose` (derived from `K_root`), so serving it to anyone
-lacking `K_root` yields nothing, and anyone holding `K_root` could derive the content keys directly.
-End-to-end regression: `crates/carapaced/tests/recovery_reconstruct.rs`.
+recovering, key-less claimant to obtain the per-chunk decryption keys. **Implemented as Option B**
+(supersedes the earlier Option-A `FileGrant`-on-replica workaround): the wire `FileEntry` chunk
+list is `(ChunkID, pt_hash, len)` - it stores `pt_hash = BLAKE3(chunk plaintext)`, which was always
+computed at ingest for chunk-key derivation and is now recorded in the sealed manifest. A holder of
+`K_content` (any owner device, or a `K_root`-recovering claimant) re-derives each chunk's
+`chunk_key`/`nonce` from `HKDF(K_content, … ‖ pt_hash)` (`chunk_keys_from_manifest`), fetches by
+`ChunkID`, decrypts, and gets a free integrity check (`BLAKE3(plaintext) == pt_hash`). No grant, no
+owner liveness.
 
-Two dispositions: (1) the placement push now carries one extra `FileGrant` frame between the
-announce and the blob count - a coordinated in-repo protocol addition, fail-closed against a pre-
-change pusher (placement aborts, no partial state), no mixed-version compat guarantee. (2)
-Deferred **Option B** (carry the per-chunk keys in the sealed manifest so recovery needs no grant
-at all): cleaner long-term, but it revs the core `Manifest`/`FileEntry` wire format and the §4/§5
-cross-client golden vectors (W11), so it is left as a future spec-level decision rather than folded
-in here. (3) Multi-source max-epoch reconciliation across trustees + replicas (§8.4) remains
-unit-tested (`max_epoch_refs`); the live claimant fetch uses a single replica, which is sufficient
-for content recovery - wiring trustee-served announce refs into the live fetch is additive.
+- **Owner / recovery reconstruct** (`reconstruct_one`, used by `sync_from` and recovery): re-derives
+  keys from the manifest `pt_hash` - no `FileGrant`. `select_targets` now builds a reconstruction
+  target from a delegated-signer announce alone (no matching grant required).
+- **Retired (recovery grant only):** `Shared.replica_grants`; the `FileGrant` push in
+  `invite_and_push`; the grant read/verify/store in `serve_replica_store`; and the `grants.push`
+  in the `ReplicaOwner` branch of `serve_docs`. The owner no longer pushes a self-`FileGrant` to
+  replicas; own-device sync derives keys from the manifest.
+- **KEPT (claimant serve path, §4.3):** the `replica_owner_device` classification, the
+  `BlobAuth::ReplicaDevice` insert, and the `ReplicaOwner` branch serving the **owner card +
+  `replica_announce`**. This is the recovering claimant's ONLY authorization + announce path
+  (`CeremonyShare` carries no announce refs, `AnnounceRef` has no replica list, and
+  `classify_dialer` admits a fresh device nowhere else); deleting it bricks recovery even with
+  `K_root`. The `FileGrant`/`GrantChunk` machinery and the `carapace-disclose` flow remain intact -
+  `FileGrant` is now **disclosure-only** (§7.4).
+
+**Confidentiality invariant (MUST): never grant `K_manifest` to a party without `K_content`.**
+`pt_hash = BLAKE3(plaintext)` is a plaintext guess-confirmation oracle to anyone who can open the
+manifest. It is safe only because every party who holds `K_manifest` (via `K_vaultroot`) also holds
+its sibling `K_content` (kdf.rs), so the oracle confirms nothing they cannot already decrypt. §7.4
+disclosure therefore hands explicit `GrantChunk` keys, **never** `K_manifest`.
+
+Wire/vector impact: the `Manifest`/`FileEntry` CBOR shape changed (Appendix B `FileEntry` chunk map
+is now `{0: id, 1: pt_hash, 2: len}`); the B.8.24 manifest golden vector was regenerated from the
+`cbor_vectors.py` oracle and round-trips through `encode`/`decode`. The KDF-tree and
+`(vid, P) -> ct + ChunkID` chunk vectors are UNCHANGED (`pt_hash` was always computed, just not
+stored); the disclosure `GrantBody` vector is unchanged. End-to-end regression:
+`crates/carapaced/tests/recovery_reconstruct.rs` (fresh claimant, owner shut down, no grant);
+unit: `crates/carapace-vault/tests/roundtrip.rs` (manifest-pt_hash reconstruct + tamper detection).

@@ -44,7 +44,7 @@ impl Vault {
             .files
             .iter()
             .flat_map(|f| f.chunks.iter())
-            .map(|(id, _)| (*id, self.store.get(id).unwrap().unwrap()))
+            .map(|(id, _, _)| (*id, self.store.get(id).unwrap().unwrap()))
             .collect()
     }
 }
@@ -62,7 +62,8 @@ fn make_vault_n(owner_seed: u8, n: usize) -> Vault {
         let data = format!("ciphertext-chunk-{owner_seed}-{i}-opaque-padding-bytes").into_bytes();
         let id = chunk_id(&data);
         store.put(id, data.clone()).unwrap();
-        chunks.push((id, data.len() as u64));
+        // Synthetic ciphertext blobs (no real plaintext); pt_hash is irrelevant to PoR.
+        chunks.push((id, [0u8; 32], data.len() as u64));
     }
 
     let manifest = Manifest {

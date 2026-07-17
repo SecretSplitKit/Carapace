@@ -38,10 +38,11 @@ fn make_vault(owner_seed: u8) -> Vault {
     let vid = [owner_seed; 32];
     let mut store = MemoryStore::new();
 
-    let mut chunk = |data: &[u8]| -> ([u8; 32], u64) {
+    let mut chunk = |data: &[u8]| -> ([u8; 32], [u8; 32], u64) {
         let id = chunk_id(data);
         store.put(id, data.to_vec()).unwrap();
-        (id, data.len() as u64)
+        // Synthetic ciphertext blob; pt_hash unused by these replica-serving tests.
+        (id, [0u8; 32], data.len() as u64)
     };
     let c0 = chunk(b"ciphertext-chunk-zero-opaque-bytes");
     let c1 = chunk(b"ciphertext-chunk-one-more-opaque-bytes!!");
@@ -335,7 +336,7 @@ fn receive_enforces_quota_cumulatively() {
         .files
         .iter()
         .flat_map(|f| f.chunks.iter())
-        .map(|(id, _)| (*id, v.store.get(id).unwrap().unwrap()))
+        .map(|(id, _, _)| (*id, v.store.get(id).unwrap().unwrap()))
         .collect();
     let incoming =
         v.env.to_bytes().len() as u64 + chunks.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
@@ -369,7 +370,7 @@ fn placed_chunks_round_trip_from_the_replica() {
 
     // Every chunk the manifest names is retrievable from the replica, byte-exact.
     for f in &v.manifest.files {
-        for (id, _) in &f.chunks {
+        for (id, _, _) in &f.chunks {
             let got = friend.chunk(id).expect("replica serves the chunk");
             assert_eq!(chunk_id(&got), *id, "served bytes hash to their ChunkID");
             assert_eq!(v.store.get(id).unwrap().unwrap(), got);
