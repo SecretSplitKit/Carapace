@@ -80,6 +80,11 @@ pub enum ReplicaError {
         /// The cap that was exceeded.
         max: u64,
     },
+    /// Persisted PoR tracker state ([`por::AuditTracker::from_bytes`]) was
+    /// truncated, had a wrong version tag, or carried trailing bytes. Loading it
+    /// would silently drop round counters and reopen the §10.1 replay window, so
+    /// the funnel MUST fail loud instead.
+    PorStateCorrupt(&'static str),
 }
 
 impl core::fmt::Display for ReplicaError {
@@ -102,6 +107,7 @@ impl core::fmt::Display for ReplicaError {
                     "replica push declared {count} blobs, over the cap of {max}"
                 )
             }
+            Self::PorStateCorrupt(why) => write!(f, "corrupt persisted PoR tracker state: {why}"),
         }
     }
 }

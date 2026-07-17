@@ -37,7 +37,9 @@ use carapace_crypto::content;
 use carapace_crypto::kdf::INFO_DISCLOSE;
 use carapace_crypto::seal::{self, HpkeError, HpkePrivateKey, HpkePublicKey};
 use carapace_wire::messages::Signed;
-use carapace_wire::{FileGrant, GrantBody, GrantFile, Sealed};
+use carapace_wire::{
+    decode, encode, Error as WireError, FileGrant, GrantBody, GrantFile, Map, Sealed, Value,
+};
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
@@ -268,7 +270,7 @@ pub fn granted_chunk_ids(body: &GrantBody) -> HashSet<[u8; 32]> {
 /// §7.4 / D3: a granted chunk is served to a requester only when the requester is
 /// authenticated (elsewhere, via NodeID + delegation) as one of the users an
 /// owner-signed grant covering that chunk names in its audience.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct DisclosureTable {
     /// ChunkID -> the set of audience user pubkeys any issued grant authorizes
     /// for that chunk.
@@ -300,6 +302,74 @@ impl DisclosureTable {
         self.by_chunk
             .get(chunk_id)
             .is_some_and(|users| users.contains(user))
+    }
+
+    /// Serialize the whole table to deterministic det-CBOR for at-rest
+    /// persistence. This state is NOT recoverable from the owner's persisted
+    /// `FileGrant`s (those carry only HPKE-sealed bodies; the ChunkID->audience
+    /// mapping lives in the cleartext `GrantBody`, which the owner never
+    /// retains), so the table itself must survive a reboot or disclosed-to
+    /// friends get denied after restart, breaking §7.4 "disclosure is forever."
+    ///
+    /// Lossless: every `(chunk, audience-user)` authorization round-trips, so the
+    /// audience-arm fetch-gate decides identically after restart. The caller
+    /// seals the returned bytes at rest; no encryption happens here. Entries and
+    /// per-chunk users are sorted, so equal tables encode to identical bytes
+    /// (stable input to the redb persistence funnel).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut chunks: Vec<(&[u8; 32], &HashSet<[u8; 32]>)> = self.by_chunk.iter().collect();
+        chunks.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let entries = chunks
+            .into_iter()
+            .map(|(id, users)| {
+                let mut u: Vec<[u8; 32]> = users.iter().copied().collect();
+                u.sort_unstable();
+                Value::Array(vec![
+                    Value::Bytes(id.to_vec()),
+                    Value::Array(u.into_iter().map(|x| Value::Bytes(x.to_vec())).collect()),
+                ])
+            })
+            .collect();
+        let mut m = Map::new();
+        m.u(0, Value::Array(entries));
+        encode(&Value::Map(m))
+    }
+
+    /// Reconstruct a table from [`DisclosureTable::to_bytes`] output. The
+    /// reconstructed table authorizes exactly the same `(chunk, user)` pairs as
+    /// the original.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DiscloseError> {
+        let mut m = decode(bytes)
+            .and_then(Value::into_map)
+            .map_err(DiscloseError::Decode)?;
+        let entries = m
+            .take(0)
+            .and_then(Value::into_list)
+            .map_err(DiscloseError::Decode)?;
+        m.finish().map_err(DiscloseError::Decode)?;
+        let mut by_chunk = HashMap::with_capacity(entries.len());
+        for e in entries {
+            let mut it = e.into_list().map_err(DiscloseError::Decode)?.into_iter();
+            let id = it
+                .next()
+                .ok_or(DiscloseError::Decode(WireError::TypeMismatch))?
+                .into_array_n::<32>()
+                .map_err(DiscloseError::Decode)?;
+            let users_v = it
+                .next()
+                .ok_or(DiscloseError::Decode(WireError::TypeMismatch))?
+                .into_list()
+                .map_err(DiscloseError::Decode)?;
+            if it.next().is_some() {
+                return Err(DiscloseError::Decode(WireError::TypeMismatch));
+            }
+            let mut users = HashSet::with_capacity(users_v.len());
+            for u in users_v {
+                users.insert(u.into_array_n::<32>().map_err(DiscloseError::Decode)?);
+            }
+            by_chunk.insert(id, users);
+        }
+        Ok(DisclosureTable { by_chunk })
     }
 }
 
@@ -493,6 +563,117 @@ mod tests {
         assert!(
             !table.is_audience(&g3.chunk_id, &b_user),
             "an ungranted chunk is refused"
+        );
+    }
+
+    // Persistence: a table serialized and reloaded authorizes EXACTLY the same
+    // (audience, chunk) pairs as the original, so the audience-arm fetch gate
+    // decides identically after a reboot (§7.4 "disclosure is forever"). Two
+    // grants give overlapping and distinct chunks across two audiences to
+    // exercise multi-user-per-chunk.
+    #[test]
+    fn disclosure_table_round_trips_losslessly() {
+        let vid = [0xC0; 32];
+        let k_content = *kdf::k_content(&*kdf::k_vaultroot(&[0x11; 32], &vid));
+        let owner = SigningKey::from_bytes(&[0x03; 32]);
+        let (b_user, c_user, d_user) = ([0xBB; 32], [0xCC; 32], [0xDD; 32]);
+
+        let (g1, _) = seal_one(&k_content, &vid, b"one");
+        let (g2, _) = seal_one(&k_content, &vid, b"two");
+        let (g3, _) = seal_one(&k_content, &vid, b"three");
+        let (ungranted, _) = seal_one(&k_content, &vid, b"nope");
+
+        // Grant 1: {B, C} get files carrying chunks g1, g2.
+        let body1 = GrantBody {
+            files: vec![
+                file_of("f1", b"one", g1.clone()),
+                file_of("f2", b"two", g2.clone()),
+            ],
+        };
+        let grant1 = build_grant(
+            &owner,
+            vid,
+            1,
+            [0x90; 16],
+            &body1,
+            &[
+                Recipient {
+                    user: b_user,
+                    enc_pub: [0x05; 32],
+                },
+                Recipient {
+                    user: c_user,
+                    enc_pub: [0x06; 32],
+                },
+            ],
+        )
+        .unwrap();
+
+        // Grant 2: {D} gets a file carrying chunks g2 (overlap) and g3.
+        let body2 = GrantBody {
+            files: vec![GrantFile {
+                path: "f23".into(),
+                file_hash: [0; 32],
+                size: 0,
+                chunks: vec![g2.clone(), g3.clone()],
+            }],
+        };
+        let grant2 = build_grant(
+            &owner,
+            vid,
+            1,
+            [0x91; 16],
+            &body2,
+            &[Recipient {
+                user: d_user,
+                enc_pub: [0x07; 32],
+            }],
+        )
+        .unwrap();
+
+        let mut table = DisclosureTable::new();
+        table.record(&grant1, &body1);
+        table.record(&grant2, &body2);
+
+        let reloaded = DisclosureTable::from_bytes(&table.to_bytes()).unwrap();
+
+        // Full-state equality (HashMap/HashSet Eq is order-independent) proves the
+        // reconstruction is lossless.
+        assert_eq!(table, reloaded, "reloaded table differs from original");
+
+        // And the gate decides identically across every relevant (chunk, user):
+        // sweep the cartesian product of every referenced chunk and user, plus an
+        // ungranted chunk and a never-seen user.
+        let chunks = [g1.chunk_id, g2.chunk_id, g3.chunk_id, ungranted.chunk_id];
+        let users = [b_user, c_user, d_user, [0xEE; 32]];
+        for chunk in &chunks {
+            for user in &users {
+                assert_eq!(
+                    table.is_audience(chunk, user),
+                    reloaded.is_audience(chunk, user),
+                    "gate decision diverged after reload for chunk/user",
+                );
+            }
+        }
+
+        // Spot-check the intended authorizations survived: B and C reach g1/g2,
+        // D reaches g2/g3, nobody reaches an ungranted chunk, and D is not on g1.
+        assert!(reloaded.is_audience(&g1.chunk_id, &b_user));
+        assert!(reloaded.is_audience(&g2.chunk_id, &c_user));
+        assert!(reloaded.is_audience(&g2.chunk_id, &d_user)); // overlap merged
+        assert!(reloaded.is_audience(&g3.chunk_id, &d_user));
+        assert!(!reloaded.is_audience(&g1.chunk_id, &d_user));
+        assert!(!reloaded.is_audience(&ungranted.chunk_id, &b_user));
+
+        // Determinism: recording in the opposite order yields identical bytes
+        // (sorted encoding), so the redb funnel sees a stable value.
+        let mut table_rev = DisclosureTable::new();
+        table_rev.record(&grant2, &body2);
+        table_rev.record(&grant1, &body1);
+        assert_eq!(
+            table.to_bytes(),
+            table_rev.to_bytes(),
+            "encoding must be independent of record order",
         );
     }
 

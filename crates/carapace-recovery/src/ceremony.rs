@@ -7,7 +7,8 @@
 
 use carapace_crypto::seal::{open, seal, HpkePrivateKey, HpkePublicKey};
 use carapace_wire::{
-    CeremonyAbort, CeremonyApprove, CeremonyShare, RecoveryOpen, ShareGrant, Signed,
+    decode, encode, CeremonyAbort, CeremonyApprove, CeremonyShare, Map, RecoveryOpen, ShareGrant,
+    Signed, Value,
 };
 use ed25519_dalek::SigningKey;
 
@@ -286,6 +287,92 @@ impl CeremonyState {
         } else {
             CeremonyPhase::Open
         }
+    }
+
+    /// Serialize the complete tracking state to deterministic canonical CBOR (the same restricted
+    /// profile the wire uses: sorted keys, shortest-form ints, definite lengths) for durable
+    /// persistence across a daemon reboot. Lossless: every field - including the private roster,
+    /// approvals, and `aborted` flag, and the local-clock anchor `first_seen` - round-trips through
+    /// [`Self::from_bytes`]. This state carries pubkeys/sigs/flags only, never share bytes; the
+    /// persistence layer seals it at rest, so this method does not encrypt.
+    ///
+    /// A dropped field here would be a §8.5 security regression: losing `first_seen` resets the
+    /// delay window on reboot, losing an approval un-approves a trustee, and losing `aborted`
+    /// re-opens a ceremony the subject already cancelled.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut m = Map::new();
+        m.u(0, Value::Bytes(self.ceremony_id.to_vec()));
+        m.u(1, Value::Bytes(self.subject.to_vec()));
+        m.u(2, Value::Uint(self.rsid));
+        m.u(3, Value::Bytes(self.ceremony_enc.to_vec()));
+        m.u(4, Value::Uint(self.recovery_delay));
+        m.u(5, Value::Uint(self.opened_at));
+        m.u(6, Value::Uint(self.first_seen));
+        m.u(7, Value::Uint(u64::from(self.m)));
+        m.u(
+            8,
+            Value::Array(
+                self.roster
+                    .iter()
+                    .map(|k| Value::Bytes(k.to_vec()))
+                    .collect(),
+            ),
+        );
+        m.u(
+            9,
+            Value::Array(
+                self.approvals
+                    .iter()
+                    .map(|k| Value::Bytes(k.to_vec()))
+                    .collect(),
+            ),
+        );
+        m.u(10, Value::Bool(self.aborted));
+        encode(&Value::Map(m))
+    }
+
+    /// Reconstruct a [`CeremonyState`] from [`Self::to_bytes`]. Strict: the canonical decoder
+    /// rejects non-canonical CBOR, an unknown key, a missing field, or a byte string of the wrong
+    /// length, and `m` must fit in a `u8`. Errors surface as [`RecoveryError::Wire`].
+    pub fn from_bytes(b: &[u8]) -> Result<Self, RecoveryError> {
+        let mut m = decode(b)?.into_map()?;
+        let ceremony_id = m.take(0)?.into_array_n()?;
+        let subject = m.take(1)?.into_array_n()?;
+        let rsid = m.take(2)?.into_uint()?;
+        let ceremony_enc = m.take(3)?.into_array_n()?;
+        let recovery_delay = m.take(4)?.into_uint()?;
+        let opened_at = m.take(5)?.into_uint()?;
+        let first_seen = m.take(6)?.into_uint()?;
+        let m_val = m.take(7)?.into_uint()?;
+        let m_threshold = u8::try_from(m_val).map_err(|_| carapace_wire::Error::WrongLength)?;
+        let roster = m
+            .take(8)?
+            .into_list()?
+            .into_iter()
+            .map(Value::into_array_n)
+            .collect::<Result<Vec<[u8; 32]>, _>>()?;
+        let approvals = m
+            .take(9)?
+            .into_list()?
+            .into_iter()
+            .map(Value::into_array_n)
+            .collect::<Result<Vec<[u8; 32]>, _>>()?;
+        let aborted = m.take(10)?.into_bool()?;
+        m.finish()?;
+        Ok(Self {
+            ceremony_id,
+            subject,
+            rsid,
+            ceremony_enc,
+            recovery_delay,
+            opened_at,
+            first_seen,
+            m: m_threshold,
+            roster,
+            approvals,
+            aborted,
+        })
     }
 }
 
@@ -881,5 +968,80 @@ mod tests {
             CeremonyState::open(&open, s.roster.clone(), 3, DELAY, T0),
             Err(RecoveryError::RsidOutOfRange)
         ));
+    }
+
+    /// Durable persistence: a mid-ceremony `CeremonyState` (open, some approvals, a set
+    /// `first_seen`) survives serialize/deserialize byte-for-byte, so a daemon reboot cannot reset
+    /// the delay clock, drop an approval, or lose an abort (§8.5). Covers both the live and the
+    /// aborted variant.
+    #[test]
+    fn ceremony_state_persistence_round_trips() {
+        let s = setup();
+        let open = an_open(&s, u64::from(s.shares[0].recovery_set_id), T0);
+        // first_seen is anchored to `now` at open; use a distinct value from opened_at to prove the
+        // E4 local-clock anchor is what survives, not the sponsor-controlled opened_at.
+        let first_seen = T0 + 5;
+        let mut cer = CeremonyState::open(&open, s.roster.clone(), 3, DELAY, first_seen).unwrap();
+        // Two of three approvals recorded so far (mid-ceremony, sub-M).
+        for t in s.trustees.iter().take(2) {
+            let mut ap = CeremonyApprove {
+                ceremony_id: [0xCE; 16],
+                ts: T0 + 10,
+                by: [0; 32],
+                sig: [0; 64],
+            };
+            ap.sign(t);
+            cer.approve(&ap).unwrap();
+        }
+
+        let restored = CeremonyState::from_bytes(&cer.to_bytes()).unwrap();
+
+        // Byte-for-byte: re-serialization is identical (proves every field round-tripped).
+        assert_eq!(restored.to_bytes(), cer.to_bytes());
+        // Explicit field checks for the security-critical anchors.
+        assert_eq!(restored.first_seen, first_seen);
+        assert_eq!(restored.approvals_count(), 2);
+        assert_eq!(restored.is_aborted(), cer.is_aborted());
+        assert_eq!(restored.m, cer.m);
+        assert_eq!(restored.recovery_delay, cer.recovery_delay);
+        // Same release verdict at the same clock, before and across the delay boundary.
+        for now in [first_seen, first_seen + DELAY - 1, first_seen + DELAY] {
+            assert_eq!(restored.can_release(now), cer.can_release(now));
+            assert_eq!(restored.phase(now), cer.phase(now));
+        }
+
+        // A third approval reaches M; still holds after a round-trip.
+        let mut cer = restored;
+        let mut ap = CeremonyApprove {
+            ceremony_id: [0xCE; 16],
+            ts: T0 + 20,
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        ap.sign(&s.trustees[2]);
+        cer.approve(&ap).unwrap();
+        assert!(cer.can_release(first_seen + DELAY));
+
+        // The abort flag survives: an aborted ceremony round-trips as still aborted and never
+        // releases, blocking a silent takeover across a reboot.
+        let mut abort = CeremonyAbort {
+            ceremony_id: [0xCE; 16],
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        abort.sign(&s.subject_key);
+        cer.abort(&abort).unwrap();
+        let restored = CeremonyState::from_bytes(&cer.to_bytes()).unwrap();
+        assert!(restored.is_aborted());
+        assert!(!restored.can_release(first_seen + DELAY));
+        assert_eq!(restored.phase(first_seen + DELAY), CeremonyPhase::Aborted);
+        assert_eq!(restored.to_bytes(), cer.to_bytes());
+    }
+
+    /// A truncated / non-canonical blob is rejected rather than silently mis-parsed.
+    #[test]
+    fn ceremony_state_from_bytes_rejects_garbage() {
+        assert!(CeremonyState::from_bytes(b"not cbor").is_err());
+        assert!(CeremonyState::from_bytes(&[]).is_err());
     }
 }
