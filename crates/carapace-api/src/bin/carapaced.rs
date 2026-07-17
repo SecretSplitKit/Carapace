@@ -144,14 +144,36 @@ async fn run(rest: Vec<String>) -> Result<()> {
     );
 
     println!("serving; press Ctrl-C to stop");
-    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
-    drop(vault_watcher); // stop the §11 watcher before reclaiming the daemon Arc
+    wait_for_stop().await?;
+    drop(vault_watcher); // stop the §11 watcher before shutting the daemon down
     api.shutdown();
-    match Arc::try_unwrap(daemon) {
-        Ok(d) => d.shutdown().await,
-        Err(_) => eprintln!("daemon still referenced at shutdown; skipping graceful close"),
-    }
+    // `shutdown(&self)` flushes the blob store + closes the endpoint regardless of
+    // how many `Arc<Daemon>` clones the API server / watcher tasks still hold — the
+    // durability flush must never be skipped because of a lingering reference.
+    daemon.shutdown().await;
     Ok(())
+}
+
+/// Block until a stop signal arrives. Handles SIGINT (Ctrl-C) AND, on unix,
+/// SIGTERM — a normal OS reboot / service manager stop sends SIGTERM, and an
+/// unhandled SIGTERM kills the process without running `Daemon::shutdown`, so
+/// the blob store's last write batch would be lost. Both must take the same
+/// graceful path.
+async fn wait_for_stop() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r.context("wait for Ctrl-C")?,
+            _ = term.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
+    }
 }
 
 fn parse_vid(h: &str) -> Result<[u8; 32]> {

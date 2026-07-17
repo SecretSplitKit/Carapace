@@ -127,6 +127,32 @@ impl IrohBlobStore {
         Ok(())
     }
 
+    /// Whether blob `id` is fully present in this store. Async; use from async
+    /// code (the sync [`ChunkStore::has`] bridge is for blocking contexts).
+    pub async fn has(&self, id: [u8; 32]) -> Result<bool> {
+        self.store()
+            .blobs()
+            .has(hash_of(id))
+            .await
+            .context("blobs has")
+    }
+
+    /// Durability barrier: resolves only once every previously-acked write
+    /// ([`add`](Self::add) / [`fetch`](Self::fetch)) is committed to disk.
+    ///
+    /// The iroh-blobs FsStore acks `add_slice` from INSIDE its open redb write
+    /// batch, which commits up to ~1 s later (store/fs.rs module docs: writes
+    /// "in the last seconds" are lost on an abrupt exit). `SyncDb` is a
+    /// top-level command that cannot join a write batch, so its answer proves
+    /// the prior batch committed — and redb commits at Immediate durability
+    /// (fsync). Call this after a logical write group and BEFORE recording or
+    /// acking those blobs anywhere durable; otherwise a prompt kill loses
+    /// blobs that other state already claims exist. No-op on the Mem backing.
+    pub async fn sync(&self) -> Result<()> {
+        self.store().sync_db().await.context("sync_db")?;
+        Ok(())
+    }
+
     /// Read a present blob's bytes. Async; use from async code.
     pub async fn get_bytes(&self, id: [u8; 32]) -> Result<Vec<u8>> {
         let bytes = self

@@ -108,6 +108,25 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
         d2.own_card_version()
     );
 
+    // The published blobs are genuinely PRESENT in the reopened FsStore — asserted
+    // directly, blob by blob. The no-op republish below proves the manifest
+    // re-derived, but on its own it cannot prove chunk survival: the no-op guard
+    // compares manifest FILE entries only, so it would pass identically with every
+    // chunk blob lost.
+    let (digest, chunks) = d2
+        .vault_blob_ids(&vid)
+        .expect("vault_blobs re-derived from the FsStore envelope after reboot");
+    assert!(
+        d2.blob_present(digest).await,
+        "manifest-envelope blob present in FsStore after reboot"
+    );
+    for (i, id) in chunks.iter().enumerate() {
+        assert!(
+            d2.blob_present(*id).await,
+            "chunk {i} present in FsStore after reboot"
+        );
+    }
+
     // epochs + vault_blobs survived: re-publishing the identical tree is a no-op that
     // returns the SAME epoch (the no-op guard compares the re-derived manifest's files,
     // proving the manifest was rebuilt from the FsStore envelope + K_manifest).

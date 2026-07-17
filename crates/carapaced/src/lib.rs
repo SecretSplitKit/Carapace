@@ -1278,6 +1278,10 @@ impl ControlHandler {
             // record it so the fetch gate can bind it to this replica-held vault (W8).
             stored.push(self.blobs.add(&bytes).await?);
         }
+        // Durability barrier: force the FsStore to commit the received blobs so
+        // the §3.2.3 ordering below is real — never persist replica bookkeeping
+        // or ack storage for blobs a prompt kill would lose.
+        self.blobs.sync().await?;
         {
             let mut s = self.shared.write().expect("shared lock");
             s.held.insert(inv.vid);
@@ -1842,7 +1846,11 @@ pub struct Daemon {
     /// `Some` only when `State::dir` was `None`. Removes the whole tree on drop so a
     /// seed-only test daemon leaves nothing behind.
     _ephemeral_dir: Option<EphemeralDir>,
-    _router: Router,
+    /// The iroh protocol router serving `iroh_blobs::ALPN` (gated blob reads) and
+    /// `carapace/1`. Held for the daemon's lifetime; [`Daemon::shutdown`] shuts it
+    /// down FIRST, which runs `BlobsProtocol::shutdown` → a clean FsStore shutdown
+    /// (commits the store's open write batch — see `IrohBlobStore::sync`).
+    router: Router,
 }
 
 /// RAII guard that removes a process-unique ephemeral state directory on drop. Used
@@ -2236,7 +2244,7 @@ impl Daemon {
             state_dir,
             db,
             _ephemeral_dir: ephemeral_dir,
-            _router: router,
+            router,
         };
 
         // W6/§6: elect the relay only after a liveness probe confirms it is up -
@@ -2408,6 +2416,12 @@ impl Daemon {
                 ensure!(&h == id, "iroh blob hash != carapace ChunkID");
             }
         }
+        // Durability barrier (§3.2.2): the FsStore acks adds from inside an open
+        // write batch that commits up to ~1 s later, so force the commit BEFORE
+        // the epoch/announce commit + replica push below. Without it a prompt
+        // kill leaves state.redb naming an epoch whose envelope/chunks never hit
+        // disk, and the vault is gone after the reboot §3 exists to survive.
+        self.blobs.sync().await?;
 
         // Seal the per-chunk access grant to the user's disclosure key.
         let grant = self.build_file_grant(&ingest.manifest, &ingest.keys, vid, epoch)?;
@@ -3016,6 +3030,9 @@ impl Daemon {
                 chunk_ids.push(*id);
             }
         }
+        // Durability barrier (§3.2.2): commit the merged blobs before the epoch
+        // commit below — same rule as `publish_vault`.
+        self.blobs.sync().await?;
 
         let grant = self.build_file_grant(manifest, keys, *vid, manifest.epoch)?;
 
@@ -4463,6 +4480,25 @@ impl Daemon {
             .map(|a| a.digest)
     }
 
+    /// Test-only: whether the served durable blob store holds `id` right now.
+    /// Lets the reboot/kill durability tests assert a blob is genuinely present
+    /// in the FsStore instead of inferring it from higher-level behavior.
+    #[doc(hidden)]
+    pub async fn blob_present(&self, id: [u8; 32]) -> bool {
+        self.blobs.has(id).await.unwrap_or(false)
+    }
+
+    /// Test-only: the published blob-source ids for `vid` — the manifest-envelope
+    /// digest plus every unique ChunkID — or `None` if the vault has no
+    /// (re-derived) blob source on this daemon.
+    #[doc(hidden)]
+    pub fn vault_blob_ids(&self, vid: &[u8; 32]) -> Option<([u8; 32], Vec<[u8; 32]>)> {
+        let s = self.shared.read().expect("shared lock");
+        s.vault_blobs
+            .get(vid)
+            .map(|vb| (vb.digest, vb.chunk_ids.clone()))
+    }
+
     /// Test-only: record `node` as a replica member of `vid` without pushing it the
     /// blobs, modeling a replica that accepted a placement but has since lost its
     /// stored copy. The PoR loop then detects the loss on audit.
@@ -4475,8 +4511,24 @@ impl Daemon {
         }
     }
 
-    /// Gracefully close the endpoint.
-    pub async fn shutdown(self) {
+    /// Graceful shutdown: stop accepting, cleanly shut down the served blob
+    /// store, then close the endpoint. The daemon serves nothing afterwards.
+    ///
+    /// `Router::shutdown` awaits every protocol handler's shutdown — including
+    /// `BlobsProtocol::shutdown`, which shuts down the FsStore cleanly
+    /// (committing its open write batch and persisting ephemeral state; the
+    /// iroh-blobs fs store otherwise loses writes from the last ~1 s on exit).
+    /// Closing only the endpoint, as this once did, dropped those writes even
+    /// on a "graceful" exit.
+    ///
+    /// Takes `&self` (idempotently: a second call is a no-op) so the binary's
+    /// signal path can always flush, even while the API server or a watcher
+    /// still holds `Arc<Daemon>` clones — a flush must never depend on being
+    /// the last reference.
+    pub async fn shutdown(&self) {
+        if let Err(e) = self.router.shutdown().await {
+            eprintln!("carapaced: router shutdown: {e}");
+        }
         self.ep.close().await;
     }
 
