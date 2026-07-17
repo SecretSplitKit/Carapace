@@ -145,7 +145,7 @@ async fn sync_fetch_and_reconstruct() -> Result<()> {
     };
 
     let router = Router::builder(server_ep.endpoint().clone())
-        .accept(iroh_blobs::ALPN, BlobsProtocol::new(blobs.mem(), None))
+        .accept(iroh_blobs::ALPN, BlobsProtocol::new(blobs.store(), None))
         .accept(ALPN, handler)
         .spawn();
 

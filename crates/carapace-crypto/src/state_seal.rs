@@ -201,9 +201,7 @@ mod tests {
     fn secret_never_appears_in_ciphertext() {
         let sealed = seal(&K, TABLE, KEY, SECRET).unwrap();
         assert!(
-            !sealed
-                .windows(SECRET.len())
-                .any(|w| w == SECRET),
+            !sealed.windows(SECRET.len()).any(|w| w == SECRET),
             "plaintext secret must not appear in the sealed blob"
         );
     }

@@ -1767,11 +1767,7 @@ fn ephemeral_state_dir() -> Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "carapaced-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("carapaced-{}-{}", std::process::id(), n));
     std::fs::create_dir_all(&dir).with_context(|| format!("create ephemeral state dir {dir:?}"))?;
     Ok(dir)
 }
@@ -2045,6 +2041,13 @@ impl Daemon {
     /// This device's node id (= iroh endpoint id).
     pub fn node_id(&self) -> [u8; 32] {
         self.ep.node_id()
+    }
+
+    /// The durable state directory (design §3): root of `blobs/` (FsStore) and, once
+    /// the redb state layer lands, `state.redb`. For a `from_seeds` daemon this is a
+    /// process-unique ephemeral dir cleaned up on drop.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 
     /// A directly dialable address for this daemon (localhost).
