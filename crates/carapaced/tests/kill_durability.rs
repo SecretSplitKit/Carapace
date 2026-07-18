@@ -11,6 +11,15 @@
 //! still running. The copy is exactly the disk image an abrupt kill leaves (no
 //! Drop, no flush, no graceful actor drain — only what was already committed).
 //! The copy's FsStore is probed directly, then a full daemon boots from it.
+//!
+//! Unix-only: the technique copies redb's live `blobs.db`/`state.redb` out from
+//! under the running daemon. On Windows redb holds a mandatory byte-range lock, so
+//! copying a live database file fails with os error 33 — the simulation can't run
+//! there. The guarantee it proves (blobs committed to disk before `publish_vault`
+//! returns, via the FsStore `sync()` barrier) is redb-level and platform-independent,
+//! and the drop-then-reopen `reboot_survival` tests exercise the committed-state-
+//! survives-restart path on every platform, so nothing is left uncovered on Windows.
+#![cfg(unix)]
 
 use anyhow::{Context, Result};
 use carapace_net::IrohBlobStore;
