@@ -1,18 +1,7 @@
-//! W2 recovery ceremony wired end-to-end over the daemon control stream (§8.5 + §8.4).
-//!
-//! The acceptance test drives a full ceremony from a KEY-LESS claimant to a recovered
-//! `K_root` that EQUALS the original: an owner splits `M`-of-`N` to trustees (W3 grants
-//! delivered); a sponsor trustee opens a ceremony for the subject with a fresh claimant
-//! device; the open fans out to the co-trustees (each raises the alarm); `M` trustees
-//! approve; before the delay NO share releases; after advancing the INJECTED clock past
-//! `first_seen + recovery_delay` the `M` approving trustees release HPKE-sealed shares;
-//! the claimant collects `M`, recovers `K_root`, and it matches. Plus: a subject-key
-//! `CeremonyAbort` cancels permanently (takeover flagged, no release); a non-trustee
-//! cannot open; sub-`M` never releases; and a share never crosses the wire unsealed.
-//!
-//! Every test is BOUNDED (§11 lesson): the 72 h abort delay is exercised with a fast
-//! INJECTED clock (`set_test_clock`) - never a real sleep - all dials are bounded by the
-//! daemon connect timeout, and every daemon is torn down at the end.
+//! Recovery ceremony end-to-end over the daemon control stream (§8.5 + §8.4): a key-less
+//! claimant recovers a `K_root` equal to the original, plus subject-abort cancels, non-trustee
+//! cannot open, sub-`M` never releases, and shares never cross the wire unsealed. Bounded: the
+//! 72 h delay uses an injected clock (`set_test_clock`), never a real sleep.
 
 use anyhow::{Context, Result};
 use carapace_wire::AnnounceRef;
@@ -273,12 +262,10 @@ async fn subject_abort_cancels_and_flags_takeover() -> Result<()> {
     Ok(())
 }
 
-/// §8.5 step 3, message-reordering vector: a subject-signed `CeremonyAbort` that reaches
-/// a trustee BEFORE that trustee's `RecoveryOpen` (fan-out is best-effort per-peer with no
-/// ordering) MUST still cancel the ceremony permanently. Without the durable
-/// `aborted_ceremonies` record the early abort is dropped, the later open re-tracks a
-/// fresh non-aborted ceremony, and an approving trustee releases its share at delay-expiry
-/// despite an authoritative abort - the exact silent takeover step 3 exists to stop.
+/// §8.5 step 3 reordering vector: a subject-signed abort that reaches a trustee BEFORE its
+/// `RecoveryOpen` (unordered fan-out) must still cancel permanently. Without the durable
+/// `aborted_ceremonies` record the later open would re-track a fresh non-aborted ceremony
+/// that releases at delay-expiry - the silent takeover step 3 exists to stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn abort_before_open_still_cancels() -> Result<()> {
     let (a, b, c, d, _k_root) = setup().await?;

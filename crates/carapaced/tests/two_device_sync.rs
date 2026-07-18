@@ -1,10 +1,6 @@
-//! Phase 1 acceptance: two in-process daemons on localhost sharing the SAME user
-//! master key (`k_root`) but holding DIFFERENT, user-delegated node keys.
-//!
-//! Device A ingests a source tree into a vault and publishes a signed
-//! `VaultAnnounce` + `FileGrant`; device B runs anti-entropy, fetches the
-//! manifest envelope + every chunk by ChunkID, opens the grant, and reconstructs
-//! the tree. The test asserts B's reconstructed files byte-match A's source.
+//! Phase 1 acceptance: two localhost daemons sharing one `k_root` but distinct node keys.
+//! Device A publishes a vault; device B runs anti-entropy, fetches the envelope + chunks, and
+//! reconstructs the tree byte-for-byte against A's source.
 
 use std::collections::BTreeMap;
 
@@ -130,10 +126,8 @@ async fn republish_bumps_epoch_and_syncs_update() -> Result<()> {
     Ok(())
 }
 
-/// W3: a poison announce (correctly node-signed, so it passes delegation, but
-/// pointing at a manifest digest no blob backs) must not starve the legitimate
-/// vaults in the same sync. B reconstructs the real vault and simply skips the
-/// unfetchable one instead of aborting the whole sync.
+/// W3: a poison announce (node-signed so it passes delegation, but pointing at an unbacked
+/// digest) must not starve the legitimate vaults; B reconstructs the real vault and skips it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn poison_announce_does_not_abort_sync() -> Result<()> {
     let daemon_a = Daemon::start(State::from_seeds([0x31; 32], K_ROOT)).await?;

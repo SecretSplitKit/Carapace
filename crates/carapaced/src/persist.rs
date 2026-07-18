@@ -1,20 +1,9 @@
-//! Durable runtime-state persistence (design §3.2-§3.5).
-//!
-//! `state.redb` is the source of truth on disk. In-RAM `Shared` stays the hot read
-//! path; every mutation boundary funnels the WHOLE `Shared` + `DocStore` back to disk
-//! in one redb transaction via [`persist_all`], then commits. The state is KB-MB, so
-//! re-persisting all of it per mutation is cheap and CORRECT by construction: a field
-//! cannot be silently forgotten because [`persist_all`] destructures `Shared` with no
-//! `..` glob, and adding a `Shared` field fails to compile until it is categorized
-//! (SEAL / PLAIN / EPH / DERIVE per design §3.3).
-//!
-//! ponytail: whole-state re-persist per mutation. Optimize to per-table incremental
-//! writes only if profiling shows the funnel is hot (KB-MB state makes it a non-issue
-//! for a personal-scale daemon).
-//!
-//! Secret categories (Shamir shares, Chela split polynomials, share grants) are AEAD
-//! -sealed under `HKDF(K_root,"carapace/v1/state-seal")` (`carapace_crypto::state_seal`)
-//! BEFORE the bytes touch redb. Everything else is signed/public metadata stored plain.
+//! Durable runtime-state persistence. `state.redb` is the on-disk source of truth;
+//! every mutation funnels the whole `Shared` + `DocStore` back in one redb txn via
+//! [`persist_all`]. State is KB-MB, so re-persisting all of it per mutation is cheap;
+//! `persist_all` destructures `Shared` with no `..` glob, so a new field fails to
+//! compile until categorized (SEAL / PLAIN / EPH / DERIVE). Secret categories are
+//! AEAD-sealed under `HKDF(K_root,"carapace/v1/state-seal")` before touching redb.
 
 use anyhow::{anyhow, bail, Context, Result};
 use redb::{Database, ReadableDatabase, TableDefinition};
@@ -22,8 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-// Types + serialization helpers reached through the crate root (child modules see the
-// parent's private items and its `use` imports).
 use super::{
     AlarmRecord, EndpointAddr, EndpointId, GrantedTrustee, OpenResplit, OwnerGrants,
     PendingResplit, Placement, RecoveryScope, RecoverySet, ResplitPeer, Shared, TrackedCeremony,
@@ -41,17 +28,13 @@ use carapace_wire::{
     AnnounceRef, CeremonyAbort, ContactCard, Friendship, ShareGrant, VaultAnnounce,
 };
 
-/// The single redb table: category name -> serialized (and, for SEAL categories,
-/// state-sealed) blob. One row per persisted category; re-persist-all overwrites
-/// every row each mutation.
+/// The single redb table: category name -> serialized (SEAL categories additionally
+/// state-sealed) blob. One row per category.
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 
-// -------------------------------------------------------------------------
-// Length-prefixed binary codec (fuzz-safe reader with explicit bounds checks).
-// -------------------------------------------------------------------------
+// Length-prefixed binary codec: variable-width `bytes` fields carry a big-endian u32
+// length prefix; the reader bounds-checks every read.
 
-/// A little append-only encoder. Fixed-width fields are written raw; variable-width
-/// fields (`bytes`) are length-prefixed with a big-endian `u32`.
 pub(crate) struct W {
     buf: Vec<u8>,
 }
@@ -69,16 +52,13 @@ impl W {
     pub(crate) fn u64(&mut self, x: u64) {
         self.buf.extend_from_slice(&x.to_be_bytes());
     }
-    /// A `usize` count/length, capped into a `u32` (state is KB-MB; no legitimate
-    /// count exceeds `u32`).
     pub(crate) fn len(&mut self, x: usize) {
         self.u32(u32::try_from(x).expect("persist count fits u32"));
     }
-    /// Raw fixed-width bytes, no length prefix (the reader must know the width).
+    /// Raw fixed-width bytes, no length prefix (reader must know the width).
     pub(crate) fn fixed(&mut self, b: &[u8]) {
         self.buf.extend_from_slice(b);
     }
-    /// Length-prefixed variable bytes.
     pub(crate) fn bytes(&mut self, b: &[u8]) {
         self.len(b.len());
         self.buf.extend_from_slice(b);
@@ -91,8 +71,7 @@ impl W {
     }
 }
 
-/// A bounds-checked decoder. Every read is guarded; malformed/truncated input is a
-/// loud error, never a panic or a partial read.
+/// A bounds-checked decoder: malformed/truncated input is a loud error, never a panic.
 pub(crate) struct R<'a> {
     b: &'a [u8],
     pos: usize,
@@ -102,12 +81,9 @@ impl<'a> R<'a> {
     pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
-    /// A safe pre-allocation size for `n` upcoming elements: capped by the bytes still
-    /// unconsumed (audit #11). Every element consumes at least one byte, so a legitimate
-    /// count can never exceed the remaining length; a hostile length prefix
-    /// (e.g. `0xFFFFFFFF` on an unauthenticated PLAIN row) is clamped to the real input
-    /// size instead of triggering a multi-GB eager `with_capacity` OOM before the loop
-    /// errors on truncation.
+    /// Safe pre-alloc size for `n` upcoming elements, capped by unconsumed bytes: every
+    /// element eats >=1 byte, so this clamps a hostile length prefix to real input size
+    /// instead of a multi-GB eager `with_capacity` OOM before the loop errors.
     fn cap(&self, n: usize) -> usize {
         n.min(self.b.len().saturating_sub(self.pos))
     }
@@ -133,7 +109,6 @@ impl<'a> R<'a> {
             self.take(8)?.try_into().expect("8 bytes"),
         ))
     }
-    /// A length/count field, returned as `usize`.
     pub(crate) fn len(&mut self) -> Result<usize> {
         Ok(self.u32()? as usize)
     }
@@ -146,7 +121,6 @@ impl<'a> R<'a> {
     pub(crate) fn arr64(&mut self) -> Result<[u8; 64]> {
         Ok(self.take(64)?.try_into().expect("64 bytes"))
     }
-    /// Length-prefixed variable bytes.
     pub(crate) fn bytes(&mut self) -> Result<&'a [u8]> {
         let n = self.len()?;
         self.take(n)
@@ -154,31 +128,22 @@ impl<'a> R<'a> {
     pub(crate) fn bool(&mut self) -> Result<bool> {
         Ok(self.u8()? != 0)
     }
-    /// True once every byte has been consumed (a trailing-garbage guard for callers
-    /// that expect an exact-fit blob).
+    /// True once every byte has been consumed (trailing-garbage guard).
     #[cfg(test)]
     pub(crate) fn done(&self) -> bool {
         self.pos == self.b.len()
     }
 }
 
-// -------------------------------------------------------------------------
-// Database open (0600).
-// -------------------------------------------------------------------------
-
 /// Open (creating if absent) `state.redb` at `path`, restricting it to `0600` on unix.
-/// On a non-unix host the same caveat as `state.rs::write_secret` applies (set
-/// `CARAPACE_PASSPHRASE` so secrets are additionally sealed under `K_root`).
 pub(crate) fn open_db(path: &Path) -> Result<Database> {
     let db = Database::create(path).with_context(|| format!("open state db {path:?}"))?;
-    // Create-then-chmod leaves a brief default-perm window (mirrors the identity-file
-    // caveat in state.rs); acceptable for the demo posture.
     restrict_perms(path)?;
     Ok(db)
 }
 
-/// Whether `state.redb` already exists (design §3.5 tripwire: blobs/keys present but no
-/// state.redb => a wiped/mismatched state dir, fail/warn loudly rather than start fresh).
+/// Whether `state.redb` already exists (startup tripwire: blobs/keys present but no
+/// state.redb => a wiped/mismatched state dir, fail loudly rather than start fresh).
 pub(crate) fn db_exists(path: &Path) -> bool {
     path.exists()
 }
@@ -195,10 +160,6 @@ fn restrict_perms(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------------
-// Raw category read/write (used by persist_all / load_all).
-// -------------------------------------------------------------------------
-
 /// Read one category blob from a read transaction; `None` if the row is absent.
 pub(crate) fn read_row(db: &Database, key: &str) -> Result<Option<Vec<u8>>> {
     let txn = db.begin_read().context("begin read txn")?;
@@ -214,10 +175,7 @@ pub(crate) fn read_row(db: &Database, key: &str) -> Result<Option<Vec<u8>>> {
         .map(|v| v.value().to_vec()))
 }
 
-// -------------------------------------------------------------------------
-// Category row keys (design §3.3). One redb row per category.
-// -------------------------------------------------------------------------
-
+// Category row keys: one redb row per category.
 mod cat {
     // PLAIN (signed/public/metadata; no secret).
     pub const CARDS: &str = "cards";
@@ -259,14 +217,11 @@ mod cat {
     pub const RESPLITS: &str = "resplits";
 }
 
-/// The redb table name used as the `state_seal` aad `table` component for every SEAL
-/// row (the per-row `key` is the category name), binding a sealed blob to its exact
-/// slot so a cross-category relocation fails to open (design §3.4).
+/// The `state_seal` aad `table` component for every SEAL row (per-row `key` is the
+/// category name): binds a sealed blob to its slot so a cross-category move fails to open.
 const SEAL_TABLE: &[u8] = b"state";
 
-// -------------------------------------------------------------------------
 // Leaf encoders/decoders shared across categories.
-// -------------------------------------------------------------------------
 
 fn enc_set32(w: &mut W, set: &HashSet<[u8; 32]>) {
     w.len(set.len());
@@ -356,8 +311,6 @@ fn dec_frame_list<M: Message>(r: &mut R) -> Result<Vec<M>> {
     Ok(out)
 }
 
-/// A `HashMap<[u8;32], M>` where `M` is a framed message (the key is stored explicitly
-/// even when it equals the message signer, so load never has to re-derive it).
 fn enc_map32_frame<M: Message>(w: &mut W, m: &HashMap<[u8; 32], M>) {
     w.len(m.len());
     for (k, v) in m {
@@ -442,8 +395,7 @@ fn dec_scope(r: &mut R) -> Result<RecoveryScope> {
     }
 }
 
-/// One owner-held trustee record (embeds a secret `Share` via its canonical JSON).
-/// Only ever written inside a SEAL row.
+/// One owner-held trustee record (embeds a secret `Share`; only written in a SEAL row).
 fn enc_granted_trustee(w: &mut W, t: &GrantedTrustee) {
     w.fixed(&t.user);
     w.fixed(&t.node);
@@ -487,17 +439,12 @@ fn dec_resplit_peer(r: &mut R) -> Result<ResplitPeer> {
     Ok(ResplitPeer { node, grant })
 }
 
-// -------------------------------------------------------------------------
-// The funnel (design §3.2.1): persist the WHOLE Shared + DocStore in one txn.
-// -------------------------------------------------------------------------
+// The funnel: persist the whole Shared + DocStore in one txn.
 
 /// Persist every durable category of `Shared` + `docs` into `txn`, sealing secret
-/// categories under `k_root` first. The caller commits `txn` (design §3.2.3:
-/// commit BEFORE any externally visible effect) and crashes on commit failure.
-///
-/// EXHAUSTIVE + COMPILE-ENFORCED (design §3.2.1): `Shared` is destructured with NO
-/// `..` glob, so every field is either persisted or explicitly discarded here. Adding
-/// a `Shared` field fails to compile until it is categorized.
+/// categories under `k_root` first. Caller commits `txn` BEFORE any externally visible
+/// effect and crashes on commit failure. `Shared` is destructured with no `..` glob, so
+/// every field is persisted or explicitly discarded and a new field fails to compile.
 pub(crate) fn persist_all(
     txn: &redb::WriteTransaction,
     s: &Shared,
@@ -541,9 +488,9 @@ pub(crate) fn persist_all(
         // --- DERIVE ---
         vault_blobs,
         needs_refetch,
-        // --- PLAIN-rebuild: reconstructed from `granted` at load (§3.3) ---
+        // --- PLAIN-rebuild: reconstructed from `granted` at load ---
         share_sets,
-        // --- EPH: rebuilt on reconnect / never persisted (§3.3) ---
+        // --- EPH: rebuilt on reconnect / never persisted ---
         tickets,
         peer_addrs,
         peer_last_seen,
@@ -554,9 +501,8 @@ pub(crate) fn persist_all(
         test_now,
     } = s;
 
-    // EPH: address/liveness caches, rate limiter, per-session auth, test clock,
-    // outstanding invite tickets (die on reboot -> TicketUnknown, acceptable), and
-    // vault chunk keys (NEVER persist: an accidental write-through is a key dump).
+    // EPH: caches, rate limiter, per-session auth, test clock, invite tickets, and vault
+    // chunk keys (NEVER persist: a write-through is a key dump).
     let _ = (
         tickets,
         peer_addrs,
@@ -567,9 +513,7 @@ pub(crate) fn persist_all(
         blob_auth,
         test_now,
     );
-    // PLAIN-rebuild: `share_sets` (AttestTracker) is reconstructed from `granted` at
-    // load (rebuild_share_sets); its only lost state is recent attestation timestamps,
-    // self-healed by the next §10.2 challenge round.
+    // PLAIN-rebuild: `share_sets` reconstructed from `granted` at load.
     let _ = share_sets;
 
     let mut t = txn.open_table(STATE).context("open state table (write)")?;
@@ -663,17 +607,16 @@ pub(crate) fn persist_all(
         enc(|w| enc_set32(w, unfriended_nodes)),
     )?;
 
-    // ---- DERIVE: vault_blobs -> only {vid -> digest, chunk_ids} (never the manifest),
-    // UNIONed with the needs-refetch sources (vaults whose manifest failed to
-    // re-derive at startup) so a failed re-derive never erases a vault's
-    // blob-source record from disk. `vault_blobs` wins on a vid in both.
+    // DERIVE: vault_blobs -> only {vid -> digest, chunk_ids} (never the manifest),
+    // unioned with needs-refetch sources so a failed re-derive never erases a vault's
+    // blob-source record. `vault_blobs` wins on a vid in both.
     put(
         &mut t,
         cat::VAULT_BLOBS,
         enc_vault_blobs(vault_blobs, needs_refetch),
     )?;
 
-    // ---- F3: monotonic own-card version floor = max own card.version ----
+    // F3: monotonic own-card version floor = max own card.version.
     let card_version = cards.iter().map(|c| c.version).max().unwrap_or(0);
     put(
         &mut t,
@@ -681,11 +624,11 @@ pub(crate) fn persist_all(
         card_version.to_be_bytes().to_vec(),
     )?;
 
-    // ---- DocStore (§6 rollback high-water marks) ----
+    // DocStore rollback high-water marks.
     put_frame_list(&mut t, cat::DOC_CARDS, docs.cards().cloned())?;
     put_frame_list(&mut t, cat::DOC_ANNOUNCES, docs.announces().cloned())?;
 
-    // ---- SEAL rows (sealed before touching redb) ----
+    // SEAL rows (sealed before touching redb).
     put_sealed(
         &mut t,
         cat::HELD_SHARES,
@@ -710,18 +653,13 @@ pub(crate) fn persist_all(
     Ok(())
 }
 
-/// Persist the whole state in one txn and commit it, fail-loud (design §3.2.5): a
-/// commit failure CRASHES rather than continuing with RAM ahead of disk. The caller
-/// holds the `shared` (and, for the `_with` path, `docs`) lock across this call so the
-/// RAM mutation and the durable write share one critical section, and calls it BEFORE
-/// any externally visible effect (§3.2.3-4).
+/// Persist the whole state in one txn and commit, fail-loud: a commit failure CRASHES
+/// rather than continuing with RAM ahead of disk. Caller holds the `shared` (and, on the
+/// `_with` path, `docs`) lock across this call and calls it before any visible effect.
 pub(crate) fn commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u8; 32]) {
     if let Err(e) = try_commit_all(db, s, docs, k_root) {
-        // §3.2.5: the daemon DIES on a commit failure - never continue with RAM ahead of
-        // disk. `abort()` (not a panic): a panic here fires while the caller holds the
-        // `shared` write lock, poisoning it and wedging the daemon half-alive on every
-        // later `.expect("shared lock")`. `abort()` takes the whole process down at once,
-        // no unwinding, no poisoned lock.
+        // abort(), not panic: a panic here fires under the caller's `shared` write lock,
+        // poisoning it and wedging the daemon half-alive; abort takes the process down clean.
         eprintln!(
             "carapace: FATAL redb state commit failed ({e:#}); aborting the daemon \
              (design §3.2.5: never continue with RAM ahead of disk)."
@@ -730,8 +668,6 @@ pub(crate) fn commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u
     }
 }
 
-/// One durable state commit: open a write txn, persist the whole state, and commit.
-/// Any failure is returned so [`commit_all`] can abort the process loudly.
 fn try_commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u8; 32]) -> Result<()> {
     let txn = db.begin_write().context("begin redb write txn")?;
     persist_all(&txn, s, docs, k_root)?;
@@ -795,10 +731,7 @@ fn put_sealed(
     k_root: &[u8; 32],
     plaintext: Vec<u8>,
 ) -> Result<()> {
-    // The category plaintext (share JSON, polynomial bytes, share-grant bodies) is
-    // secret-equivalent. Wrap the caller's buffer (moved in, no copy) so it is WIPED after
-    // sealing rather than left in freed heap - the seal-side edge of audit #10. Covers
-    // every SEAL category, since all of them route through here.
+    // Secret-equivalent plaintext: wrap so it is wiped after sealing, not left in freed heap.
     let plaintext = Zeroizing::new(plaintext);
     let sealed = state_seal::seal(k_root, SEAL_TABLE, key.as_bytes(), &plaintext)
         .map_err(|e| anyhow!("seal {key}: {e}"))?;
@@ -849,10 +782,9 @@ fn enc_ceremonies(m: &HashMap<[u8; 16], TrackedCeremony>) -> Vec<u8> {
     })
 }
 
-/// C1: a party we have standing to trust - an owner whose share we hold
-/// (`held_grants` subject), an established friend, or ourselves (`docs.card`). Shared by
-/// the abort and alarm bounds: an unauthenticated dispatch from a stranger must never be
-/// able to write a durable row (durable disk-fill DoS otherwise).
+/// A party we have standing to trust - an owner whose share we hold, an established
+/// friend, or ourselves. Gates the abort/alarm durable bounds so a stranger's
+/// unauthenticated dispatch cannot write a durable row (disk-fill DoS otherwise).
 fn signer_qualifies(
     signer: &[u8; 32],
     held_grants: &HashMap<[u8; 32], ShareGrant>,
@@ -862,13 +794,9 @@ fn signer_qualifies(
     held_grants.contains_key(signer) || friends.contains_key(signer) || docs.card(signer).is_some()
 }
 
-/// C1: persist only alarms whose SPONSOR (the `RecoveryOpen` signer) is a qualifying
-/// party (see [`signer_qualifies`]). A stranger can self-sign a `RecoveryOpen` for any
-/// subject and dial us unauthenticated (`serve_recovery_open`); without this bound each
-/// such open would append an attacker-chosen ~1MiB alarm to disk unbounded. A stranger's
-/// alarm stays RAM-only (still visible to `/api/status` for the session, just not
-/// durable). The subject is deliberately NOT a qualifier: it is public, so an attacker
-/// would just set `subject = our pubkey` to bypass the bound.
+/// Persist only alarms whose sponsor (the `RecoveryOpen` signer) qualifies: a stranger's
+/// alarm stays RAM-only so an unauthenticated open cannot append to disk unbounded. The
+/// subject is deliberately not a qualifier (it is public: an attacker would set it to us).
 fn enc_alarms(
     m: &HashMap<[u8; 16], AlarmRecord>,
     held_grants: &HashMap<[u8; 32], ShareGrant>,
@@ -894,8 +822,7 @@ fn enc_alarms(
     })
 }
 
-/// C1: persist only aborts whose signer is a qualifying party (see [`signer_qualifies`]).
-/// A stranger's abort stays RAM-only so an unauthenticated dispatch cannot fill disk.
+/// Persist only aborts whose signer qualifies; a stranger's abort stays RAM-only.
 fn enc_aborted(
     m: &HashMap<[u8; 16], Vec<CeremonyAbort>>,
     held_grants: &HashMap<[u8; 32], ShareGrant>,
@@ -947,8 +874,7 @@ fn enc_pending_delete_sends(v: &[(Vec<EndpointAddr>, Placement)]) -> Vec<u8> {
     enc(|w| {
         w.len(v.len());
         for (addrs, placement) in v {
-            // Persist node ids only; direct addresses are hints, rebuilt via relay
-            // fallback on reconnect (§6 "addresses are hints, not identities").
+            // Node ids only; direct addresses are hints, rebuilt via relay on reconnect.
             w.len(addrs.len());
             for a in addrs {
                 w.fixed(a.id.as_bytes());
@@ -966,8 +892,7 @@ fn enc_vault_blobs(
     m: &HashMap<[u8; 32], VaultBlobs>,
     needs_refetch: &HashMap<[u8; 32], BlobSource>,
 ) -> Vec<u8> {
-    // Retained-but-underivable sources ride in the same row; a vid present in
-    // `m` (re-derived or republished) supersedes its needs-refetch entry.
+    // Retained-but-underivable sources ride in the same row; a vid in `m` supersedes them.
     let extra: Vec<_> = needs_refetch
         .iter()
         .filter(|(vid, _)| !m.contains_key(*vid))
@@ -997,7 +922,7 @@ fn enc_held_shares(m: &HashMap<u64, (Share, ShareMonitor)>) -> Vec<u8> {
     enc(|w| {
         w.len(m.len());
         for (rsid, (share, _monitor)) in m {
-            // ShareMonitor is EPH (CRC self-validation cadence, rebuilt on load).
+            // ShareMonitor is EPH (rebuilt on load).
             w.u64(*rsid);
             w.bytes(share_to_json(share).as_bytes());
         }
@@ -1075,9 +1000,7 @@ fn enc_resplits(m: &HashMap<u64, OpenResplit>) -> Vec<u8> {
     })
 }
 
-// -------------------------------------------------------------------------
-// Startup load (design §3.5).
-// -------------------------------------------------------------------------
+// Startup load.
 
 /// A DERIVE vault-blob source row: `(vid, manifest digest, chunk ids)`. The decrypted
 /// `Manifest` is re-derived from the FsStore envelope at startup (never persisted).
@@ -1089,26 +1012,21 @@ pub(crate) type BlobSource = ([u8; 32], Vec<[u8; 32]>);
 
 /// Everything reloaded from `state.redb` at startup.
 pub(crate) struct Loaded {
-    /// `Shared` with every persisted category filled and EPH fields left at their
-    /// defaults (the daemon rebuilds `rate`/`relay_health`/… on start). `vault_blobs`
-    /// is EMPTY here: its decrypted manifests are re-derived asynchronously from
-    /// `vault_blob_sources` against FsStore + `K_manifest`.
+    /// `Shared` with every persisted category filled and EPH fields defaulted.
+    /// `vault_blobs` is EMPTY: its manifests are re-derived async from `vault_blob_sources`.
     pub shared: Shared,
-    /// The rollback high-water-mark store (§6).
     pub docs: DocStore,
-    /// DERIVE (A1): `{vid -> (digest, chunk_ids)}` to re-derive `vault_blobs` manifests
-    /// from FsStore at startup. The decoded `Manifest` is NEVER persisted in clear.
+    /// DERIVE `{vid -> (digest, chunk_ids)}` to re-derive `vault_blobs` manifests from
+    /// FsStore at startup. The decoded `Manifest` is never persisted in clear.
     pub vault_blob_sources: Vec<VaultBlobSource>,
     /// F3: persisted monotonic own-card version floor. The fresh own card is minted at
-    /// `max(unix_now(), card_version + 1)` so its version strictly increases across a
-    /// restart even under rapid relay flapping.
+    /// `max(unix_now(), card_version + 1)` so its version strictly increases across restart.
     pub card_version: u64,
 }
 
-/// Load and decode all persisted state (design §3.5). SEAL rows are opened under
-/// `k_root`; a sealed row that fails to open ABORTS startup (fail loud, never
-/// skip-and-continue — that silently loses a share). GC/router must not start until
-/// after this returns and reconciliation completes.
+/// Load and decode all persisted state. SEAL rows are opened under `k_root`; a sealed
+/// row that fails to open ABORTS startup (fail loud, never skip-and-continue — that
+/// silently loses a share).
 pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
     let mut s = Shared::default();
 
@@ -1212,7 +1130,7 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
         s.resplits = dec_resplits(&mut R::new(&b))?;
     }
 
-    // ---- PLAIN-rebuild: share_sets from granted (§3.3) ----
+    // ---- PLAIN-rebuild: share_sets from granted ----
     s.share_sets = rebuild_share_sets(&s.granted);
 
     // ---- DERIVE: vault_blob sources (manifests re-derived by the caller) ----
@@ -1221,7 +1139,6 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
         None => Vec::new(),
     };
 
-    // ---- F3 own-card version floor ----
     let card_version = match read_row(db, cat::CARD_VERSION)? {
         Some(b) => u64::from_be_bytes(
             b.as_slice()
@@ -1231,7 +1148,7 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
         None => 0,
     };
 
-    // ---- DocStore (§6 high-water marks) ----
+    // ---- DocStore high-water marks ----
     let mut docs = DocStore::new();
     if let Some(b) = read_row(db, cat::DOC_CARDS)? {
         for c in dec_frame_list::<ContactCard>(&mut R::new(&b))? {
@@ -1255,14 +1172,13 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
 }
 
 /// Open a SEAL row under `k_root`. Absent -> `None`; present-but-unopenable -> loud
-/// error (design §3.4/§3.5: never skip a share that will not decrypt).
+/// error (never skip a share that will not decrypt).
 fn read_sealed(db: &Database, key: &str, k_root: &[u8; 32]) -> Result<Option<Zeroizing<Vec<u8>>>> {
     match read_row(db, key)? {
         None => Ok(None),
         Some(sealed) => {
-            // Return the `Zeroizing` buffer state_seal::open produced (do NOT `to_vec()` it
-            // into a plain Vec that drops unwiped): the decoder borrows it and it is wiped
-            // when the caller's binding drops - the read-side edge of audit #10.
+            // Keep the `Zeroizing` buffer open produced (no `to_vec()`): the decoder
+            // borrows it and it is wiped when the caller's binding drops.
             let opened =
                 state_seal::open(k_root, SEAL_TABLE, key.as_bytes(), &sealed).map_err(|e| {
                     anyhow!(
@@ -1429,7 +1345,6 @@ fn dec_pending_delete_sends(r: &mut R) -> Result<Vec<(Vec<EndpointAddr>, Placeme
         let mut addrs = Vec::with_capacity(r.cap(acount));
         for _ in 0..acount {
             let node = r.arr32()?;
-            // Reconstruct a bare-id EndpointAddr; direct addrs resolve via relay/hole-punch.
             if let Ok(id) = EndpointId::from_bytes(&node) {
                 addrs.push(EndpointAddr::new(id));
             }
@@ -1473,7 +1388,7 @@ fn dec_held_shares(r: &mut R) -> Result<HashMap<u64, (Share, ShareMonitor)>> {
     for _ in 0..n {
         let rsid = r.u64()?;
         let share = share_from_json(&dec_str(r)?).map_err(|e| anyhow!("decode held share: {e}"))?;
-        // ShareMonitor is EPH: a fresh default monitor (re-runs its CRC self-check cadence).
+        // ShareMonitor is EPH: fresh default monitor.
         m.insert(rsid, (share, ShareMonitor::new()));
     }
     Ok(m)
@@ -1640,8 +1555,7 @@ mod tests {
     }
 
     // Full funnel roundtrip across PLAIN + SEAL + DERIVE categories, plus fail-loud on a
-    // wrong K_root. Exercises the compile-enforced `persist_all` destructure against real
-    // shares/split-state (the hard SEAL path) and the share_sets rebuild-from-granted.
+    // wrong K_root.
     #[test]
     fn persist_load_roundtrips_all_categories() {
         use carapace_wire::Signed;

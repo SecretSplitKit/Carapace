@@ -1,20 +1,8 @@
-//! §11 multi-device conflict reconciliation between two owner daemons that share
-//! one `k_root` but hold distinct, user-delegated node keys.
-//!
-//! Both devices publish a *concurrent* change to the SAME path in the SAME vault
-//! (neither version vector dominates the other), then reconcile by pulling from
-//! each other over a BOUNDED number of rounds. The tests prove:
-//!
-//! - **No data loss on concurrent edit-vs-edit:** both devices end up holding
-//!   BOTH edits - the `(mtime, deviceId)` winner at the original path and the
-//!   loser at `path.sync-conflict-<ts>-<dev>.<ext>`.
-//! - **Edit wins delete-vs-edit:** a concurrent delete on one device does not
-//!   erase a live edit on the other; the edit survives on both.
-//! - **Convergence / termination:** reconciliation reaches a fixed point (no
-//!   device re-publishes once both agree), so the round loop quiesces well within
-//!   the hard cap. Every `sync_from` is additionally wrapped in a wall-clock
-//!   timeout, so a regression that reintroduces the historical ping-pong or a
-//!   dial-each-other deadlock FAILS the test fast instead of hanging.
+//! §11 multi-device conflict reconciliation between two owner daemons sharing one `k_root`
+//! but distinct node keys. Both publish a concurrent change to the same path (neither VV
+//! dominates), then reconcile over bounded rounds. Proves: no loss on edit-vs-edit (winner at
+//! the path, loser at `path.sync-conflict-*.ext`), edit wins delete-vs-edit, and convergence
+//! (a fixed point well within the cap; a per-call timeout fails a ping-pong regression fast).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -74,10 +62,8 @@ async fn reconcile(
             a_dir = Some(r.out_dir.clone());
         }
 
-        // A round that pulls nothing newer for this vault in EITHER direction is
-        // the fixed point: the idempotent merge stopped producing republishes, so
-        // the per-signer epoch line stops advancing and every further pull is a
-        // no-op. That is convergence + termination in one observable.
+        // A round that pulls nothing newer in EITHER direction is the fixed point: the
+        // idempotent merge stopped republishing, so every further pull is a no-op.
         let touched = a_got.iter().any(|r| r.vid == vid) || b_got.iter().any(|r| r.vid == vid);
         if !touched {
             converged = true;
@@ -109,11 +95,9 @@ fn dir_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// Concurrent edit-vs-edit on the same path: both devices publish a different
-/// body for `notes.txt` with no shared ancestry, so neither version vector
-/// dominates. After a bounded reconcile BOTH devices must hold BOTH bodies - the
-/// winner at `notes.txt`, the loser at `notes.sync-conflict-*.txt` - with the
-/// extension preserved. Nothing is lost, and the loop converges.
+/// Concurrent edit-vs-edit on the same path (no shared ancestry, neither VV dominates): after
+/// a bounded reconcile BOTH devices hold BOTH bodies - winner at `notes.txt`, loser at
+/// `notes.sync-conflict-*.txt` with the extension preserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_edit_same_path_keeps_both_no_loss() -> Result<()> {
     const ALPHA: &[u8] = b"device A wrote these notes first";
@@ -180,11 +164,8 @@ async fn concurrent_edit_same_path_keeps_both_no_loss() -> Result<()> {
     Ok(())
 }
 
-/// Delete-vs-edit: device A deletes `data.txt` while device B concurrently edits
-/// it, with the two changes concurrent (neither VV dominates). §11 resolves this
-/// to the edit surviving - a concurrent delete must not erase a live edit. After
-/// a bounded reconcile BOTH devices hold the edited file and no tombstone or
-/// conflict artifact.
+/// Delete-vs-edit: A deletes `data.txt` while B concurrently edits it. §11 resolves to the
+/// edit surviving; after a bounded reconcile BOTH devices hold the edit, no tombstone/conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_vs_edit_edit_survives_on_both() -> Result<()> {
     const ORIG: &[u8] = b"the original body on device A";
@@ -195,8 +176,7 @@ async fn delete_vs_edit_edit_survives_on_both() -> Result<()> {
 
     let (vid, _n) = daemon_a.new_vid();
 
-    // Device A: publish the file, then delete it and republish -> a tombstone
-    // that carries A's bumped version-vector component.
+    // Device A: publish, then delete and republish -> a tombstone carrying A's bumped VV.
     let src_a = tempfile::tempdir()?;
     std::fs::write(src_a.path().join("data.txt"), ORIG)?;
     assert_eq!(daemon_a.publish_vault(src_a.path(), vid).await?, 1);
@@ -207,8 +187,7 @@ async fn delete_vs_edit_edit_survives_on_both() -> Result<()> {
         "the delete republishes a tombstone at a bumped epoch"
     );
 
-    // Device B: concurrently publish an independent edit of the same path. With
-    // no shared ancestry, B's {b:1} is concurrent with A's delete tombstone.
+    // Device B: concurrently publish an independent edit; B's {b:1} is concurrent with A's tombstone.
     let src_b = tempfile::tempdir()?;
     std::fs::write(src_b.path().join("data.txt"), EDIT)?;
     assert_eq!(daemon_b.publish_vault(src_b.path(), vid).await?, 1);

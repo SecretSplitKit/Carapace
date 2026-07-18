@@ -1,18 +1,9 @@
-//! MAJOR 3 regression: 3+ device convergence on a concurrent edit must be
-//! order-independent.
-//!
-//! Three owner daemons share one `k_root` and each publishes a DIFFERENT body for
-//! the same path in the same vault, with no shared ancestry, so all three edits are
-//! mutually concurrent. The bug: the winner tie-break and the `sync-conflict-<dev>`
-//! filename were derived from the POST-MERGE joined version vector, so different
-//! pairwise fold orders on different devices produced different winners / conflict
-//! names - the devices ended up with DIFFERENT file sets (permanent divergence).
-//!
-//! The fix derives both the winner and the conflict name from order-independent,
-//! content-intrinsic data (mtime + file_hash). This test reconciles the three
-//! devices to a fixed point and asserts they converge on an IDENTICAL file set -
-//! same winner path, same two conflict-copy names - with all three bodies present
-//! (nothing dropped). Bounded and self-terminating.
+//! 3+ device convergence on a concurrent edit must be order-independent. Three owner daemons
+//! sharing one `k_root` each publish a different body for the same path (no shared ancestry, so
+//! all three are mutually concurrent). The bug: the winner + conflict filename came from the
+//! post-merge joined VV, so different fold orders produced different file sets (permanent
+//! divergence). The fix derives both from content-intrinsic data (mtime + file_hash). This
+//! reconciles to a fixed point and asserts an IDENTICAL file set with all three bodies present.
 
 use std::collections::BTreeSet;
 use std::path::Path;

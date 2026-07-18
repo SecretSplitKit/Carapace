@@ -1,8 +1,6 @@
-//! C1 regression: a transiently-unreachable replica is NOT evicted by the wired
-//! PoR loop. Transport failure (the peer cannot be dialed) must never advance the
-//! retention loss streak - only a peer that answered with missing/wrong bytes does.
-//! This exercises the real network adapter (`por_audit_round` -> `fetch_audit_samples`)
-//! that introduces the unreachable=loss collapse the audit flagged.
+//! C1 regression: a transiently-unreachable replica is NOT evicted by the PoR loop. Transport
+//! failure must never advance the retention loss streak - only a peer that answered with
+//! missing/wrong bytes does. Exercises the real network adapter (`por_audit_round`).
 
 use std::collections::HashMap;
 

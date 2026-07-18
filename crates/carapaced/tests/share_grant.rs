@@ -1,14 +1,7 @@
-//! W3 ShareGrant minting / delivery / ref-refresh (§8, §7.3, §10.2).
-//!
-//! The owner splits a secret to a trustee set and mints one signed `ShareGrant` per
-//! trustee, delivered over the `carapace/1` control stream. Each trustee VERIFIES the
-//! grant (signature + embedded-share CRC + owner delegation) and stores the FULL grant
-//! (roster + recovery_delay + announce refs), not a bare share — so a ceremony can
-//! later locate co-trustees and the latest manifest without a live owner.
-//!
-//! Every test is BOUNDED (§11 lesson): no real cadence is ever waited on. The refresh
-//! runs on an injected `maintenance_round(now)` with a fast clock; the delivery dials
-//! are bounded by the daemon's connect timeout; daemons are torn down at the end.
+//! W3 ShareGrant minting / delivery / ref-refresh (§8, §7.3, §10.2): the owner splits a secret
+//! and delivers one signed `ShareGrant` per trustee. Each trustee verifies (signature +
+//! embedded-share CRC + owner delegation) and stores the FULL grant (roster + recovery_delay +
+//! announce refs). Bounded: the refresh runs on an injected `maintenance_round(now)`.
 
 use std::collections::HashSet;
 
@@ -200,10 +193,8 @@ async fn grant_with_bad_signature_is_rejected_on_receipt() -> Result<()> {
     let b = Daemon::start(seeds(0x13, 0xB2)).await?;
     a_befriends(&a, &b).await?;
 
-    // Build a grant, sign it, then tamper a signed field so the signature no longer
-    // covers the content. The subject is irrelevant: `verify_share_grant` (signature +
-    // embedded share) runs before any delegation check, so this is rejected purely on
-    // the bad signature.
+    // Build a grant, sign it, then tamper a signed field. `verify_share_grant` runs before any
+    // delegation check, so this is rejected purely on the bad signature.
     let signer = SigningKey::from_bytes(&[0x77; 32]);
     let share = {
         let (shares, _state, _warn) = carapace_recovery::split_root(&[0x5e; 32], 2, Some(3), false)

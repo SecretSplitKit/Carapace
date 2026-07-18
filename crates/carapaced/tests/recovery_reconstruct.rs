@@ -1,25 +1,10 @@
-//! §8.4 end-to-end DATA recovery: the ceremony -> replica -> reconstruct path the
-//! project was missing. `full_ceremony_recovers_k_root` (tests/ceremony.rs) proves a
-//! key-less claimant recovers `K_root`; `friend_gate_replica_placement...`
-//! (tests/friend_replica.rs) proves a *delegated* device reconstructs off a replica
-//! while the owner is live. This test joins them for the real recovery scenario: the
-//! owner is GONE, and a FRESH claimant device that recovered only `K_root` must fetch
-//! and decrypt the actual file content off a surviving friend's replica.
-//!
-//! Flow: owner A publishes a multi-file vault and places a replica on friend B (the
-//! placement ships the owner-signed announce; Option B §4 means NO FileGrant is
-//! pushed or retained); A splits `K_root` 2-of-3 to trustees B, C, D. A then "loses
-//! every device". A fresh claimant runs the full ceremony (collect M shares ->
-//! recover `K_root`, re-derive identity), stands itself up as a `Daemon` on the
-//! recovered key, and reconstructs the vault from B - authenticating as an
-//! owner-delegated device (`ReplicaDevice`) with a card its re-derived user key
-//! signed. B serves it the retained announce + owner card (never a grant); the
-//! claimant re-derives every per-chunk key from the manifest's `pt_hash`. The
-//! assertion is CONTENT: every file byte-matches the source, not merely that
-//! `K_root` came back.
-//!
-//! Bounded (§11 lesson): the 72 h abort delay is driven by an INJECTED clock, all
-//! dials are connect-timeout bounded, and every daemon is torn down.
+//! §8.4 end-to-end DATA recovery: owner GONE, a fresh claimant that recovered only `K_root`
+//! fetches and decrypts the actual file content off a surviving friend's replica. Owner A
+//! publishes a multi-file vault, places a replica on friend B, and splits `K_root` 2-of-3 to
+//! B, C, D; A loses every device; a fresh claimant runs the full ceremony, stands up as a
+//! Daemon on the recovered key, and reconstructs from B as an owner-delegated `ReplicaDevice`
+//! (retained announce + owner card, no grant; keys re-derived from the manifest pt_hash). The
+//! assertion is CONTENT: every file byte-matches. Bounded: injected clock, no real sleeps.
 
 use std::collections::BTreeMap;
 
@@ -82,9 +67,8 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
         a_befriends(&a, t).await?;
     }
 
-    // A publishes a real vault and places a replica on friend B. The placement pushes
-    // A's owner-signed VaultAnnounce, which B retains (§8.4). Option B (§4): no
-    // FileGrant is pushed - recovery re-derives keys from the manifest pt_hash.
+    // A publishes a vault and places a replica on B, which retains A's owner-signed announce
+    // (§8.4). Option B: no FileGrant is pushed; recovery re-derives keys from the pt_hash.
     let (src, expected) = make_tree();
     let (vid, _nonce) = a.new_vid();
     a.publish_vault(src.path(), vid).await?;
@@ -147,13 +131,10 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
         "re-derived user key equals the original owner's"
     );
 
-    // ---- §8.4 data recovery: stand the claimant up as a full Daemon on the recovered
-    // K_root + its own node identity, then reconstruct the vault off the surviving
-    // replica B. The claimant is a FRESH device (new node key) presenting a card its
-    // re-derived owner-user key signed; B admits it as an owner-delegated ReplicaDevice
-    // and serves the retained announce + owner card + blobs - NEVER a grant (Option B,
-    // §4): the claimant re-derives every per-chunk key from the manifest pt_hash. B has
-    // no grant to serve - the `replica_grants` retention path was removed entirely. ----
+    // §8.4 data recovery: stand the claimant up as a Daemon on the recovered K_root + its own
+    // node identity, then reconstruct off replica B. The fresh device presents a card its
+    // re-derived user key signed; B admits it as an owner-delegated ReplicaDevice and serves
+    // the retained announce + owner card + blobs, never a grant (keys from the pt_hash).
     let recovered_daemon =
         Daemon::start(State::from_seeds(claimant.node_seed(), *recovered.k_root)).await?;
     assert_eq!(
