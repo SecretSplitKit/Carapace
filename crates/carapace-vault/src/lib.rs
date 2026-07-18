@@ -1,16 +1,7 @@
 //! carapace-vault: vault identity, directory ingest into a sealed manifest plus
 //! a content-addressed chunk store, and reconstruction back to plaintext
-//! (protocol §5, §7, §11). Network-independent — no iroh here.
-//!
-//! - [`vid`] / [`new_vid`]: vault identity `BLAKE3-256(user_pubkey ‖ nonce)`.
-//! - [`ChunkStore`]: content-addressed ciphertext store ([`MemoryStore`],
-//!   [`FsStore`]).
-//! - [`ingest_dir`]: walk a tree, FastCDC-chunk + seal each file, populate the
-//!   store, and build a [`Manifest`] + sealed, node-signed [`ManifestEnvelope`].
-//! - [`open_envelope`] / [`reconstruct`]: verify + decrypt back to bytes/disk.
-//!
-//! Every cryptographic primitive routes through `carapace-crypto`; every wire
-//! encoding routes through `carapace-wire`. Nothing is re-implemented here.
+//! (protocol §5, §7, §11). Network-independent. Crypto routes through
+//! `carapace-crypto`, wire encoding through `carapace-wire`.
 
 pub mod merge;
 mod store;
@@ -52,13 +43,12 @@ pub enum VaultError {
     /// Recovered file bytes did not match the manifest's `file_hash`.
     FileHashMismatch(String),
     /// A decrypted chunk's `BLAKE3(plaintext)` did not match the manifest's stored
-    /// `pt_hash` for that chunk (Option B integrity check, §4.2).
+    /// `pt_hash` (Option B integrity check, §4.2).
     ChunkHashMismatch([u8; 32]),
     /// A manifest path was absolute or escaped the output root (`..`).
     UnsafePath(String),
-    /// A file's name was not valid UTF-8, so it cannot round-trip through the
-    /// manifest's `String` path without a lossy collapse that could alias it onto
-    /// a distinct file. Rejected rather than silently merged.
+    /// A non-UTF8 filename: a lossy collapse could alias it onto a distinct file,
+    /// so it is refused rather than silently merged.
     NonUtf8Path(String),
     /// System clock / metadata could not produce a valid mtime.
     BadMtime,
@@ -125,10 +115,9 @@ pub fn vid(user_pubkey: &[u8; 32], creation_nonce: &[u8; 16]) -> [u8; 32] {
 /// `vid`. Returns `(vid, nonce)` so the caller can persist the nonce.
 pub fn new_vid(user_pubkey: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
     let mut nonce = [0u8; 16];
-    // ponytail: OS-CSPRNG failure at vault-mint is unrecoverable and not
-    // attacker-reachable (S8); `expect` here keeps `new_vid` infallible for its
-    // callers. The RNG-failure path that a peer *can* reach (`seal_manifest`)
-    // propagates a `VaultError::Rng` instead.
+    // ponytail: CSPRNG failure at vault-mint is not attacker-reachable (S8), so
+    // `expect` keeps `new_vid` infallible; the peer-reachable path
+    // (`seal_manifest`) propagates `VaultError::Rng` instead.
     getrandom::getrandom(&mut nonce).expect("CSPRNG");
     (vid(user_pubkey, &nonce), nonce)
 }
@@ -160,11 +149,8 @@ impl VaultKeys {
 
 // ---------------- chunk key map -----------------------------------------
 
-/// A chunk's decryption secret. `chunk_key`/`nonce` derive one-way from
-/// `K_content` + plaintext hash (`pt_hash`). Since the manifest now stores
-/// `pt_hash` per chunk (Option B, §4), a `K_content` holder re-derives these with
-/// [`chunk_keys_from_manifest`]; the owner no longer needs to persist or grant them
-/// for its own recovery.
+/// A chunk's decryption secret, derived one-way from `K_content` + `pt_hash`. A
+/// `K_content` holder re-derives it via [`chunk_keys_from_manifest`] (Option B, §4).
 #[derive(Clone)]
 pub struct ChunkSecret {
     /// XChaCha20-Poly1305 key.
@@ -176,10 +162,9 @@ pub struct ChunkSecret {
 /// Map from ChunkID to the secret needed to open that blob.
 pub type ChunkKeys = HashMap<[u8; 32], ChunkSecret>;
 
-/// Option B (§4.2): re-derive the per-chunk `ChunkKeys` for a manifest from
-/// `K_content` alone, using each chunk's stored `pt_hash`. This is what lets an
-/// owner (or a `K_root`-holding recovery claimant) reconstruct from the sealed
-/// manifest with no `FileGrant`. Deleted files carry no chunks and are skipped.
+/// Option B (§4.2): re-derive the per-chunk `ChunkKeys` from `K_content` alone,
+/// using each chunk's stored `pt_hash`. Lets an owner or recovery claimant
+/// reconstruct from the sealed manifest with no `FileGrant`.
 pub fn chunk_keys_from_manifest(manifest: &Manifest, k_content: &[u8]) -> ChunkKeys {
     let mut keys = HashMap::new();
     for f in &manifest.files {
@@ -207,20 +192,14 @@ pub struct Ingest {
 
 // ---------------- ingest (§5, §7) ---------------------------------------
 
-/// Walk `dir`, seal every file's chunks into `store`, and build the manifest +
-/// sealed envelope for epoch `epoch`, node-signed by `node_key`.
+/// Walk `dir` (sorted path order, deterministic manifest), FastCDC-cut and seal
+/// each file's chunks (`aad = vid`) into `store`, and build the manifest + sealed
+/// envelope for `epoch`, node-signed by `node_key`.
 ///
-/// Files are visited in sorted path order for a deterministic manifest. Each
-/// file's chunks are FastCDC-cut, sealed with `aad = vid`, and stored under
-/// their ChunkID.
-///
-/// Per-file version vectors follow §11. Pass the device's previously-published
-/// [`Manifest`] as `prev` (or `None` for a first ingest): a file that *changed*
-/// (or is new, or resurrects a tombstone) bumps this node's component so a
-/// concurrent edit on another device is later detectable; an *unchanged* file
-/// carries its prior vector forward untouched; a file that *disappeared* from
-/// disk becomes a tombstone with this node's component bumped, so the delete
-/// propagates.
+/// Per-file version vectors follow §11 against `prev` (the device's previously-
+/// published manifest, or `None` for a first ingest): a changed/new/resurrected
+/// file bumps this node's component, an unchanged file carries its vector forward,
+/// and a disappeared file becomes a bumped tombstone so the delete propagates.
 pub fn ingest_dir<S: ChunkStore>(
     dir: &Path,
     node_key: &SigningKey,
@@ -255,9 +234,7 @@ pub fn ingest_dir<S: ChunkStore>(
             let plaintext = &data[off..off + len];
             let sealed = content::seal_chunk(&*keys.k_content, &keys.vid, plaintext)?;
             store.put(sealed.chunk_id, sealed.ciphertext)?;
-            // Record pt_hash in the manifest (Option B, §4): a K_content holder
-            // re-derives this chunk's key/nonce from it, so owner sync and recovery
-            // never need a FileGrant.
+            // pt_hash in the manifest lets a K_content holder re-derive key/nonce (Option B, §4).
             chunk_refs.push((sealed.chunk_id, sealed.pt_hash, len as u64));
             key_map.entry(sealed.chunk_id).or_insert(ChunkSecret {
                 chunk_key: sealed.chunk_key,
@@ -420,10 +397,8 @@ pub fn reconstruct_file<S: ChunkStore>(
         let ct = store.get(id)?.ok_or(VaultError::MissingChunk(*id))?;
         let secret = keys.get(id).ok_or(VaultError::MissingKey(*id))?;
         let pt = content::open_chunk(&secret.chunk_key, &secret.nonce, &ct, vid)?;
-        // Option B free integrity check (§4.2): the manifest's pt_hash must equal
-        // BLAKE3(plaintext). A key/nonce re-derived from a tampered manifest pt_hash
-        // already fails the AEAD open above; this also catches a store that returns
-        // the wrong (but validly-keyed) chunk for this id.
+        // Option B integrity check (§4.2): also catches a store returning the wrong
+        // (but validly-keyed) chunk for this id.
         if blake3::hash(&pt).as_bytes() != pt_hash {
             return Err(VaultError::ChunkHashMismatch(*id));
         }
@@ -457,24 +432,14 @@ pub fn reconstruct<S: ChunkStore>(
     Ok(())
 }
 
-/// Write `bytes` to `dest`, then restore the entry's `mtime` (and, on unix, its
-/// `mode`) so that a subsequent [`ingest_dir`] of this tree round-trips to the
-/// identical [`FileEntry`].
+/// Write `bytes` to `dest`, restoring the entry's `mtime` (and unix `mode`) so a
+/// subsequent [`ingest_dir`] round-trips to the identical [`FileEntry`] and does
+/// not ping-pong metadata between devices (§11). The existing file is removed
+/// first so a restored read-only mode from a prior round cannot block the overwrite.
 ///
-/// This is what makes reconstructing INTO a watched working directory stable
-/// (§11): the daemon's re-ingest of the just-written tree reads back the same
-/// mtime/mode and content, so it produces the same per-file version vectors and is
-/// a no-op instead of a spurious change - which otherwise ping-pongs metadata
-/// between devices (mtime/mode feed conflict resolution) and never converges. The
-/// existing file is removed first so a restored read-only mode from a prior round
-/// does not block the overwrite.
-///
-/// ponytail: writes in place (remove + create + write), NOT a temp-file + atomic
-/// rename, so a reader (or the working-dir watcher) that peeks mid-write can see a
-/// truncated/partial file; the daemon's per-vid publish lock + debounce cover its
-/// OWN re-ingest, but a concurrent external reader has no such guard. Upgrade path:
-/// write to `dest.tmp` then `fs::rename` for atomic replace (and fsync the dir) if
-/// external mid-write reads ever matter.
+/// ponytail: in-place write (remove + create + write), NOT temp-file + atomic
+/// rename, so a concurrent external reader can peek a partial file. Upgrade path:
+/// write `dest.tmp` then `fs::rename` (and fsync the dir) if that ever matters.
 fn write_file_with_meta(dest: &Path, bytes: &[u8], entry: &FileEntry) -> Result<(), VaultError> {
     use std::io::Write;
     let _ = fs::remove_file(dest);
@@ -519,10 +484,9 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
     Ok(())
 }
 
-/// Join a relative path's normal components with `/`, returning `None` if any
-/// component is not valid UTF-8. A lossy collapse (`to_string_lossy` -> U+FFFD)
-/// could map two distinct filenames onto one manifest path and silently merge
-/// their content, so a non-UTF8 name is refused at the source instead.
+/// Join a relative path's normal components with `/`, returning `None` on a
+/// non-UTF8 component. A lossy collapse could alias two distinct filenames onto
+/// one manifest path and merge their content, so it is refused at the source.
 fn rel_to_slash(rel: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for c in rel.components() {
@@ -554,12 +518,11 @@ fn file_mtime(meta: &fs::Metadata) -> Result<u64, VaultError> {
 /// Join a manifest-supplied relative path onto `base`, rejecting absolute paths
 /// and any `..` escape (a manifest may be hostile).
 ///
-/// S9 (deferred to the foreign-manifest phase): two residual gaps remain for a
-/// *cross-user* hostile manifest — a Windows alternate-data-stream component
-/// (`foo:bar`) is not filtered (a blanket `:` reject would break legitimate unix
-/// filenames), and `reconstruct`'s `fs::write` follows a pre-existing symlink at
-/// the destination. Phase 1 manifests are same-user-trusted, so this is safe as
-/// is; tighten both before honoring a friend's manifest.
+/// S9 (deferred to the foreign-manifest phase): for a cross-user hostile manifest,
+/// a Windows ADS component (`foo:bar`) is not filtered (a blanket `:` reject would
+/// break legit unix names), and reconstruct's write follows a pre-existing symlink
+/// at the destination. Phase 1 manifests are same-user-trusted; tighten both before
+/// honoring a friend's manifest.
 fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, VaultError> {
     let mut out = base.to_path_buf();
     for part in rel.split('/') {

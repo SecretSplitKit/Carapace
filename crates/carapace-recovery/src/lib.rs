@@ -1,6 +1,6 @@
 //! carapace-recovery: recovery-via-Chela orchestration (protocol §8).
 //!
-//! Carapace consumes Chela's extendable-split profile through four concerns, one module each:
+//! Carapace consumes Chela's extendable-split profile through three concerns, one module each:
 //!
 //! - [`split`]: split `K_root` (inner circle) and `K_vaultroot(vid)` (scoped, §8.2); extend to
 //!   add a trustee / replace a lost share; the §8.3 issuance cap; owner-side round-trip

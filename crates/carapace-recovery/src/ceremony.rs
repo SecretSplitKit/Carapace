@@ -1,9 +1,6 @@
-//! The recovery ceremony (protocol §8.5, normative). A testable state machine plus the message
-//! builders/verifiers. No protocol can cryptographically prove a key-less claimant is the owner,
-//! so the ceremony structures human verification and makes silent takeover loud and slow:
-//! only a trustee may open, the subject's own key can abort unforgeably, and no share moves before
-//! both the delay elapses and `M` trustees approve. Wall-clock time is injected as a `now`
-//! parameter so tests never sleep.
+//! The recovery ceremony (protocol §8.5): state machine plus message builders/verifiers. Only a
+//! trustee may open, the subject's key aborts unforgeably, and no share moves before the delay
+//! elapses and `M` trustees approve. Wall-clock time is injected as `now` so tests never sleep.
 
 use carapace_crypto::seal::{open, seal, HpkePrivateKey, HpkePublicKey};
 use carapace_wire::{
@@ -32,8 +29,8 @@ pub enum CeremonyPhase {
     Aborted,
 }
 
-/// Per-subject rate limiter for `RecoveryOpen` (protocol §8.5: "rate-limited per subject").
-/// A sliding window of recent opens; opens beyond `max_per_window` inside `window_secs` are refused.
+/// Per-subject rate limiter for `RecoveryOpen` (protocol §8.5): a sliding window of recent opens;
+/// opens beyond `max_per_window` inside `window_secs` are refused.
 pub struct RecoveryRateLimiter {
     window_secs: u64,
     max_per_window: usize,
@@ -52,7 +49,7 @@ impl RecoveryRateLimiter {
     }
 
     /// Record an open for `subject` at `now`, or refuse with [`RecoveryError::RateLimited`] if the
-    /// window is already full. Prunes events older than the window on each call.
+    /// window is full. Prunes events older than the window on each call.
     pub fn check_and_record(&mut self, subject: [u8; 32], now: u64) -> Result<(), RecoveryError> {
         self.events
             .retain(|(_, t)| now.saturating_sub(*t) < self.window_secs);
@@ -99,8 +96,6 @@ pub fn open_recovery(
 /// recovery set (protocol §8.5 step 1 - strangers cannot open). `roster` is the co-trustee user
 /// pubkeys for the set.
 pub fn verify_recovery_open(open: &RecoveryOpen, roster: &[[u8; 32]]) -> Result<(), RecoveryError> {
-    // The wire `rsid` is a u64, but Chela's `recovery_set_id` is 11-bit; a larger value cannot
-    // reference a real set, so reject it on ingest rather than carrying it inward.
     if open.rsid > MAX_RSID {
         return Err(RecoveryError::RsidOutOfRange);
     }
@@ -124,11 +119,11 @@ pub struct CeremonyState {
     pub ceremony_enc: [u8; 32],
     /// The recovery delay in seconds (from the `ShareGrant`, default 72 h).
     pub recovery_delay: u64,
-    /// The sponsor's claimed open time (from the signed `RecoveryOpen`). Advisory only: the release
-    /// gate uses `max(opened_at, first_seen)` so a sponsor cannot backdate it (see `can_release`).
+    /// The sponsor's claimed open time. Advisory only: the gate uses `max(opened_at, first_seen)`
+    /// so a sponsor cannot backdate it (see [`Self::can_release`]).
     pub opened_at: u64,
-    /// This observer's own first-observation time, captured when it began tracking the ceremony.
-    /// The delay clock is anchored here, not to the sponsor-controlled `opened_at`.
+    /// This observer's own first-observation time; the delay clock is anchored here, not to the
+    /// sponsor-controlled `opened_at`.
     pub first_seen: u64,
     /// The reconstruction threshold `M`.
     pub m: u8,
@@ -138,12 +133,9 @@ pub struct CeremonyState {
 }
 
 impl CeremonyState {
-    /// Begin tracking a ceremony from a verified [`RecoveryOpen`]. Verifies the open against the
-    /// roster (only a trustee may open). `recovery_delay` and `m` come from the `ShareGrant`. `now`
-    /// is this observer's wall clock at ingest and anchors the delay (see [`Self::can_release`]).
-    ///
-    /// Prefer [`Self::open_from_grant`], which binds the open to a verified grant, derives the
-    /// roster / `m` / `recovery_delay` from it, and applies the per-subject rate limit. This
+    /// Begin tracking a ceremony from a verified [`RecoveryOpen`], checking it against the roster
+    /// (only a trustee may open). `now` anchors the delay (see [`Self::can_release`]). Prefer
+    /// [`Self::open_from_grant`], which binds the open to a verified grant and rate-limits; this
     /// lower-level form trusts the caller to pair the correct roster with the open.
     pub fn open(
         open: &RecoveryOpen,
@@ -156,18 +148,10 @@ impl CeremonyState {
         Ok(Self::track(open, roster, m, recovery_delay, now))
     }
 
-    /// Begin tracking a ceremony bound to the [`ShareGrant`] that gates it. This is the front door
-    /// for an inbound [`RecoveryOpen`] and closes the composition gaps of the raw [`Self::open`]:
-    ///
-    /// - verifies the grant's signature and decodes its share;
-    /// - requires `open.subject == grant.subject` and `open.rsid == share.recovery_set_id`
-    ///   (an open cannot be gated on a grant for a different subject or set);
-    /// - derives the roster (`grant.by` plus every `grant.cotrustees[i].user`), threshold `M`
-    ///   (the share's), and `recovery_delay` from the grant rather than trusting loose arguments;
-    /// - verifies the open against that derived roster (only a trustee may sponsor);
-    /// - charges the per-subject rate limit (protocol §8.5: "rate-limited per subject").
-    ///
-    /// `limiter` is the daemon's long-lived [`RecoveryRateLimiter`]; `now` anchors the delay.
+    /// Begin tracking a ceremony bound to the [`ShareGrant`] that gates it (the front door for an
+    /// inbound [`RecoveryOpen`]). Verifies the grant, requires the open's subject/rsid to match it,
+    /// derives the roster / threshold / delay from the grant (not loose arguments), verifies the
+    /// open against that roster, and charges the per-subject rate limit. `now` anchors the delay.
     pub fn open_from_grant(
         open: &RecoveryOpen,
         grant: &ShareGrant,
@@ -195,7 +179,7 @@ impl CeremonyState {
     }
 
     /// Construct the tracking state from already-verified parts. Callers MUST have verified the
-    /// open against `roster` first (both [`Self::open`] and [`Self::open_from_grant`] do).
+    /// open against `roster` first.
     fn track(
         open: &RecoveryOpen,
         roster: Vec<[u8; 32]>,
@@ -219,7 +203,7 @@ impl CeremonyState {
     }
 
     /// Apply a [`CeremonyApprove`] (protocol §8.5 step 4): verify the signature, the ceremony id,
-    /// and that the approver is a roster trustee; record a distinct approval.
+    /// and roster membership; record a distinct approval.
     pub fn approve(&mut self, ap: &CeremonyApprove) -> Result<(), RecoveryError> {
         ap.verify()?;
         if ap.ceremony_id != self.ceremony_id {
@@ -235,8 +219,8 @@ impl CeremonyState {
         Ok(())
     }
 
-    /// Apply a [`CeremonyAbort`] (protocol §8.5 step 3). Authoritative and unforgeable: it must be
-    /// signed by the subject's *user* key. A valid abort cancels the ceremony permanently.
+    /// Apply a [`CeremonyAbort`] (protocol §8.5 step 3): must be signed by the subject's *user*
+    /// key, and cancels the ceremony permanently.
     pub fn abort(&mut self, ab: &CeremonyAbort) -> Result<(), RecoveryError> {
         ab.verify()?;
         if ab.ceremony_id != self.ceremony_id {
@@ -262,12 +246,11 @@ impl CeremonyState {
     }
 
     /// Whether shares may be released at `now`: not aborted, `≥ M` approvals, AND the delay has
-    /// elapsed (protocol §8.5 step 5). Both conditions are required.
+    /// elapsed (protocol §8.5 step 5).
     ///
-    /// The delay is anchored to `max(opened_at, first_seen)`, not to the sponsor-controlled
-    /// `opened_at` alone. A malicious sponsor who backdates `opened_at` (e.g. to 0) cannot collapse
-    /// the abort window: each honest observer still waits `recovery_delay` from its own first
-    /// observation. A future-dated `opened_at` only pushes release later. See spec-errata E4.
+    /// Anchored to `max(opened_at, first_seen)` so a sponsor who backdates `opened_at` cannot
+    /// collapse the abort window; each observer still waits `recovery_delay` from its own first
+    /// observation (spec-errata E4).
     #[must_use]
     pub fn can_release(&self, now: u64) -> bool {
         let release_at = self
@@ -289,16 +272,11 @@ impl CeremonyState {
         }
     }
 
-    /// Serialize the complete tracking state to deterministic canonical CBOR (the same restricted
-    /// profile the wire uses: sorted keys, shortest-form ints, definite lengths) for durable
-    /// persistence across a daemon reboot. Lossless: every field - including the private roster,
-    /// approvals, and `aborted` flag, and the local-clock anchor `first_seen` - round-trips through
-    /// [`Self::from_bytes`]. This state carries pubkeys/sigs/flags only, never share bytes; the
-    /// persistence layer seals it at rest, so this method does not encrypt.
-    ///
-    /// A dropped field here would be a §8.5 security regression: losing `first_seen` resets the
-    /// delay window on reboot, losing an approval un-approves a trustee, and losing `aborted`
-    /// re-opens a ceremony the subject already cancelled.
+    /// Serialize the full tracking state to canonical CBOR for durable persistence across a daemon
+    /// reboot. Lossless: every field (including roster, approvals, `aborted`, and the local-clock
+    /// anchor `first_seen`) round-trips through [`Self::from_bytes`]. Dropping any field is a §8.5
+    /// regression - losing `first_seen` resets the delay, losing `aborted` re-opens a cancelled
+    /// ceremony. Carries pubkeys/sigs/flags only, never share bytes, so it does not encrypt.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut m = Map::new();
@@ -333,8 +311,8 @@ impl CeremonyState {
     }
 
     /// Reconstruct a [`CeremonyState`] from [`Self::to_bytes`]. Strict: the canonical decoder
-    /// rejects non-canonical CBOR, an unknown key, a missing field, or a byte string of the wrong
-    /// length, and `m` must fit in a `u8`. Errors surface as [`RecoveryError::Wire`].
+    /// rejects non-canonical CBOR, unknown/missing keys, or a wrong-length byte string, and `m`
+    /// must fit in a `u8`. Errors surface as [`RecoveryError::Wire`].
     pub fn from_bytes(b: &[u8]) -> Result<Self, RecoveryError> {
         let mut m = decode(b)?.into_map()?;
         let ceremony_id = m.take(0)?.into_array_n()?;
@@ -377,9 +355,8 @@ impl CeremonyState {
 }
 
 /// Build a [`CeremonyShare`] (protocol §8.5 step 5): HPKE-seal the trustee's `chela.share` JSON to
-/// the claimant's `ceremony_enc` pubkey, then sign the message with the trustee key. The sealed
-/// bytes are `encapped_key(32) ‖ ciphertext`; the ceremony id is bound as AEAD associated data.
-/// No trustee ever sees another's share.
+/// the claimant's `ceremony_enc` pubkey, then sign with the trustee key. Sealed bytes are
+/// `encapped_key(32) ‖ ciphertext`; the ceremony id is bound as AEAD associated data.
 pub fn build_ceremony_share(
     trustee: &SigningKey,
     ceremony_id: [u8; 16],
@@ -393,7 +370,7 @@ pub fn build_ceremony_share(
         &ceremony_id,
         share_json.as_bytes(),
     )?;
-    let mut sealed = encapped; // X25519 encapped key is 32 bytes
+    let mut sealed = encapped;
     sealed.extend_from_slice(&ct);
 
     let mut cs = CeremonyShare {
@@ -407,10 +384,9 @@ pub fn build_ceremony_share(
 }
 
 /// Open a [`CeremonyShare`] with the claimant's ceremony private key, returning the recovered
-/// `chela.share` JSON. Authenticates the sender first - the trustee signature must verify AND
-/// `cs.by` must be in `roster` - before decrypting, so a party who merely observed the (semi-public)
-/// `ceremony_enc` cannot feed the claimant a bogus share. Then splits the leading 32-byte encapped
-/// key from the ciphertext and binds the ceremony id as associated data.
+/// `chela.share` JSON. Authenticates the sender (signature valid AND `cs.by` in `roster`) *before*
+/// decrypting, so a party who merely observed the semi-public `ceremony_enc` cannot feed the
+/// claimant a bogus share. The ceremony id is bound as associated data.
 pub fn open_ceremony_share(
     recipient: &HpkePrivateKey,
     cs: &CeremonyShare,
@@ -788,9 +764,8 @@ mod tests {
         ));
     }
 
-    /// C1: a malicious sponsor who backdates `opened_at` cannot skip the delay. The clock is
-    /// anchored to the observer's own `first_seen`, so with `opened_at = 0` and M approvals the
-    /// ceremony is still not releasable until `first_seen + recovery_delay`.
+    /// C1: a sponsor who backdates `opened_at` to 0 cannot skip the delay; the clock is anchored
+    /// to the observer's own `first_seen`.
     #[test]
     fn delay_anchored_to_first_seen_not_sponsor_opened_at() {
         let s = setup();
@@ -970,16 +945,14 @@ mod tests {
         ));
     }
 
-    /// Durable persistence: a mid-ceremony `CeremonyState` (open, some approvals, a set
-    /// `first_seen`) survives serialize/deserialize byte-for-byte, so a daemon reboot cannot reset
-    /// the delay clock, drop an approval, or lose an abort (§8.5). Covers both the live and the
-    /// aborted variant.
+    /// Durable persistence: a mid-ceremony `CeremonyState` survives serialize/deserialize
+    /// byte-for-byte, so a reboot cannot reset the delay, drop an approval, or lose an abort
+    /// (§8.5). Covers both the live and the aborted variant.
     #[test]
     fn ceremony_state_persistence_round_trips() {
         let s = setup();
         let open = an_open(&s, u64::from(s.shares[0].recovery_set_id), T0);
-        // first_seen is anchored to `now` at open; use a distinct value from opened_at to prove the
-        // E4 local-clock anchor is what survives, not the sponsor-controlled opened_at.
+        // Distinct from opened_at to prove the E4 local-clock anchor survives, not opened_at.
         let first_seen = T0 + 5;
         let mut cer = CeremonyState::open(&open, s.roster.clone(), 3, DELAY, first_seen).unwrap();
         // Two of three approvals recorded so far (mid-ceremony, sub-M).
@@ -1022,8 +995,7 @@ mod tests {
         cer.approve(&ap).unwrap();
         assert!(cer.can_release(first_seen + DELAY));
 
-        // The abort flag survives: an aborted ceremony round-trips as still aborted and never
-        // releases, blocking a silent takeover across a reboot.
+        // The abort flag survives: an aborted ceremony round-trips as still aborted.
         let mut abort = CeremonyAbort {
             ceremony_id: [0xCE; 16],
             by: [0; 32],

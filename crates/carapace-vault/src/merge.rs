@@ -1,26 +1,15 @@
 //! §11 live-sync conflict resolution: version-vector algebra and per-file /
-//! per-manifest merge. Pure logic, network-independent.
+//! per-manifest merge. Pure logic, network-independent. Per-file rules:
 //!
-//! A version vector ([`Vv`]) maps a device pubkey to a per-file change counter.
-//! Each local edit bumps that device's component ([`bump`]); comparing two
-//! vectors classifies the relationship as one dominating the other (a
-//! fast-forward) or the two being *concurrent* (a genuine conflict). §11:
+//! - Dominance -> take the dominant entry (live or tombstone).
+//! - Concurrent (or equal-VV) with distinct content -> keep BOTH: winner by
+//!   `(mtime, content-hash)` keeps the path, loser renamed
+//!   `path.sync-conflict-<ts>-<h>.<ext>`. Both derive from content-intrinsic data,
+//!   never the joined VV, so 3+ devices converge regardless of fold order.
+//!   Identical content collapses to one survivor.
+//! - Concurrent delete-vs-edit -> the edit survives; delete-vs-delete -> deleted.
 //!
-//! - **Dominance** -> take the dominant entry (live or tombstone).
-//! - **Concurrent (or equal-VV) with DISTINCT content** -> BOTH kept: the winner
-//!   by `(mtime, content-hash)` keeps the path, the loser is renamed
-//!   `path.sync-conflict-<ts>-<h>.<ext>`. Both the winner tie-break and the loser
-//!   filename derive from order-independent, content-intrinsic data (mtime +
-//!   `file_hash`), never the post-merge joined VV, so 3+ devices converge on an
-//!   identical file set regardless of the order they fold manifests in. Identical
-//!   content collapses to one survivor (no pointless duplicate).
-//! - **Concurrent, delete-vs-edit** -> the edit survives at the path (a
-//!   concurrent delete does not resurrect-block a live edit).
-//! - **Concurrent, delete-vs-delete** -> the file stays deleted.
-//!
-//! [`merge_manifests`] applies the per-file rule across the union of paths and
-//! is deterministic, commutative (equal resulting file set for `merge(a,b)` and
-//! `merge(b,a)`), and idempotent (`merge(a,a) == a`).
+//! [`merge_manifests`] is deterministic, commutative in the file set, and idempotent.
 
 use carapace_wire::{FileEntry, Manifest, Vv};
 use std::cmp::Ordering;
@@ -37,10 +26,9 @@ fn vv_get(vv: &Vv, dev: &[u8; 32]) -> u64 {
         .unwrap_or(0)
 }
 
-/// Canonical form: entries sorted bytewise by device key, zero-valued
-/// components dropped, duplicate keys collapsed to their max. Two vectors that
-/// are equal as maps have identical canonical forms, which makes [`FileEntry`]
-/// equality (a `Vec` compare) order-insensitive and merge output deterministic.
+/// Canonical form: sorted bytewise by device key, zero components dropped,
+/// duplicate keys collapsed to max. Gives map-equal vectors identical forms, so
+/// [`FileEntry`] equality (a `Vec` compare) is order-insensitive.
 pub fn canon_vv(vv: &Vv) -> Vv {
     let mut m: BTreeMap<[u8; 32], u64> = BTreeMap::new();
     for (d, c) in vv {
@@ -142,26 +130,21 @@ pub fn bump(vv: &Vv, dev: &[u8; 32]) -> Vv {
 
 // ---------------- per-file merge (§11) ----------------------------------
 
-/// A deterministic, argument-order-independent total key over a file's
-/// content-intrinsic identity: `(mtime, file_hash, size)`. Used both to pick the
-/// `(mtime, deviceID)`-style path winner on a genuine conflict and to pick a
-/// single survivor for otherwise-identical entries. It is intrinsic to the entry
-/// (never the post-merge joined VV), so it is IDENTICAL regardless of pairwise
-/// fold order across any number of devices (§11, MAJOR 3): `mtime` is primary
-/// (the spec's winner rule) and a tie falls to the content hash rather than an
-/// order-dependent device attribution.
+/// Order-independent total key over a file's content-intrinsic identity:
+/// `(mtime, file_hash, size)`. Picks the conflict path winner and the single
+/// survivor for identical entries. Intrinsic to the entry (never the joined VV),
+/// so it is identical regardless of pairwise fold order (§11, MAJOR 3): mtime is
+/// primary (the spec winner rule), ties fall to content hash.
 ///
-/// ponytail: a `mode`-only difference between two byte-identical, same-mtime
-/// entries is not disambiguated here; that corner only picks between two
-/// content-identical survivors, so it is cosmetic. Add `mode` to the key if
-/// mode-exact convergence is ever required.
+/// ponytail: a mode-only difference between byte-identical same-mtime entries is
+/// not disambiguated (cosmetic); add `mode` to the key if mode-exact convergence
+/// is ever required.
 fn entry_key(e: &FileEntry) -> (u64, [u8; 32], u64) {
     (e.mtime, e.file_hash, e.size)
 }
 
 fn hex_short(bytes: &[u8; 32]) -> String {
-    // First 4 bytes -> 8 lowercase hex chars, enough to disambiguate the loser's
-    // content in a conflict filename while staying short.
+    // First 4 bytes -> 8 lowercase hex chars.
     let mut s = String::with_capacity(8);
     for b in &bytes[..4] {
         s.push(char::from_digit((b >> 4) as u32, 16).expect("nibble"));
@@ -170,18 +153,12 @@ fn hex_short(bytes: &[u8; 32]) -> String {
     s
 }
 
-/// Build the loser's conflict path: `<dir>/<stem>.sync-conflict-<ts>-<h>.<ext>`,
-/// preserving the last extension (`report.txt` -> `report.sync-conflict-….txt`;
-/// `archive.tar.gz` -> `archive.tar.sync-conflict-….gz`; `README` and
-/// `.gitignore` keep no extension). `ts` is the loser's mtime in unix seconds and
-/// `h` is the short (first-4-byte) hex of the loser's `file_hash`.
-///
-/// Both inputs are content-intrinsic to the losing entry (§11, MAJOR 3): they do
-/// not depend on the post-merge joined version vector, so every device names the
-/// same losing content the same way regardless of the order it folded manifests
-/// in. Termination of the manifest fold still holds because a rename strictly
-/// lengthens the stem (a re-collision nests a second `.sync-conflict-` segment
-/// rather than reproducing the same path).
+/// Build the loser's conflict path `<dir>/<stem>.sync-conflict-<ts>-<h>.<ext>`,
+/// preserving the last extension (`archive.tar.gz` -> `archive.tar.sync-conflict-….gz`;
+/// `.gitignore` keeps none). `ts` is the loser's mtime, `h` the short hex of its
+/// `file_hash` - both content-intrinsic, so every device names the loser identically
+/// (§11, MAJOR 3). The fold terminates: a rename strictly lengthens the stem, so a
+/// re-collision nests a second segment rather than reproducing the path.
 fn conflict_path(path: &str, ts: u64, file_hash: &[u8; 32]) -> String {
     let h = hex_short(file_hash);
     let (dir, base) = match path.rfind('/') {
@@ -198,17 +175,13 @@ fn conflict_path(path: &str, ts: u64, file_hash: &[u8; 32]) -> String {
     }
 }
 
-/// Merge two entries for the *same path* from two devices per §11. Returns one
-/// entry (dominance, identical content, delete-vs-edit resolved to the edit, or
-/// both deleted) or two (a concurrent edit-vs-edit conflict over DISTINCT
-/// content: winner at the path, loser renamed). Every surviving entry carries the
-/// merged version vector.
-///
-/// Conflict identity (winner + loser filename) is derived from order-independent,
-/// content-intrinsic data ([`entry_key`], `file_hash`), never the mutated joined
-/// VV, so 3+ devices converge on an identical file set no matter what pairwise
-/// order they fold in (MAJOR 3). Equal-VV-but-distinct-content is treated as a
-/// conflict, never a silent drop (MAJOR 2).
+/// Merge two entries for the *same path* per §11. Returns one entry (dominance,
+/// identical content, delete-vs-edit resolved to the edit, or both deleted) or two
+/// (concurrent edit over distinct content: winner at the path, loser renamed).
+/// Every survivor carries the merged VV. Conflict identity derives from
+/// content-intrinsic data ([`entry_key`], `file_hash`), never the joined VV, so
+/// 3+ devices converge (MAJOR 3); equal-VV-distinct-content is a conflict, not a
+/// silent drop (MAJOR 2).
 pub fn merge_entries(a: &FileEntry, b: &FileEntry) -> Vec<FileEntry> {
     debug_assert_eq!(a.path, b.path, "merge_entries requires equal paths");
     let mvv = merge_vv(&a.version, &b.version);
@@ -225,8 +198,8 @@ pub fn merge_entries(a: &FileEntry, b: &FileEntry) -> Vec<FileEntry> {
             e.version = mvv;
             return vec![e];
         }
-        // Equal or Concurrent: resolve by delete-state and content below. Equal is
-        // NOT assumed to mean identical content (MAJOR 2) - the hashes are compared.
+        // Equal or Concurrent: resolve below. Equal-VV is NOT assumed identical
+        // content (MAJOR 2) - hashes are compared.
         Rel::Equal | Rel::Concurrent => {}
     }
 
@@ -244,8 +217,7 @@ pub fn merge_entries(a: &FileEntry, b: &FileEntry) -> Vec<FileEntry> {
         }
         (false, false) => {
             if a.file_hash == b.file_hash {
-                // Identical content: one survivor, merged VV. No point keeping two
-                // byte-identical copies, and this keeps the fold terminating.
+                // Identical content: one survivor, merged VV.
                 let mut e = if entry_key(a) >= entry_key(b) {
                     a.clone()
                 } else {
@@ -254,9 +226,8 @@ pub fn merge_entries(a: &FileEntry, b: &FileEntry) -> Vec<FileEntry> {
                 e.version = mvv;
                 vec![e]
             } else {
-                // Distinct concurrent (or equal-VV) content: keep BOTH. Winner by
-                // (mtime, content) keeps the path; loser renamed by ITS OWN intrinsic
-                // (mtime, file_hash) so every device agrees on the name (MAJOR 2/3).
+                // Distinct content: keep BOTH. Winner by (mtime, content) keeps the
+                // path; loser renamed by its own intrinsic key (MAJOR 2/3).
                 let (win, lose) = if entry_key(a) >= entry_key(b) {
                     (a, b)
                 } else {
@@ -270,8 +241,7 @@ pub fn merge_entries(a: &FileEntry, b: &FileEntry) -> Vec<FileEntry> {
                 vec![w, l]
             }
         }
-        // delete-vs-edit: the edit survives at the path; the delete is discarded
-        // (it does not resurrect-block the live edit).
+        // delete-vs-edit: the edit survives, the delete is discarded.
         _ => {
             let live = if a.deleted { b } else { a };
             let mut e = live.clone();
@@ -298,13 +268,10 @@ pub struct MergedManifest {
 /// across the union of paths (a path present on only one side passes through).
 /// Deterministic, commutative in the resulting file set, and idempotent.
 pub fn merge_manifests(local: &Manifest, incoming: &Manifest) -> MergedManifest {
-    // Fold every entry into a path-keyed map, merging on collision. A
-    // concurrent edit-vs-edit conflict re-queues its two outputs (winner at the
-    // original path, loser at a renamed path).
-    //
-    // ponytail: worst-case O(n) re-queues; terminates because a conflict rename
-    // strictly lengthens the path stem, so a renamed loser cannot re-collide
-    // with the finite set of original paths.
+    // Fold entries into a path-keyed map, merging on collision; a conflict
+    // re-queues its two outputs (winner at the path, loser renamed).
+    // ponytail: worst-case O(n) re-queues; terminates because a rename strictly
+    // lengthens the stem, so a loser cannot re-collide with the original paths.
     let mut out: HashMap<String, FileEntry> = HashMap::new();
     let mut work: Vec<FileEntry> = Vec::with_capacity(local.files.len() + incoming.files.len());
     work.extend(local.files.iter().cloned());
@@ -346,10 +313,8 @@ mod tests {
         items.iter().map(|(d, c)| (dev(*d), *c)).collect()
     }
 
-    /// A file entry whose content identity (`file_hash`) is tagged by `content`,
-    /// so two "different edits" of the same path get DIFFERENT hashes (as real
-    /// distinct bytes would) and the same edit gets the same hash. A tombstone has
-    /// the all-zero hash.
+    /// A file entry whose `file_hash` is tagged by `content` (distinct edits ->
+    /// distinct hashes). A tombstone has the all-zero hash.
     fn entry_h(path: &str, mtime: u64, version: Vv, deleted: bool, content: u64) -> FileEntry {
         let file_hash = if deleted {
             [0; 32]
@@ -370,8 +335,7 @@ mod tests {
         }
     }
 
-    /// Default content: distinct per `mtime`, matching the common test pattern of
-    /// using a bumped mtime to stand in for a distinct edit.
+    /// Default content: distinct per `mtime` (a bumped mtime stands in for an edit).
     fn entry(path: &str, mtime: u64, version: Vv, deleted: bool) -> FileEntry {
         entry_h(path, mtime, version, deleted, mtime)
     }

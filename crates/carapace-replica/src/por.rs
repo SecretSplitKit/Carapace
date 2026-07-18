@@ -1,67 +1,22 @@
 //! Proof-of-Retention (PoR) audits (protocol §10.1).
 //!
-//! The owner periodically challenges each replica to prove it still holds the
-//! ciphertext chunks it accepted. Challenges are **unpredictable to the peer**:
-//! the owner derives which chunks (and which byte ranges within them) to sample
-//! from `K_audit(vid)` - a key only the owner holds - mixed with the announce
-//! epoch and a per-replica round counter. The sampling is deterministic given
-//! `(K_audit, epoch, round)` so the owner can rebuild and verify the same
-//! challenge, yet a peer without `K_audit` cannot precompute the answers, so it
-//! cannot discard chunks and reconstruct only the sampled ones on demand.
+//! The owner samples which chunks/ranges to challenge from `K_audit(vid)` (owner-only)
+//! mixed with epoch and a per-replica round counter: deterministic so the owner can
+//! rebuild and verify, unpredictable so a peer without `K_audit` cannot precompute
+//! answers and keep only the sampled chunks. Responses are content-addressed
+//! (ChunkID = `BLAKE3(ct)`), so returned bytes verify by hashing - no owner-held copy.
 //!
-//! A challenge is answered with BLAKE3-verified blob data. Each chunk is
-//! content-addressed (its ChunkID is `BLAKE3(ciphertext)`), so returned bytes
-//! verify against the sampled ChunkID by hashing - no owner-held copy and no
-//! shared secret are needed. A correct response to the whole sampled set is the
-//! retention proof ([`run_audit`] / [`verify_audit_response`]).
+//! Offline is not loss: an unreachable round feeds [`AuditTracker::record_unreachable`]
+//! and leaves the failure streak untouched; only a peer that answers with missing or
+//! non-matching bytes advances it. `N` consecutive failures (default 3) yields
+//! [`AuditAction::Lost`], which the caller turns into [`crate::Health::AuditLost`] +
+//! [`crate::ReplicaSet::repair`].
 //!
-//! The bytes returned for a sample must *cover* the sampled `offset..offset+len`
-//! range; in the wired path the responder returns the whole content-addressed
-//! chunk (verified by hash) and the range simply selects a focus sub-range, so a
-//! full chunk always covers it. Production SHOULD narrow this to bao
-//! verified-range streaming so only the sampled bytes cross the wire; until then
-//! the per-sample `offset`/`len` are a focus record, not a fidelity boundary.
-//!
-//! Transport vs. content: a peer that could not be reached at all is *not* a
-//! retention failure. Only a peer that answered but is missing or returns
-//! non-matching bytes for a sampled chunk counts toward the loss streak. An
-//! unreachable round is fed to [`AuditTracker::record_unreachable`], which
-//! reschedules without touching the streak (offline is not loss, §10.1); the
-//! separate reachability/grace path (`Health::UnreachableSince`) handles a peer
-//! that stays gone.
-//!
-//! Loss tracking ([`AuditTracker`]): `N` consecutive failures (default 3, §12)
-//! marks the replica lost and yields an [`AuditAction::Lost`]; the caller feeds
-//! that into the existing repair path by recording [`crate::Health::AuditLost`]
-//! and calling [`crate::ReplicaSet::repair`], which drops the peer and
-//! re-replicates. Audit timing is randomized per replica (a deterministic
-//! per-replica jitter, so scheduling stays testable under an injected clock),
-//! and an occasional **wide-coverage** round ([`build_wide_audit`]) samples a
-//! large random subset in one window instead of the small per-round spot check.
-//!
-//! # Proxy limitation (§10.1 / audit D1)
-//!
-//! A PoR pass proves the sampled bytes are *retrievable through the audited
-//! peer* at audit time - **not** that the peer stores them exclusively or even
-//! itself. A dishonest peer that discarded its copy could proxy each challenge
-//! to another replica that still holds the data and relay the verified bytes
-//! back; the response would verify identically. PoR therefore cannot, on its
-//! own, distinguish independent storage from friend-proxied storage. The
-//! accepted mitigations are all availability-side, not proofs:
-//!
-//! - **Randomized per-replica timing** (see [`AuditTracker::schedule`]) so a
-//!   proxy cannot cheaply pre-arrange to have a helper online exactly when each
-//!   audit lands.
-//! - **Occasional wide-coverage audits** ([`build_wide_audit`]) that demand a
-//!   large subset at once, making live proxying of the whole set expensive.
-//! - **Response-time distribution watching**: a proxied answer adds a network
-//!   hop, so an owner SHOULD watch each replica's latency distribution and treat
-//!   a shifted tail as suspicious. This module only records the sampled ranges
-//!   and leaves the timing to the caller (time [`run_audit`] at the call site);
-//!   it deliberately does not build the statistics here.
-//!
-//! Residual friend-proxying is an availability risk only and is accepted by the
-//! trust model (§10.1); it never exposes plaintext, which stays sealed.
+//! Proxy limitation (§10.1): a pass proves the bytes are retrievable *through* the peer,
+//! not stored exclusively by it - a dishonest peer could proxy the challenge to another
+//! replica. Mitigations are availability-side only (randomized per-replica timing,
+//! occasional wide-coverage rounds, caller-side latency watching), never proofs; residual
+//! friend-proxying is an accepted availability risk that never exposes plaintext.
 
 use std::collections::HashMap;
 
@@ -162,19 +117,9 @@ impl AuditOutcome {
 }
 
 /// Something that can answer a PoR challenge for one sampled chunk.
-///
-/// In production this is an iroh-blobs verified-streaming reader that returns the
-/// requested range plus a bao proof tying it to the ChunkID. The in-process
-/// implementation ([`ReplicaPeer`]) returns the whole content-addressed blob,
-/// which [`verify_audit_response`] BLAKE3-checks against the ChunkID (the
-/// degenerate bao proof is the leaf itself); the sampled `offset`/`len` then
-/// select the focused sub-range. Either way, a returned value that verifies
-/// against the ChunkID is proof the responder held the content.
 pub trait AuditResponder {
-    /// Return content-addressed bytes covering `sample`'s chunk, or `None` if the
-    /// chunk is not held. The bytes MUST verify against `sample.chunk_id`
-    /// (bao-verified in production; guaranteed by the content-addressed store
-    /// in-process).
+    /// Return content-addressed bytes covering `sample`'s chunk (must verify against
+    /// `sample.chunk_id`), or `None` if the chunk is not held.
     fn respond(&self, sample: &AuditSample) -> Option<Vec<u8>>;
 }
 
@@ -224,8 +169,7 @@ fn distinct_indices(r: &mut blake3::OutputReader, n: usize, want: usize) -> Vec<
     let mut idx: Vec<usize> = (0..n).collect();
     let k = want.min(n);
     for i in 0..k {
-        // Uniform-ish pick in [i, n): modulo bias is negligible for our small n
-        // and does not affect the security goal (unpredictability, not uniformity).
+        // Modulo bias is negligible for our small n and the goal is unpredictability, not uniformity.
         let j = i + (next_u64(r) as usize) % (n - i);
         idx.swap(i, j);
     }
@@ -340,13 +284,10 @@ pub fn verify_audit_response(audit: &Audit, responses: &[Option<Vec<u8>>]) -> Au
         let Some(bytes) = resp else {
             return AuditOutcome::Fail(AuditFailure::Missing(s.chunk_id));
         };
-        // BLAKE3-verify the returned bytes against the content address.
         if chunk_id(bytes) != s.chunk_id {
             return AuditOutcome::Fail(AuditFailure::Corrupt(s.chunk_id));
         }
-        // The verified content must actually cover the sampled range. S3:
-        // saturating add so a hostile owner-supplied sample (public fields) cannot
-        // overflow the range check.
+        // Saturating: sample fields are public, so a hostile owner cannot overflow this.
         let need = s.offset.saturating_add(s.len) as usize;
         if bytes.len() < need {
             return AuditOutcome::Fail(AuditFailure::ShortRange {
@@ -387,20 +328,15 @@ pub enum AuditAction {
     /// Consecutive failures reached the limit: treat the replica as lost. The
     /// caller should record [`crate::Health::AuditLost`] and repair.
     Lost,
-    /// The replica could not be reached at all this round (transport failure, not
-    /// a content answer). The failure streak and round counter are left untouched
-    /// (offline is not retention loss, §10.1) and the next audit is rescheduled.
-    /// Produced by [`AuditTracker::record_unreachable`], never by
-    /// [`AuditTracker::record`].
+    /// The replica could not be reached this round (transport failure, not a content
+    /// answer): streak and round counter untouched, next audit rescheduled (§10.1).
+    /// Produced by [`AuditTracker::record_unreachable`], never [`AuditTracker::record`].
     Skipped,
 }
 
-/// Per-replica PoR bookkeeping against an injected clock: consecutive-failure
-/// counts, the next scheduled audit time (randomized per replica), and a round
-/// counter that also decides when a round is wide-coverage.
-///
-/// Keyed by `(replica_node_id, vid)` so one tracker serves every vault a set of
-/// replicas holds.
+/// Per-replica PoR bookkeeping against an injected clock, keyed by
+/// `(replica_node_id, vid)`: consecutive-failure counts, the randomized next-audit
+/// time, and a round counter that also decides when a round is wide-coverage.
 pub struct AuditTracker {
     interval: u64,
     fail_limit: u32,
@@ -426,11 +362,10 @@ impl AuditTracker {
         }
     }
 
-    /// Update ONLY the cadence scalars (`interval`, `fail_limit`, `wide_every`), KEEPING
-    /// every per-replica round/fail/schedule map (design §10.1 F4). The maintenance loop
-    /// stamps its configured interval at start; using this instead of a fresh
-    /// [`AuditTracker::new`] preserves the round counters `load_all` restored, so a reboot
-    /// never re-issues an already-used (predictable) PoR challenge for a replica.
+    /// Update only the cadence scalars, keeping every per-replica round/fail/schedule
+    /// map. The maintenance loop stamps its interval at start via this rather than a fresh
+    /// [`AuditTracker::new`], so restored round counters survive and a reboot never
+    /// re-issues an already-used (now-predictable) challenge (§10.1).
     pub fn restamp(&mut self, interval: u64, fail_limit: u32, wide_every: u64) {
         self.interval = interval;
         self.fail_limit = fail_limit;
@@ -490,25 +425,21 @@ impl AuditTracker {
         self.record_outcome(replica, vid, outcome, now)
     }
 
-    /// Mark a challenge as ISSUED to `replica` for the current round: advance the round
-    /// counter (the unpredictability nonce) and reschedule. The owner MUST persist this
-    /// BEFORE revealing the challenge on the wire (design §10.1 / audit #6), so a crash
-    /// after the reveal can never re-issue the same - now predictable - round to the same
-    /// replica. Does NOT touch the failure streak: that is judged on the answer via
-    /// [`AuditTracker::record_outcome`]. Callers that both build and grade a challenge
-    /// atomically (no crash window between reveal and grade) can use [`AuditTracker::record`]
-    /// instead, which advances the round and grades in one step.
+    /// Mark a challenge as issued: advance the round nonce and reschedule, without
+    /// touching the failure streak (graded later via [`AuditTracker::record_outcome`]).
+    /// The owner MUST persist this BEFORE revealing the challenge on the wire (§10.1),
+    /// so a crash after reveal cannot re-issue the same now-predictable round. Callers
+    /// that build and grade atomically can use [`AuditTracker::record`] instead.
     pub fn mark_issued(&mut self, replica: [u8; 32], vid: [u8; 32], now: u64) {
         *self.round.entry((replica, vid)).or_insert(0) += 1;
         self.schedule(replica, vid, now);
     }
 
-    /// Record the CONTENT outcome of an audit whose round was already advanced at issue
-    /// time via [`AuditTracker::mark_issued`]: reschedule and update the consecutive-failure
-    /// streak ONLY (never the round counter, which was committed at issue time). On
-    /// [`AuditOutcome::Pass`] the streak resets; on failure it increments and, at the
-    /// limit, returns [`AuditAction::Lost`] (and resets the streak, since the caller will
-    /// repair and drop the replica).
+    /// Record the content outcome of an audit whose round was already advanced via
+    /// [`AuditTracker::mark_issued`]: reschedule and update the failure streak only
+    /// (never the round counter). Pass resets the streak; failure increments it and, at
+    /// the limit, returns [`AuditAction::Lost`] (resetting the streak, since the caller
+    /// repairs and drops the replica).
     pub fn record_outcome(
         &mut self,
         replica: [u8; 32],
@@ -533,12 +464,10 @@ impl AuditTracker {
         }
     }
 
-    /// Record that the replica could not be reached this round (C1): reschedule the
-    /// next audit relative to `now` but leave the failure streak and round counter
-    /// untouched. A transient offline peer (travel, ISP outage, closed laptop) must
-    /// not accumulate PoR failures and be evicted without grace - offline is not
-    /// retention loss (§10.1). Only a peer that *answered* with missing or
-    /// non-matching bytes advances the streak via [`AuditTracker::record`].
+    /// Record that the replica could not be reached this round: reschedule but leave the
+    /// failure streak and round counter untouched. Offline is not retention loss (§10.1),
+    /// so a transiently-offline peer must not accumulate PoR failures; only a peer that
+    /// answered with missing/non-matching bytes advances the streak via [`AuditTracker::record`].
     pub fn record_unreachable(
         &mut self,
         replica: [u8; 32],
@@ -549,25 +478,10 @@ impl AuditTracker {
         AuditAction::Skipped
     }
 
-    /// Serialize the full tracker to a deterministic, lossless byte string for the
-    /// durable-persistence funnel (spec §3.3, `por` = PLAIN F4). These are counters
-    /// and schedule times, not secrets; the caller decides at-rest sealing.
-    ///
-    /// Every field that steers a future challenge is captured, so a reboot resumes
-    /// exactly where it left off instead of replaying a spent challenge sequence
-    /// (§10.1):
-    /// - `interval`, `fail_limit`, `wide_every` - the cadence/limit/wide-period the
-    ///   scheduler and loss logic run on;
-    /// - `round` - the per-(replica,vid) round counter that *is* the unpredictability
-    ///   nonce; losing it re-issues an identical challenge stream for the epoch;
-    /// - `fails` - the consecutive-failure streak, so a near-lost replica is not
-    ///   handed a fresh streak by a reboot;
-    /// - `next` - the randomized next-audit time, so timing (a §10.1 anti-proxy
-    ///   mitigation) is not reset to "due now" on every restart.
-    ///
-    /// Map entries are emitted in sorted-key order so equal trackers yield identical
-    /// bytes (stable across `HashMap` iteration order) - byte-stability the redb
-    /// row-seal AAD and any dedup rely on.
+    /// Serialize the tracker losslessly for durable persistence (§10.1 replay
+    /// safety: losing the `round` counter re-issues an identical, now-predictable
+    /// challenge stream). Map entries are emitted in sorted-key order so equal
+    /// trackers yield byte-identical output regardless of `HashMap` iteration order.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(POR_STATE_VERSION);
@@ -636,8 +550,7 @@ fn write_u64_map(out: &mut Vec<u8>, m: &HashMap<PorKey, u64>) {
 
 fn read_u32_map(r: &mut Reader) -> Result<HashMap<PorKey, u32>, ReplicaError> {
     let count = r.u64()?;
-    // No `with_capacity(count)`: a corrupt count must not pre-allocate; `take`
-    // fails as soon as the bytes run out.
+    // No `with_capacity(count)`: a corrupt count must not pre-allocate; `take` fails when bytes run out.
     let mut m = HashMap::new();
     for _ in 0..count {
         let key = (r.arr32()?, r.arr32()?);
@@ -730,19 +643,18 @@ mod state_tests {
     }
 
     /// Advance two (replica,vid) pairs through several rounds, serialize, reload,
-    /// and prove the reloaded tracker resumes the *next* challenge (never a spent
-    /// round) and preserves the failure streak, schedule, and config.
+    /// and prove the reload resumes the next challenge (never a spent round) and
+    /// preserves streak, schedule, and config.
     #[test]
     fn round_trip_resumes_and_never_repeats_a_round() {
-        let a = [0x11u8; 32]; // replica A
-        let b = [0x22u8; 32]; // replica B
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
         let vid = [0xAAu8; 32];
         let interval = 3600u64;
 
         let mut t = AuditTracker::new(interval, DEFAULT_POR_FAIL_LIMIT, 4);
 
-        // A: pass, pass, pass -> round 3, streak reset. 3 is a wide round (every 4th
-        // skips 0, so is_wide is false at 3 but the state must survive regardless).
+        // A: three passes -> round 3, streak reset.
         for k in 0..3 {
             assert_eq!(
                 t.record(a, vid, AuditOutcome::Pass, k * 100),
@@ -787,9 +699,7 @@ mod state_tests {
         assert_eq!(t2.next.get(&(b, vid)).copied(), next_b);
         assert_eq!(t2.is_wide_round(a, vid), wide_a);
 
-        // The core §10.1 guarantee: the NEXT challenge continues from the stored
-        // round, never re-issuing a spent one. `round()` is the nonce for the next
-        // build_audit; recording again must advance to round+1 for BOTH pairs.
+        // §10.1: the next challenge continues from the stored round, never a spent one.
         let mut t2 = t2;
         assert_eq!(t2.round(a, vid), 3); // next challenge uses round 3, not 0..2 again
         t2.record(a, vid, AuditOutcome::Pass, 999);
