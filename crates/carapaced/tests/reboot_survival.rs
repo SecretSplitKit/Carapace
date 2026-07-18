@@ -267,6 +267,88 @@ async fn rederive_failure_keeps_blob_source_until_republished() -> Result<()> {
     Ok(())
 }
 
+/// The REAL binary key path: `State::load_or_generate` reads/writes `node.key` +
+/// `root.key` on disk, so a genuine process reboot re-derives `k_root` from the file
+/// rather than a fixed in-memory seed. Every other reboot test here uses
+/// `from_seeds_in` (a fixed `k_root` that trivially matches on boot 2), so none of them
+/// exercise the axis that would break if the key files did not round-trip: a mismatched
+/// boot-2 `k_root` yields a different `K_manifest`, `open_envelope` fails, and the vault
+/// is silently routed to needs-refetch (empty `published_vaults`). This asserts the
+/// derive chain survives a real load-or-generate cycle, for BOTH the plaintext-seed and
+/// the `CARAPACE_PASSPHRASE`-sealed (Argon2id) key files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn load_or_generate_key_path_survives_reboot() -> Result<()> {
+    // No passphrase: plaintext seed files.
+    reboot_via_load_or_generate(None).await?;
+    // With passphrase: Argon2id-sealed key files. The env var is process-global, so
+    // set it only for this segment and clear it immediately after. No other test in
+    // this binary reads it (they all use `from_seeds_in`, which ignores it).
+    std::env::set_var("CARAPACE_PASSPHRASE", "correct horse battery staple");
+    let sealed = reboot_via_load_or_generate(Some("root.key")).await;
+    std::env::remove_var("CARAPACE_PASSPHRASE");
+    sealed?;
+    Ok(())
+}
+
+/// Boot a daemon from a real on-disk identity (`State::load_or_generate`), publish a
+/// vault, shut down, then reboot from the SAME dir via `load_or_generate` again and
+/// assert the vault is still listed (its manifest re-derived, so `k_root` round-tripped).
+/// When `sealed_key` is `Some(name)`, also assert that key file is at-rest sealed on
+/// disk (magic-prefixed, not the raw seed) so the passphrase branch is really exercised.
+async fn reboot_via_load_or_generate(sealed_key: Option<&str>) -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let (src, _expected) = make_tree();
+
+    let (vid, node_id, digest, chunks) = {
+        let d = Daemon::start(State::load_or_generate(state_dir.path())?).await?;
+        let (vid, _nonce) = d.new_vid();
+        assert_eq!(d.publish_vault(src.path(), vid).await?, 1);
+        assert_eq!(
+            d.published_vaults(),
+            vec![(vid, 1)],
+            "vault listed on first boot"
+        );
+        let (digest, chunks) = d.vault_blob_ids(&vid).expect("published blob source");
+        let node_id = d.node_id();
+        d.shutdown().await;
+        (vid, node_id, digest, chunks)
+    };
+
+    if let Some(name) = sealed_key {
+        let on_disk = std::fs::read(state_dir.path().join(name))?;
+        assert!(
+            on_disk.starts_with(b"CRPCSEAL"),
+            "{name} must be at-rest sealed when CARAPACE_PASSPHRASE is set"
+        );
+    }
+
+    // Let redb release its single-open lock before re-opening the same file.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Reboot from the SAME dir: re-reads the key files. If `k_root` did not round-trip,
+    // `rederive_manifest` would fail and this vault would be absent from published_vaults.
+    let d2 = Daemon::start(State::load_or_generate(state_dir.path())?).await?;
+    assert_eq!(
+        d2.node_id(),
+        node_id,
+        "node identity re-derived identically from the persisted node.key"
+    );
+    assert_eq!(
+        d2.published_vaults(),
+        vec![(vid, 1)],
+        "vault survives a real load_or_generate reboot (k_root re-derived from the key file)"
+    );
+    assert!(
+        d2.blob_present(digest).await,
+        "manifest envelope present after reboot"
+    );
+    for id in &chunks {
+        assert!(d2.blob_present(*id).await, "chunk present after reboot");
+    }
+    d2.shutdown().await;
+    Ok(())
+}
+
 /// §3.5 tripwire is NOT triggered on a genuinely fresh dir (no blobs/, no state.redb):
 /// a clean first boot must succeed and create state.redb.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
