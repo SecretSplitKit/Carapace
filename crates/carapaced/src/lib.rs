@@ -330,6 +330,16 @@ struct Shared {
     /// Per-owned-vault blob source (digest + ChunkIDs) for replica placement. Holds
     /// only the CURRENT epoch's source (overwritten on republish).
     vault_blobs: HashMap<[u8; 32], VaultBlobs>,
+    /// §3.5 reconciliation: blob sources `{vid -> (digest, chunk_ids)}` of OWNED
+    /// vaults whose manifest could NOT be re-derived at startup (envelope absent or
+    /// unopenable in FsStore) — the durable needs-refetch set. Persisted in the same
+    /// VAULT_BLOBS row as `vault_blobs`, so a failed re-derive NEVER erases the
+    /// vault's blob-source record: without this, the first post-boot persist rewrote
+    /// the row from the (empty) re-derived map and the vault silently vanished from
+    /// every later boot with no warning left to fire. Cleared per-vid by a successful
+    /// (re)publish or adopted sync baseline; re-populated fresh each boot from the
+    /// sources whose re-derive fails.
+    needs_refetch: HashMap<[u8; 32], persist::BlobSource>,
     /// The single authoritative working directory per vault (§11): the SAME tree is
     /// the published source, the watched tree, AND the sync/reconstruct target. Set
     /// at `publish_vault` time (to the caller's source) and on a first sync (to
@@ -2109,6 +2119,7 @@ impl Daemon {
         // owner can republish from its working dir (reconciliation, not a startup abort).
         // The FsStore fetch is async, so re-derive OFF the lock, then insert under it.
         let mut rebuilt_vaults = Vec::new();
+        let mut refetch_vaults = Vec::new();
         for (vid, digest, chunk_ids) in vault_blob_sources {
             match Self::rederive_manifest(&blobs, &k_root, vid, digest).await {
                 Ok(manifest) => {
@@ -2119,11 +2130,17 @@ impl Daemon {
                     let keys = chunk_keys_from_manifest(&manifest, &*vkeys.k_content);
                     rebuilt_vaults.push((vid, digest, chunk_ids, manifest, keys));
                 }
-                Err(e) => eprintln!(
-                    "carapace: WARNING vault {} manifest could not be re-derived at startup \
-                     ({e}); marked needs-refetch (republish or anti-entropy will repair)",
-                    hex32(&vid)
-                ),
+                Err(e) => {
+                    eprintln!(
+                        "carapace: WARNING vault {} manifest could not be re-derived at startup \
+                         ({e}); marked needs-refetch (republish or anti-entropy will repair)",
+                        hex32(&vid)
+                    );
+                    // Keep the blob source as the durable needs-refetch record. Dropping
+                    // it here let the next persist rewrite the VAULT_BLOBS row without
+                    // this vault, silently erasing it from every later boot.
+                    refetch_vaults.push((vid, digest, chunk_ids));
+                }
             }
         }
         {
@@ -2138,6 +2155,9 @@ impl Daemon {
                         manifest,
                     },
                 );
+            }
+            for (vid, digest, chunk_ids) in refetch_vaults {
+                s.needs_refetch.insert(vid, (digest, chunk_ids));
             }
         }
 
@@ -2460,6 +2480,9 @@ impl Daemon {
             // `K_manifest`) is still refused the envelope.
             s.owned_chunks.insert(vb.digest, vid);
             s.vault_blobs.insert(vid, vb.clone());
+            // A publish IS the repair for a needs-refetch vault (§3.5): the blob
+            // source is current again, so drop the retained stale record.
+            s.needs_refetch.remove(&vid);
             // Retain the per-chunk secrets so a later `disclose_files` can seal a subset
             // of files into a friend-facing grant without re-ingesting (§7.4).
             s.vault_keys.insert(vid, ingest.keys);
@@ -2989,6 +3012,8 @@ impl Daemon {
                 manifest: manifest.clone(),
             },
         );
+        // An adopted sync baseline repairs a needs-refetch vault (§3.5).
+        s.needs_refetch.remove(vid);
         // MAJOR 4 (audit #4): epochs + vault_blobs are persisted categories (vault_keys is
         // EPH, re-derived at load). Commit the baseline so a post-reboot local edit still
         // diffs against the incoming state instead of re-minting every file as new.
@@ -3067,6 +3092,8 @@ impl Daemon {
                 manifest: manifest.clone(),
             },
         );
+        // A merged republish repairs a needs-refetch vault too (§3.5).
+        s.needs_refetch.remove(vid);
         // §11 (audit #4): this inserted persisted gate categories (epochs, owned_chunks
         // incl. the envelope digest, announces, grants, vault_blobs). Commit them under
         // the held write lock, or a reboot default-denies our own re-served blobs and
@@ -4497,6 +4524,18 @@ impl Daemon {
         s.vault_blobs
             .get(vid)
             .map(|vb| (vb.digest, vb.chunk_ids.clone()))
+    }
+
+    /// Test-only: the retained needs-refetch blob source for `vid` (§3.5) — the
+    /// `(digest, chunk_ids)` kept when the startup re-derive failed — or `None`.
+    #[doc(hidden)]
+    pub fn needs_refetch_ids(&self, vid: &[u8; 32]) -> Option<([u8; 32], Vec<[u8; 32]>)> {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .needs_refetch
+            .get(vid)
+            .cloned()
     }
 
     /// Test-only: record `node` as a replica member of `vid` without pushing it the

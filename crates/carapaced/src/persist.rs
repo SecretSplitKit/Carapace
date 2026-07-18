@@ -540,6 +540,7 @@ pub(crate) fn persist_all(
         unfriended_nodes,
         // --- DERIVE ---
         vault_blobs,
+        needs_refetch,
         // --- PLAIN-rebuild: reconstructed from `granted` at load (§3.3) ---
         share_sets,
         // --- EPH: rebuilt on reconnect / never persisted (§3.3) ---
@@ -662,8 +663,15 @@ pub(crate) fn persist_all(
         enc(|w| enc_set32(w, unfriended_nodes)),
     )?;
 
-    // ---- DERIVE: vault_blobs -> only {vid -> digest, chunk_ids} (never the manifest) ----
-    put(&mut t, cat::VAULT_BLOBS, enc_vault_blobs(vault_blobs))?;
+    // ---- DERIVE: vault_blobs -> only {vid -> digest, chunk_ids} (never the manifest),
+    // UNIONed with the needs-refetch sources (vaults whose manifest failed to
+    // re-derive at startup) so a failed re-derive never erases a vault's
+    // blob-source record from disk. `vault_blobs` wins on a vid in both.
+    put(
+        &mut t,
+        cat::VAULT_BLOBS,
+        enc_vault_blobs(vault_blobs, needs_refetch),
+    )?;
 
     // ---- F3: monotonic own-card version floor = max own card.version ----
     let card_version = cards.iter().map(|c| c.version).max().unwrap_or(0);
@@ -954,14 +962,31 @@ fn enc_pending_delete_sends(v: &[(Vec<EndpointAddr>, Placement)]) -> Vec<u8> {
     })
 }
 
-fn enc_vault_blobs(m: &HashMap<[u8; 32], VaultBlobs>) -> Vec<u8> {
+fn enc_vault_blobs(
+    m: &HashMap<[u8; 32], VaultBlobs>,
+    needs_refetch: &HashMap<[u8; 32], BlobSource>,
+) -> Vec<u8> {
+    // Retained-but-underivable sources ride in the same row; a vid present in
+    // `m` (re-derived or republished) supersedes its needs-refetch entry.
+    let extra: Vec<_> = needs_refetch
+        .iter()
+        .filter(|(vid, _)| !m.contains_key(*vid))
+        .collect();
     enc(|w| {
-        w.len(m.len());
+        w.len(m.len() + extra.len());
         for (vid, vb) in m {
             w.fixed(vid);
             w.fixed(&vb.digest);
             w.len(vb.chunk_ids.len());
             for c in &vb.chunk_ids {
+                w.fixed(c);
+            }
+        }
+        for &(vid, (digest, chunk_ids)) in &extra {
+            w.fixed(vid);
+            w.fixed(digest);
+            w.len(chunk_ids.len());
+            for c in chunk_ids {
                 w.fixed(c);
             }
         }
@@ -1057,6 +1082,10 @@ fn enc_resplits(m: &HashMap<u64, OpenResplit>) -> Vec<u8> {
 /// A DERIVE vault-blob source row: `(vid, manifest digest, chunk ids)`. The decrypted
 /// `Manifest` is re-derived from the FsStore envelope at startup (never persisted).
 pub(crate) type VaultBlobSource = ([u8; 32], [u8; 32], Vec<[u8; 32]>);
+
+/// A vault's retained blob source keyed by vid (`Shared::needs_refetch`):
+/// `(manifest-envelope digest, unique ChunkIDs)`.
+pub(crate) type BlobSource = ([u8; 32], Vec<[u8; 32]>);
 
 /// Everything reloaded from `state.redb` at startup.
 pub(crate) struct Loaded {

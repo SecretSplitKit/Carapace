@@ -7,8 +7,10 @@
 //! own-card version floor (strictly increasing across the restart).
 
 use anyhow::Result;
-use carapaced::{Daemon, RecoveryScope, State};
+use carapaced::{Daemon, MaintenanceConfig, RecoveryScope, State};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 fn make_tree() -> (tempfile::TempDir, BTreeMap<String, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
@@ -137,6 +139,131 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
     );
 
     d2.shutdown().await;
+    Ok(())
+}
+
+/// The BINARY boot path (`carapace_api::serve` shape): the daemon lives in an `Arc`
+/// with the background maintenance loop running — whose rounds persist state — and
+/// is shut down via `&self` while other `Arc` clones may still exist. A published
+/// vault must survive that full lifecycle plus a reboot. The other tests here call
+/// `Daemon` directly and never start maintenance, so this path was untested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn binary_boot_path_maintenance_rounds_preserve_vault() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let node_seed = [0x71u8; 32];
+    let k_root = [0x72u8; 32];
+    let (src, _expected) = make_tree();
+
+    let (vid, digest, chunks) = {
+        let d = Arc::new(
+            Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?,
+        );
+        // Fast tick so several maintenance rounds (and their persists) actually run.
+        let maintenance = Arc::clone(&d).run_maintenance(MaintenanceConfig {
+            tick: Duration::from_millis(20),
+            ..MaintenanceConfig::default()
+        });
+        let (vid, _nonce) = d.new_vid();
+        assert_eq!(d.publish_vault(src.path(), vid).await?, 1);
+        let (digest, chunks) = d.vault_blob_ids(&vid).expect("published blob source");
+        // Let a few post-publish rounds run and persist.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        maintenance.stop().await;
+        // Shut down exactly like the binary: via `&self`, with the Arc still held.
+        d.shutdown().await;
+        (vid, digest, chunks)
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let d2 = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
+    assert_eq!(
+        d2.published_vaults(),
+        vec![(vid, 1)],
+        "vault survives the binary boot path (maintenance persists + &self shutdown)"
+    );
+    assert!(
+        d2.blob_present(digest).await,
+        "envelope present after reboot"
+    );
+    for id in &chunks {
+        assert!(d2.blob_present(*id).await, "chunk present after reboot");
+    }
+    d2.shutdown().await;
+    Ok(())
+}
+
+/// §3.5: a vault whose manifest cannot be re-derived at startup (FsStore damage —
+/// here the whole blobs/ dir deleted between boots) must KEEP its persisted
+/// blob-source record as the durable needs-refetch set, across further reboots,
+/// until a republish repairs it. The original bug: the failed re-derive dropped the
+/// source from RAM and the next persist rewrote the VAULT_BLOBS row without it, so
+/// the vault silently vanished from every later boot with zero warnings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rederive_failure_keeps_blob_source_until_republished() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let node_seed = [0x81u8; 32];
+    let k_root = [0x82u8; 32];
+    let (src, _expected) = make_tree();
+
+    // Boot 1: publish, remember the blob source, shut down cleanly.
+    let (vid, digest, chunks) = {
+        let d = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
+        let (vid, _nonce) = d.new_vid();
+        assert_eq!(d.publish_vault(src.path(), vid).await?, 1);
+        let ids = d.vault_blob_ids(&vid).expect("published blob source");
+        d.shutdown().await;
+        (vid, ids.0, ids.1)
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Damage: the served blob store is gone (models the loss a pre-durability
+    // binary left behind, a botched restore, or future GC gone wrong).
+    std::fs::remove_dir_all(state_dir.path().join("blobs"))?;
+
+    // Boot 2: re-derive fails; the vault is not servable — but its blob source
+    // must be retained as needs-refetch. This boot's own startup persists are the
+    // clobber vector the bug rode in on.
+    {
+        let d = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
+        assert!(
+            d.published_vaults().is_empty(),
+            "underivable vault is not listed as published"
+        );
+        assert_eq!(
+            d.needs_refetch_ids(&vid),
+            Some((digest, chunks.clone())),
+            "boot 2 retains the blob source of the underivable vault"
+        );
+        d.shutdown().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Boot 3: the record SURVIVED boot 2's persists (the regression). Republish
+    // from the working tree repairs: new epoch, listed again, record cleared.
+    {
+        let d = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
+        assert_eq!(
+            d.needs_refetch_ids(&vid),
+            Some((digest, chunks.clone())),
+            "needs-refetch record survives further reboots until repaired"
+        );
+        let epoch = d.publish_vault(src.path(), vid).await?;
+        assert_eq!(epoch, 2, "repair republish bumps past the persisted epoch");
+        assert_eq!(d.published_vaults(), vec![(vid, 2)]);
+        assert_eq!(
+            d.needs_refetch_ids(&vid),
+            None,
+            "republish clears the needs-refetch record"
+        );
+        d.shutdown().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Boot 4: the repaired vault is a normally-listed vault again.
+    let d = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
+    assert_eq!(d.published_vaults(), vec![(vid, 2)]);
+    assert_eq!(d.needs_refetch_ids(&vid), None);
+    d.shutdown().await;
     Ok(())
 }
 
