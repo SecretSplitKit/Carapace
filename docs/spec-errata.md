@@ -107,7 +107,7 @@ the card, the grant is local policy. A formal bilateral over-the-wire
 storage-agreement message is a possible future spec addition; the card-offer +
 local-grant model satisfies it for now.
 
-## Note — PoR round counter is in-memory; unreachable is not retention loss (§10.1)
+## Note — PoR round counter persists across restart; unreachable is not retention loss (§10.1)
 
 Phase 4 audit findings C1/S2. Two related PoR (§10.1) points settled in code:
 
@@ -123,15 +123,13 @@ Phase 4 audit findings C1/S2. Two related PoR (§10.1) points settled in code:
   (unreachable), a connected-but-empty answer returns per-sample `None`
   (content loss).
 
-- **S2 (accepted, not fixed): the per-replica round counter is in-memory.** The
-  entire daemon runtime state (members, epochs, vault blob refs, the PoR tracker)
-  lives in `Shared` and is not persisted; only the node/root keys are on disk.
-  On restart the round counter reseeds at 0 and re-arms every member's audit, so
-  a restart re-issues the `(epoch, round=0)` challenge and bursts audits at
-  startup - a marginal aid to a pre-staging proxy. Persisting only the round
-  counter while the rest of the set state stays ephemeral would be inconsistent;
-  this is deferred until the daemon grows a runtime-state store, at which point
-  the round counter is persisted alongside the member set.
+- **S2 (fixed): the per-replica round counter persists.** `Shared` (members,
+  epochs, vault blob refs, the PoR tracker, and the rest of the daemon runtime
+  state) now persists to redb (`persist.rs`, `cat::POR`) alongside the node/root
+  keys. A restart reloads the round counter instead of reseeding at 0, so it no
+  longer re-arms every member's audit or bursts `(epoch, round=0)` challenges at
+  startup. Proven by `crates/carapaced/tests/por_reboot_replay.rs`, which
+  restarts the daemon and asserts the round counter survives.
 
 ## Note — attestation liveness binds to the enrolled roster (§10.2)
 
@@ -173,22 +171,24 @@ Phase 5 audit dispositions for the owner-side blob-read gate (`authorize_fetch`)
   old chunk to no non-device - it no longer regresses to the residual and is not
   served to any dialer.
 
-- **W2-gc (accepted, not fixed): old-epoch blobs are not GC'd.** Superseded chunk
-  blobs remain in the in-memory store and their ChunkIDs remain in `owned_chunks`,
-  so both grow with the distinct chunks published over the daemon's life. This is a
-  resource concern, not a confidentiality or gate one (the gate is retained above).
-  Bounded eviction of old-epoch blobs under a retention policy - dropping the blob
-  and its `owned_chunks` entry together - is deferred until the daemon grows a
-  runtime-state/blob store with a GC pass; the two must be evicted in lockstep so
-  the gate never outlives, or is outlived by, the blob.
+- **W2-gc (accepted, still not fixed): old-epoch blobs are not GC'd.** Blobs now
+  live in an on-disk iroh `FsStore` (`blobs.rs`) instead of memory, and their
+  ChunkIDs remain in `owned_chunks`, but neither is pruned: superseded chunk blobs
+  and their gate entries both grow with the distinct chunks published over the
+  daemon's life. Moving the blob store to disk turns this from a memory-growth
+  concern into a disk-growth one - it no longer clears on restart, so it is a
+  real, still-open resource concern. This is not a confidentiality or gate issue
+  (the gate is retained above). Bounded eviction of old-epoch blobs under a
+  retention policy - dropping the blob and its `owned_chunks` entry together -
+  remains future work; the two must be evicted in lockstep so the gate never
+  outlives, or is outlived by, the blob.
 
-- **S4 (accepted, not fixed): the manifest envelope digest is outside the gate.**
-  `authorize_fetch` gates chunk ChunkIDs, not the per-vault manifest-envelope blob
-  (`VaultBlobs.digest`), so the envelope is served to any dialer on the inherited
-  residual. It is AEAD-sealed under `K_manifest`, which friends never hold, so only
-  its ciphertext and size leak - acceptable. Folding the envelope digest into
-  `owned_chunks` (gated to own devices + replica set) would tighten it if envelope
-  metadata size/among-friends exposure ever matters.
+- **S4 (fixed): the manifest envelope digest is now inside the gate.** `publish_vault`
+  inserts the manifest-envelope digest (`VaultBlobs.digest`) into `owned_chunks`
+  alongside the chunk ChunkIDs (`lib.rs:2481`, F1), retained across epoch bumps like
+  the rest of the owner-gated set. `authorize_fetch` therefore serves the envelope
+  only to own devices / the replica set, never to a bare dialer or audience friend on
+  the inherited residual.
 
 ## Note — self-hosted NAT-traversal audit dispositions (§6, §14)
 
@@ -284,23 +284,17 @@ daemon-wide `Hello.protocol` enforcement.
     consecutive failed probes before withdrawing - the first two are tentative
     and do not re-issue - and resets the streak on the first success (which
     re-advertises). Covered by `w6_relay_probe_hysteresis`.
-  - **Own-card version rollback survival across restart (implemented, with a
-    residual).** All daemon state (including the own card and its flap-bumped
-    version) is in-memory, so a naive restart would re-issue the card at v1;
-    friends who already hold a higher-versioned card from the prior run's relay
-    flaps would reject the fresh one as a rollback (`DocStore`), stranding the
-    node. The own card's *initial* version is therefore seeded from a wall-clock
-    floor (`unix_now()`, unix seconds) rather than 1, and the existing
-    `version += 1` re-issue logic rides on top. A later restart's base (a larger
-    timestamp) exceeds the prior run's flap-bumped versions in the common case
-    (elapsed seconds >> number of flaps). **Residual:** a pathological
-    rapid-restart under heavy flapping (elapsed wall-clock seconds < number of
-    flaps in the prior run) can still re-issue below a version a friend holds.
-    The complete fix is a persisted monotonic counter, folded into the same
-    in-memory-state persistence deferral as the rest of `Shared` (the maintenance
-    round counter, the friend/replica set, etc.; see the persistence note above):
-    when `Shared` gains on-disk durability, persist the own card's last-issued
-    version alongside it and seed from `max(persisted + 1, unix_now())`.
+  - **Own-card version rollback survival across restart (implemented, complete
+    fix).** A naive restart that reseeds the card version at 1 would be rejected
+    as a rollback by friends already holding a higher-versioned card from the
+    prior run's relay flaps (`DocStore`), stranding the node. The own-card
+    version floor now persists (`persist.rs`, `cat::CARD_VERSION`), and the card
+    version is seeded from `unix_now().max(card_version_floor.saturating_add(1))`
+    (`lib.rs:2174`) rather than a bare wall-clock floor. This closes the prior
+    residual: a rapid restart under heavy flapping (elapsed wall-clock seconds <
+    number of flaps in the prior run) can no longer re-issue below a version a
+    friend holds, because the persisted floor - not just elapsed time - lower-bounds
+    the new version.
 
 - **W6 (implemented): the relay's TCP/HTTP port is now NAT-mapped.** The earlier
   errata that "iroh's portmapper maps only the endpoint UDP port, never the relay's
@@ -542,12 +536,12 @@ mechanisms. Each is documented here rather than code-changed.
   not autonomously start an extend or re-split (only the unfriend path auto-drives a re-split,
   under the destroy gate). This matches the §9.3.4 decision to prompt the owner rather than
   act unattended: the recommendation is surfaced, the owner starts it via the recovery API.
-- **§14 split-state at-rest sealing is correct but not exercised.** The seal primitive is
+- **§14 split-state at-rest sealing is now exercised.** The seal primitive is
   `HKDF(K_root, "carapace/v1/split-state")` + XChaCha20-Poly1305 with `aad = rsid‖M`
-  (`state_seal`), unit-tested, but the daemon holds split-state only in memory (all daemon
-  runtime state is in-memory, no persistence yet), so nothing is ever written unsealed. When
-  persistence lands, seal on write. Endpoint compromise of an owner device is out of scope
-  (§14).
+  (`state_seal`). `split_states` persists as a SEAL-category row in redb (`persist.rs`),
+  sealed under `K_root` on every write, so the primitive is now exercised on the live
+  persistence path rather than only unit-tested in isolation. Endpoint compromise of an
+  owner device is out of scope (§14).
 - **§14 weakest-split rule "K_root split once" (SHOULD) is not enforced.** `recovery_split`
   accepts more than one root split; nothing rejects a second `K_root` door. The scope
   distinction (`RecoveryScope::Root` vs `Vault`) exists and the default flow splits once, but
