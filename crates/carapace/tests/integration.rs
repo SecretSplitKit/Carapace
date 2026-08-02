@@ -1,3 +1,5 @@
+#![cfg(not(windows))]
+
 //! Drives the real `carapace-api` (fronting a real `Daemon`) through the
 //! `carapace` client's public entry point, over a real loopback socket.
 
