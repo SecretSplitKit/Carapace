@@ -571,7 +571,6 @@ fn write_atomic_portable(
         file.set_modified(modified)?;
         drop(file);
         replace_file(&temporary, &destination)?;
-        File::open(&parent)?.sync_all()?;
         Ok(destination.clone())
     })();
     if result.is_err() {
