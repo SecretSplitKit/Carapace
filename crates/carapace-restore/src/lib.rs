@@ -192,6 +192,7 @@ fn cleanup_stale_temporary_files(_root: &Path, _paths: &[PathBuf]) -> Result<(),
     Ok(())
 }
 
+#[cfg(unix)]
 fn is_restore_temporary_name(name: &str) -> bool {
     let Some(body) = name
         .strip_prefix(".carapace-restore-")
@@ -522,7 +523,7 @@ fn write_atomic_portable(
     root: &Path,
     relative: &Path,
     bytes: &[u8],
-    mode: u64,
+    _mode: u64,
     mtime: u64,
 ) -> Result<PathBuf, Error> {
     fs::create_dir_all(root)?;
@@ -568,11 +569,6 @@ fn write_atomic_portable(
             .checked_add(std::time::Duration::from_secs(mtime))
             .ok_or_else(|| Error::InvalidLayout(relative.display().to_string()))?;
         file.set_modified(modified)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode((mode & 0o0755) as u32))?;
-        }
         drop(file);
         replace_file(&temporary, &destination)?;
         File::open(&parent)?.sync_all()?;
