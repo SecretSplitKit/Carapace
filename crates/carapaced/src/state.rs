@@ -797,6 +797,7 @@ mod tests {
         assert!(load_or_generate_seed(&path, None).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn protected_local_identity_opens_only_with_the_supplied_passphrase() {
         let dir = tempfile::tempdir().unwrap();
