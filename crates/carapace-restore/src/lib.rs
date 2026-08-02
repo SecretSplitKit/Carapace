@@ -684,7 +684,14 @@ fn write_atomic_unix_with_hook(
 
 #[cfg(not(unix))]
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(temporary, destination)
+    // A Windows rename can replace an existing destination. Create a second
+    // name for the temporary file so activation fails if the destination exists.
+    fs::hard_link(temporary, destination)?;
+    if let Err(error) = fs::remove_file(temporary) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
