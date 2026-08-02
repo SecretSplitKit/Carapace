@@ -607,9 +607,12 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::collections::HashMap;
+    #[cfg(unix)]
     use std::sync::Mutex;
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct FakeCredentialStore {
         values: Mutex<HashMap<(String, String), [u8; 32]>>,
@@ -618,6 +621,7 @@ mod tests {
         writes: Mutex<usize>,
     }
 
+    #[cfg(unix)]
     impl CredentialStore for FakeCredentialStore {
         fn write(&self, id: &str, kind: &str, seed: &[u8; 32]) -> Result<()> {
             let mut writes = self.writes.lock().unwrap();
@@ -652,7 +656,9 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct FailAt(Option<MigrationPoint>);
+    #[cfg(unix)]
     impl MigrationHooks for FailAt {
         fn reach(&mut self, point: MigrationPoint) -> Result<()> {
             if self.0 == Some(point) {
@@ -662,11 +668,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn legacy_pair(dir: &Path) {
         write_secret(&dir.join("node.key"), &[0x31; 32]).unwrap();
         write_secret(&dir.join("root.key"), &[0x52; 32]).unwrap();
     }
 
+    #[cfg(unix)]
     fn assert_original_pair(dir: &Path, store: &FakeCredentialStore) {
         assert_eq!(std::fs::read(dir.join("node.key")).unwrap(), [0x31; 32]);
         assert_eq!(std::fs::read(dir.join("root.key")).unwrap(), [0x52; 32]);
