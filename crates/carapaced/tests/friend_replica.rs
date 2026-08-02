@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Phase-1-close acceptance over in-process localhost iroh endpoints: friendship handshake,
 //! W5-gated control stream, replica placement, repair, and reconstruction from a surviving
 //! replica. Owner `A` + second delegated device `A2` (shared `k_root`); friends `B`, `C`, `E`;

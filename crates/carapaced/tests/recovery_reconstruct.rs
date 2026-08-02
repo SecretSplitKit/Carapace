@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! §8.4 end-to-end DATA recovery: owner GONE, a fresh claimant that recovered only `K_root`
 //! fetches and decrypts the actual file content off a surviving friend's replica. Owner A
 //! publishes a multi-file vault, places a replica on friend B, and splits `K_root` 2-of-3 to

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! §11 multi-device conflict reconciliation between two owner daemons sharing one `k_root`
 //! but distinct node keys. Both publish a concurrent change to the same path (neither VV
 //! dominates), then reconcile over bounded rounds. Proves: no loss on edit-vs-edit (winner at

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Phase 1 acceptance: two localhost daemons sharing one `k_root` but distinct node keys.
 //! Device A publishes a vault; device B runs anti-entropy, fetches the envelope + chunks, and
 //! reconstructs the tree byte-for-byte against A's source.

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Regression: a filesystem watcher on a vault's working dir must not tombstone files a sync
 //! merged INTO that dir. Two owner daemons share one `k_root`; A watches its working dir. They
 //! reconcile a vault whose merge yields a B-only file (synced into A's dir) and a

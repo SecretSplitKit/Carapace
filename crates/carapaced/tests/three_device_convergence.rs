@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! 3+ device convergence on a concurrent edit must be order-independent. Three owner daemons
 //! sharing one `k_root` each publish a different body for the same path (no shared ancestry, so
 //! all three are mutually concurrent). The bug: the winner + conflict filename came from the

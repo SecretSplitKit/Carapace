@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! §3.5/§11 default-deny after reboot: a device reaches gate state through a §11 merge
 //! (`publish_merged` inserts owned_chunks incl. the merged envelope digest, announces, grants,
 //! vault_blobs). The pre-fix `publish_merged` returned WITHOUT committing, so a reboot

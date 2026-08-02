@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! §7.4 acceptance: selective disclosure + fetch authorization (adversarial D3). Owner `A`
 //! publishes F1/F2/F3; `B` is the audience, `C` a friend NOT in it.
 //! 1. A discloses F1, F2 to B; B reconstructs exactly those byte-identical (F3's keys are

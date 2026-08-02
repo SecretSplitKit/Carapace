@@ -25,9 +25,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-#[derive(rust_embed::RustEmbed)]
-#[folder = "static/"]
-struct ClaimantAssets;
+const CLAIMANT_HTML: &[u8] = include_bytes!("../static/claimant.html");
+const CLAIMANT_SCRIPT: &[u8] = include_bytes!("../static/claimant.js");
+const CLAIMANT_STYLESHEET: &[u8] = include_bytes!("../static/claimant.css");
+
+fn claimant_asset(path: &str) -> Option<&'static [u8]> {
+    match path {
+        "claimant.html" => Some(CLAIMANT_HTML),
+        "claimant.js" => Some(CLAIMANT_SCRIPT),
+        "claimant.css" => Some(CLAIMANT_STYLESHEET),
+        _ => None,
+    }
+}
 
 /// State for the claimant-only server. It deliberately has no normal daemon.
 #[derive(Clone)]
@@ -91,11 +100,10 @@ impl IntoResponse for ClaimantError {
 
 /// Serve the claimant-only shell. The token is a fixed-length hexadecimal value.
 pub(crate) async fn shell(State(state): State<ClaimantState>) -> Response {
-    let Some(asset) = ClaimantAssets::get("claimant.html") else {
+    let Some(asset) = claimant_asset("claimant.html") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let html =
-        String::from_utf8_lossy(&asset.data).replace("__CARAPACE_CLAIMANT_TOKEN__", &state.token);
+    let html = String::from_utf8_lossy(asset).replace("__CARAPACE_CLAIMANT_TOKEN__", &state.token);
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -113,7 +121,7 @@ pub(crate) async fn shell(State(state): State<ClaimantState>) -> Response {
 
 /// Serve one fixed claimant asset. No normal GUI asset fallback is available here.
 pub(crate) async fn asset(path: &'static str, content_type: &'static str) -> Response {
-    let Some(asset) = ClaimantAssets::get(path) else {
+    let Some(asset) = claimant_asset(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     (
@@ -122,7 +130,7 @@ pub(crate) async fn asset(path: &'static str, content_type: &'static str) -> Res
             (header::CACHE_CONTROL, "no-store"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
-        asset.data.into_owned(),
+        asset,
     )
         .into_response()
 }

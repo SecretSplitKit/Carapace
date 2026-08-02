@@ -354,6 +354,7 @@ async fn missing_state_database_fails_closed() -> Result<()> {
 
     let first = Daemon::start(state()).await?;
     first.shutdown().await;
+    drop(first);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let db_path = state_dir.path().join("state.redb");
