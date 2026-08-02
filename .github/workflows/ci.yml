@@ -126,7 +126,7 @@ jobs:
           rust-version: 1.95.0
           manifest-path: Carapace/Cargo.toml
           arguments: --all-features
-          command-arguments: --config Carapace/deny.toml
+          command-arguments: --config /github/workspace/Carapace/deny.toml
 
       - name: Prepare lock file for cargo audit
         run: cp Carapace/Cargo.lock Cargo.lock
