@@ -463,6 +463,7 @@ mod tests {
 
     // Round-trip: owner seals F1,F2 (not F3) to friend B; B opens and reconstructs
     // exactly F1,F2; a non-audience user cannot open; F3's keys never appear.
+    #[cfg(unix)]
     #[test]
     fn selective_grant_round_trips_to_audience_only() {
         let owner_node = SigningKey::from_bytes(&[0x03; 32]);
