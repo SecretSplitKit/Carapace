@@ -597,6 +597,13 @@ fn sync_parent(path: &Path) -> Result<()> {
         .with_context(|| format!("sync parent directory {parent:?}"))
 }
 
+#[cfg(not(unix))]
+fn sync_parent(path: &Path) -> Result<()> {
+    path.parent()
+        .context("secret file has no parent directory")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
