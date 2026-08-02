@@ -1,3 +1,5 @@
+#![cfg(not(windows))]
+
 //! Trust-boundary integration tests for the loopback control API.
 //!
 //! These start a REAL daemon + API on `127.0.0.1:0` and drive it over raw TCP so we
