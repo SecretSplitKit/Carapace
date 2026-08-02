@@ -395,14 +395,16 @@ fn create_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir(path).with_context(|| format!("create backup directory {path:?}"))
 }
 
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(path)
-            .with_context(|| format!("open directory {path:?} for sync"))?
-            .sync_all()
-            .with_context(|| format!("sync directory {path:?}"))?;
-    }
+    std::fs::File::open(path)
+        .with_context(|| format!("open directory {path:?} for sync"))?
+        .sync_all()
+        .with_context(|| format!("sync directory {path:?}"))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
