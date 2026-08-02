@@ -12,6 +12,9 @@ grep -Fq 'command-arguments: --config /github/workspace/Carapace/deny.toml' "$ci
 grep -Fq 'rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0' "$ci_workflow"
 grep -Fq 'unknown-registry = "deny"' deny.toml
 grep -Fq 'unknown-git = "deny"' deny.toml
+grep -Fq 'yanked = "deny"' deny.toml
+grep -Fq 'allow-wildcard-paths = true' deny.toml
+grep -Fq '"Unlicense"' deny.toml
 
 node -e '
 const manifest = require("./gui/package.json");
