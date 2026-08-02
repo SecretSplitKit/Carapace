@@ -923,6 +923,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_journal_tracks_interruption_and_clean_restart() {
         let temp = tempfile::tempdir().unwrap();
