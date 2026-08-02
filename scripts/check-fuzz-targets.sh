@@ -5,6 +5,7 @@ expected="$(printf '%s\n' manifests_grants recovery_messages restore_paths state
 actual="$(
   cargo metadata --manifest-path fuzz/Cargo.toml --no-deps --format-version 1 |
     jq -r '.packages[0].targets[] | select(.kind == ["bin"]) | .name' |
+    tr -d '\r' |
     sort
 )"
 

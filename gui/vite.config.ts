@@ -8,6 +8,8 @@ export default defineConfig({
 	build: { assetsInlineLimit: 0 },
 	plugins: [
 		sveltekit({
+			// Keep production asset hashes reproducible across clean builds.
+			version: { name: '0.0.1' },
 			compilerOptions: {
 				// Force runes mode for the project, except for libraries. Can be removed in svelte 6.
 				runes: ({ filename }) =>

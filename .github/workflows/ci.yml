@@ -125,7 +125,8 @@ jobs:
         with:
           rust-version: 1.95.0
           manifest-path: Carapace/Cargo.toml
-          arguments: --all-features --config Carapace/deny.toml
+          arguments: --all-features
+          command-arguments: --config Carapace/deny.toml
 
       - name: Prepare lock file for cargo audit
         run: cp Carapace/Cargo.lock Cargo.lock
@@ -158,6 +159,22 @@ jobs:
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
           echo "CHELA_REV=$revision" >> "$GITHUB_ENV"
+
+      - name: Checkout chela
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: SecretSplitKit/Chela
+          ref: ${{ steps.chela-pin.outputs.revision }}
+          # The default GITHUB_TOKEN is scoped to this repository. Use the
+          # optional token if Chela becomes private.
+          token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
+          path: chela
+
+      - name: Verify Chela revision
+        shell: bash
+        run: |
+          actual_revision="$(git -C chela rev-parse HEAD)"
+          test "$actual_revision" = "$CHELA_REV"
 
       - name: Check release workflow
         shell: bash
@@ -195,23 +212,6 @@ jobs:
         run: |
           cargo install cargo-fuzz --version 0.13.1 --locked
           scripts/check-fuzz-targets.sh --smoke
-
-      - name: Checkout chela
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: SecretSplitKit/Chela
-          ref: ${{ steps.chela-pin.outputs.revision }}
-          # The default GITHUB_TOKEN is scoped to THIS repo only and cannot read the
-          # separate private Chela repo. Provide a PAT/App token as the
-          # CHELA_CHECKOUT_TOKEN secret; the fallback works only if Chela is public.
-          token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
-          path: chela
-
-      - name: Verify Chela revision
-        shell: bash
-        run: |
-          actual_revision="$(git -C chela rev-parse HEAD)"
-          test "$actual_revision" = "$CHELA_REV"
 
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
