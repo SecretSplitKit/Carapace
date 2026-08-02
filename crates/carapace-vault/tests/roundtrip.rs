@@ -2,10 +2,11 @@
 //! multiple FastCDC chunks) into a manifest + chunk store, then reconstruct and
 //! assert byte-identity, ChunkID integrity, and envelope seal/open/verify.
 
+#[cfg(unix)]
 use carapace_vault::{
-    chunk_keys_from_manifest, ingest_dir, new_vid, open_envelope, reconstruct, reconstruct_file,
-    ChunkStore, FsStore, MemoryStore, VaultError, VaultKeys,
+    chunk_keys_from_manifest, reconstruct, reconstruct_file, ChunkStore, FsStore, VaultError,
 };
+use carapace_vault::{ingest_dir, new_vid, open_envelope, MemoryStore, VaultKeys};
 use ed25519_dalek::SigningKey;
 use std::fs;
 use std::path::PathBuf;
@@ -71,6 +72,7 @@ fn setup() -> (VaultKeys, SigningKey) {
     (VaultKeys::derive(&k_root, vid), node_key)
 }
 
+#[cfg(unix)]
 #[test]
 fn full_roundtrip_memory_store() {
     let src = TempDir::new("src");
@@ -123,6 +125,7 @@ fn full_roundtrip_memory_store() {
 /// Option B (§4.2): a `K_content` holder reconstructs from the sealed manifest
 /// alone by re-deriving every chunk key from the stored `pt_hash` (no FileGrant,
 /// no persisted `ChunkKeys`), and a tampered `pt_hash` is caught.
+#[cfg(unix)]
 #[test]
 fn reconstruct_from_manifest_pt_hash_and_tamper_detected() {
     let src = TempDir::new("src");
@@ -199,6 +202,7 @@ fn envelope_seal_open_verify_and_digest() {
     assert!(open_envelope(&wrong_epoch, &keys.k_manifest).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn full_roundtrip_fs_store() {
     let src = TempDir::new("src");
