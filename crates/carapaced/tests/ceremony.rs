@@ -372,8 +372,7 @@ async fn unknown_signer_cannot_grow_ceremony_state() -> Result<()> {
     let (a, b, c, d, _k_root) = setup().await?;
     let rogue = ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]);
     let before = c.ceremony_record_counts();
-    let database = c.state_dir().join("state.redb");
-    let durable_before = std::fs::read(&database)?;
+    let durable_before = c.persist_commit_count();
 
     for n in 0..32u128 {
         let mut abort = CeremonyAbort {
@@ -391,7 +390,7 @@ async fn unknown_signer_cannot_grow_ceremony_state() -> Result<()> {
         "an unknown signer must not allocate ceremony state"
     );
     assert_eq!(
-        std::fs::read(&database)?,
+        c.persist_commit_count(),
         durable_before,
         "unknown abort flooding must not amplify durable commits"
     );
@@ -406,8 +405,7 @@ async fn unauthenticated_recovery_open_flood_has_no_state_or_commit_amplificatio
     let (a, b, c, d, _k_root) = setup().await?;
     let rogue = ed25519_dalek::SigningKey::from_bytes(&[0xE2; 32]);
     let before = c.ceremony_record_counts();
-    let database = c.state_dir().join("state.redb");
-    let durable_before = std::fs::read(&database)?;
+    let durable_before = c.persist_commit_count();
     for value in 0..32u128 {
         let open = open_recovery(
             &rogue,
@@ -423,7 +421,7 @@ async fn unauthenticated_recovery_open_flood_has_no_state_or_commit_amplificatio
         b.deliver_recovery_open(&c.addr()?, &open).await?;
     }
     assert_eq!(c.ceremony_record_counts(), before);
-    assert_eq!(std::fs::read(&database)?, durable_before);
+    assert_eq!(c.persist_commit_count(), durable_before);
     teardown([a, b, c, d]).await;
     Ok(())
 }
@@ -477,11 +475,10 @@ async fn inbound_oversized_recovery_open_has_no_state_or_commit_amplification() 
         T0,
     );
     let before = c.ceremony_record_counts();
-    let database = c.state_dir().join("state.redb");
-    let durable_before = std::fs::read(&database)?;
+    let durable_before = c.persist_commit_count();
     b.deliver_recovery_open(&c.addr()?, &open).await?;
     assert_eq!(c.ceremony_record_counts(), before);
-    assert_eq!(std::fs::read(&database)?, durable_before);
+    assert_eq!(c.persist_commit_count(), durable_before);
     teardown([a, b, c, d]).await;
     Ok(())
 }

@@ -272,6 +272,7 @@ use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -1118,6 +1119,7 @@ struct ControlHandler {
     /// The redb source of truth on disk, shared with the owning [`Daemon`]. Handlers commit
     /// the whole state through it BEFORE any externally visible effect.
     db: Arc<redb::Database>,
+    persist_count: Arc<AtomicU64>,
     blobs: IrohBlobStore,
     replica_ingress: PathBuf,
     shared: Arc<RwLock<Shared>>,
@@ -1151,6 +1153,7 @@ impl ControlHandler {
                 node: self.node_key.verifying_key().to_bytes(),
             },
         );
+        self.persist_count.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn serve(&self, conn: Connection) -> Result<()> {
@@ -2124,6 +2127,7 @@ pub struct Daemon {
     /// `DocStore` back through [`persist::persist_all`] in one txn, committed before any
     /// externally visible effect. `Arc` so background tasks persist without borrowing `self`.
     db: Arc<redb::Database>,
+    persist_count: Arc<AtomicU64>,
     /// Cleanup guard for a `from_seeds` daemon's ephemeral state dir: `Some` only when
     /// `State::dir` was `None`. Removes the tree on drop.
     _ephemeral_dir: Option<EphemeralDir>,
@@ -2242,6 +2246,7 @@ impl Daemon {
                 node: self.node_id(),
             },
         );
+        self.persist_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bind the endpoint from `state`, start serving the blob store and the `carapace/1`
@@ -2436,6 +2441,7 @@ impl Daemon {
         // (store-and-forward, §6/W7). Loaded from disk so rollback high-water marks survive.
         let docs = Arc::new(Mutex::new(loaded.docs));
         let recovery_limiter = Arc::new(Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)));
+        let persist_count = Arc::new(AtomicU64::new(0));
 
         let hello = Hello {
             protocol: 1,
@@ -2449,6 +2455,7 @@ impl Daemon {
             self_user,
             k_root: k_root.clone(),
             db: Arc::clone(&db),
+            persist_count: Arc::clone(&persist_count),
             blobs: blobs.clone(),
             replica_ingress,
             shared: Arc::clone(&shared),
@@ -2469,6 +2476,7 @@ impl Daemon {
             let s = shared.read().expect("shared lock");
             let d = docs.lock().expect("docs lock");
             persist::commit_all(&db, &s, &d, &k_root, &identity);
+            persist_count.fetch_add(1, Ordering::Relaxed);
         }
 
         let gate_shared = Arc::clone(&shared);
@@ -2499,6 +2507,7 @@ impl Daemon {
             relay_host: cfg.relay_host,
             state_dir,
             db,
+            persist_count,
             _ephemeral_dir: ephemeral_dir,
             router,
         };
@@ -2582,6 +2591,12 @@ impl Daemon {
     /// `from_seeds` daemon this is an ephemeral dir cleaned up on drop.
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Number of durable state commits completed by this daemon process.
+    #[doc(hidden)]
+    pub fn persist_commit_count(&self) -> u64 {
+        self.persist_count.load(Ordering::Relaxed)
     }
 
     /// A directly dialable address for this daemon (localhost).
