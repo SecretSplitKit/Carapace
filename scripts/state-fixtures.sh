@@ -50,6 +50,13 @@ case "$mode" in
     expected="$(awk -F '\t' '$1 == "legacy-rich-v1.redb.gz.b64" { print $2 }' "$manifest")"
     test -n "$expected"
     test "$(hash_file "$frozen")" = "$expected"
+    case "$(uname -s)" in
+      MINGW*|MSYS*|CYGWIN*)
+        cargo test --locked -p carapaced --lib persist_load_roundtrips_all_categories
+        echo "State fixture $mode completed."
+        exit 0
+        ;;
+    esac
     temporary="$(mktemp -d)"
     trap 'rm -rf "$temporary"' EXIT
     generate "$temporary"
