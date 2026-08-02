@@ -4,6 +4,7 @@
 //! and reconstructs byte-identical plaintext through `carapace-vault`. Plus a
 //! unit test for the monotonic-version rollback rule.
 
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -15,10 +16,13 @@ use carapace_net::{
     read_msg, write_msg, AllowList, CarapaceEndpoint, CarapaceRelay, DocStore, IrohBlobStore,
     Reject, SyncHandler,
 };
+#[cfg(unix)]
 use carapace_vault::{
     ingest_dir, new_vid, open_envelope, reconstruct, ChunkStore, MemoryStore, VaultKeys,
 };
-use carapace_wire::{ContactCard, Hello, ManifestEnvelope, Offers, Signed, VaultAnnounce};
+#[cfg(unix)]
+use carapace_wire::ManifestEnvelope;
+use carapace_wire::{ContactCard, Hello, Offers, Signed, VaultAnnounce};
 use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
@@ -100,10 +104,12 @@ async fn live_bao_range_fetch_excludes_unrelated_blocks() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 const K_ROOT: [u8; 32] = [0x33; 32];
 
 /// Populate a temp directory with a mix of files (including one large enough to
 /// be cut into multiple FastCDC chunks, a nested file, and an empty file).
+#[cfg(unix)]
 fn make_tree() -> (tempfile::TempDir, BTreeMap<String, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
     let mut expected = BTreeMap::new();
@@ -164,6 +170,7 @@ fn signed_announce(
     ann
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sync_fetch_and_reconstruct() -> Result<()> {
     let user = SigningKey::from_bytes(&[0x07; 32]);
