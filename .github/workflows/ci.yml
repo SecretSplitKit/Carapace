@@ -202,6 +202,7 @@ jobs:
         run: scripts/state-fixtures.sh check
 
       - name: Install fuzz toolchain
+        if: runner.os == 'Linux'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: nightly-2026-06-01
@@ -210,8 +211,12 @@ jobs:
         shell: bash
         working-directory: Carapace
         run: |
-          cargo install cargo-fuzz --version 0.13.1 --locked
-          scripts/check-fuzz-targets.sh --smoke
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            cargo install cargo-fuzz --version 0.13.1 --locked
+            scripts/check-fuzz-targets.sh --smoke
+          else
+            scripts/check-fuzz-targets.sh
+          fi
 
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
