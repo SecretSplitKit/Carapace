@@ -435,6 +435,7 @@ mod tests {
     use super::*;
     use carapace_crypto::kdf;
     use carapace_wire::GrantChunk;
+    #[cfg(unix)]
     use std::fs;
 
     /// Seal a plaintext chunk under a vault's content key and return the wire
