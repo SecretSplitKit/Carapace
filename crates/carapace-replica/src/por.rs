@@ -45,7 +45,8 @@ pub const AUDIT_CODE_RETENTION_LOST: u64 = 1;
 /// Format tag for [`AuditTracker::to_bytes`]/[`AuditTracker::from_bytes`]. Bump
 /// only on an incompatible layout change; `from_bytes` rejects any other tag so a
 /// stale on-disk row fails loud rather than deserializing into wrong counters.
-const POR_STATE_VERSION: u8 = 1;
+const POR_STATE_VERSION: u8 = 2;
+const LATENCY_WINDOW: usize = 16;
 
 /// Domain separator for the PoR sampling PRF; mixed into the keyed BLAKE3 XOF
 /// alongside epoch, round, and the wide flag so distinct inputs give
@@ -305,6 +306,29 @@ pub fn verify_audit_response(audit: &Audit, responses: &[Option<Vec<u8>>]) -> Au
     AuditOutcome::Pass
 }
 
+/// Grade ranges that the transport already verified against each sample's ChunkID with Bao.
+/// No whole-chunk fallback is accepted: each answer must have exactly the sampled length.
+pub fn verify_bao_range_responses(audit: &Audit, responses: &[Option<Vec<u8>>]) -> AuditOutcome {
+    for (sample, response) in audit.samples.iter().zip(responses) {
+        let Some(bytes) = response else {
+            return AuditOutcome::Fail(AuditFailure::Missing(sample.chunk_id));
+        };
+        if bytes.len() != sample.len as usize {
+            return AuditOutcome::Fail(AuditFailure::ShortRange {
+                chunk_id: sample.chunk_id,
+                have: bytes.len(),
+                need: sample.len as usize,
+            });
+        }
+    }
+    if responses.len() != audit.samples.len() {
+        return AuditOutcome::Fail(AuditFailure::Missing(
+            audit.samples[responses.len()].chunk_id,
+        ));
+    }
+    AuditOutcome::Pass
+}
+
 /// Issue `audit` to `responder` and verify the answer. The convenience over
 /// [`verify_audit_response`] is that it drives the responder for every sample;
 /// time this call at the site to feed the response-time hook (§10.1).
@@ -347,6 +371,7 @@ pub struct AuditTracker {
     next: HashMap<([u8; 32], [u8; 32]), u64>,
     /// (replica, vid) -> completed round count (the audit nonce source).
     round: HashMap<([u8; 32], [u8; 32]), u64>,
+    latency_ms: HashMap<([u8; 32], [u8; 32]), Vec<u32>>,
 }
 
 impl AuditTracker {
@@ -359,6 +384,7 @@ impl AuditTracker {
             fails: HashMap::new(),
             next: HashMap::new(),
             round: HashMap::new(),
+            latency_ms: HashMap::new(),
         }
     }
 
@@ -478,6 +504,41 @@ impl AuditTracker {
         AuditAction::Skipped
     }
 
+    /// Record one completed probe duration in a fixed window. Returns true when it is more
+    /// than four times the established median and at least 500 ms slower.
+    pub fn record_latency(&mut self, replica: [u8; 32], vid: [u8; 32], millis: u32) -> bool {
+        let window = self.latency_ms.entry((replica, vid)).or_default();
+        let anomalous = if window.len() >= 4 {
+            let mut baseline = window.clone();
+            baseline.sort_unstable();
+            let median = baseline[baseline.len() / 2];
+            millis > median.saturating_mul(4) && millis.saturating_sub(median) >= 500
+        } else {
+            false
+        };
+        if window.len() == LATENCY_WINDOW {
+            window.remove(0);
+        }
+        window.push(millis);
+        anomalous
+    }
+
+    pub fn latency_anomaly_count(&self) -> usize {
+        self.latency_ms
+            .values()
+            .filter(|window| {
+                if window.len() < 5 {
+                    return false;
+                }
+                let current = *window.last().expect("nonempty");
+                let mut baseline = window[..window.len() - 1].to_vec();
+                baseline.sort_unstable();
+                let median = baseline[baseline.len() / 2];
+                current > median.saturating_mul(4) && current.saturating_sub(median) >= 500
+            })
+            .count()
+    }
+
     /// Serialize the tracker losslessly for durable persistence (§10.1 replay
     /// safety: losing the `round` counter re-issues an identical, now-predictable
     /// challenge stream). Map entries are emitted in sorted-key order so equal
@@ -491,6 +552,7 @@ impl AuditTracker {
         write_u32_map(&mut out, &self.fails);
         write_u64_map(&mut out, &self.next);
         write_u64_map(&mut out, &self.round);
+        write_latency_map(&mut out, &self.latency_ms);
         out
     }
 
@@ -501,7 +563,7 @@ impl AuditTracker {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplicaError> {
         let mut r = Reader { b: bytes, pos: 0 };
         let version = r.u8()?;
-        if version != POR_STATE_VERSION {
+        if version != 1 && version != POR_STATE_VERSION {
             return Err(ReplicaError::PorStateCorrupt("unknown por state version"));
         }
         let interval = r.u64()?;
@@ -510,6 +572,11 @@ impl AuditTracker {
         let fails = read_u32_map(&mut r)?;
         let next = read_u64_map(&mut r)?;
         let round = read_u64_map(&mut r)?;
+        let latency_ms = if version >= 2 {
+            read_latency_map(&mut r)?
+        } else {
+            HashMap::new()
+        };
         if r.pos != bytes.len() {
             return Err(ReplicaError::PorStateCorrupt("trailing bytes"));
         }
@@ -520,6 +587,7 @@ impl AuditTracker {
             fails,
             next,
             round,
+            latency_ms,
         })
     }
 }
@@ -546,6 +614,38 @@ fn write_u64_map(out: &mut Vec<u8>, m: &HashMap<PorKey, u64>) {
         out.extend_from_slice(vid);
         out.extend_from_slice(&v.to_le_bytes());
     }
+}
+
+fn write_latency_map(out: &mut Vec<u8>, map: &HashMap<PorKey, Vec<u32>>) {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_unstable_by_key(|(key, _)| **key);
+    out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for ((replica, vid), values) in entries {
+        out.extend_from_slice(replica);
+        out.extend_from_slice(vid);
+        out.push(values.len().min(LATENCY_WINDOW) as u8);
+        for value in values.iter().take(LATENCY_WINDOW) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+fn read_latency_map(r: &mut Reader) -> Result<HashMap<PorKey, Vec<u32>>, ReplicaError> {
+    let count = r.u64()?;
+    let mut map = HashMap::new();
+    for _ in 0..count {
+        let key = (r.arr32()?, r.arr32()?);
+        let len = r.u8()? as usize;
+        if len > LATENCY_WINDOW {
+            return Err(ReplicaError::PorStateCorrupt("latency window too large"));
+        }
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(r.u32()?);
+        }
+        map.insert(key, values);
+    }
+    Ok(map)
 }
 
 fn read_u32_map(r: &mut Reader) -> Result<HashMap<PorKey, u32>, ReplicaError> {
@@ -719,6 +819,27 @@ mod state_tests {
         assert_eq!(t2.fails, t.fails);
         assert_eq!(t2.next, t.next);
         assert_eq!(t2.interval, t.interval);
+    }
+
+    #[test]
+    fn latency_shift_is_bounded_and_survives_restart() {
+        let replica = [0x31; 32];
+        let vid = [0x41; 32];
+        let mut tracker = AuditTracker::default();
+        for value in [100, 110, 90, 105] {
+            assert!(!tracker.record_latency(replica, vid, value));
+        }
+        assert!(tracker.record_latency(replica, vid, 900));
+        assert_eq!(tracker.latency_anomaly_count(), 1);
+        for value in 0..40 {
+            tracker.record_latency(replica, vid, 100 + value);
+        }
+        assert_eq!(tracker.latency_ms[&(replica, vid)].len(), LATENCY_WINDOW);
+        let restored = AuditTracker::from_bytes(&tracker.to_bytes()).unwrap();
+        assert_eq!(restored.latency_ms, tracker.latency_ms);
+        let mut truncated = tracker.to_bytes();
+        truncated.pop();
+        assert!(AuditTracker::from_bytes(&truncated).is_err());
     }
 
     #[test]

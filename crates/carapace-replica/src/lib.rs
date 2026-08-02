@@ -26,9 +26,10 @@ pub use policy::{
 };
 pub use por::{
     build_audit, build_audit_n, build_wide_audit, run_audit, signed_audit_notice,
-    verify_audit_response, Audit, AuditAction, AuditFailure, AuditOutcome, AuditResponder,
-    AuditSample, AuditTracker, AUDIT_CODE_RETENTION_LOST, DEFAULT_POR_FAIL_LIMIT,
-    DEFAULT_POR_INTERVAL_SECS, DEFAULT_SAMPLES_PER_ROUND, DEFAULT_WIDE_EVERY,
+    verify_audit_response, verify_bao_range_responses, Audit, AuditAction, AuditFailure,
+    AuditOutcome, AuditResponder, AuditSample, AuditTracker, AUDIT_CODE_RETENTION_LOST,
+    DEFAULT_POR_FAIL_LIMIT, DEFAULT_POR_INTERVAL_SECS, DEFAULT_SAMPLES_PER_ROUND,
+    DEFAULT_WIDE_EVERY,
 };
 
 /// Default replica invariant `r` (§10.1).

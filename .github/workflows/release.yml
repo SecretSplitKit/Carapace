@@ -6,17 +6,140 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: carapaced
 
-# Least privilege by default; the build job elevates to contents: write only for
-# the release-asset upload.
+# Build jobs are read-only. Only the publication gate can write release assets.
 permissions:
+  actions: read
   contents: read
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Carapace
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: Carapace
+      - name: Read pinned Chela revision
+        id: chela-pin
+        shell: bash
+        run: |
+          revision="$(tr -d '\r\n' < Carapace/chela-revision.txt)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Checkout chela
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: SecretSplitKit/Chela
+          ref: ${{ steps.chela-pin.outputs.revision }}
+          token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
+          path: chela
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - name: Check Rust formatting and lints
+        working-directory: Carapace
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check secrets and supply-chain policy
+        working-directory: Carapace
+        run: |
+          scripts/check-tracked-secrets.sh
+          scripts/check-supply-chain-config.sh
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@d755fbddac377c2d538f556dd0f9c7728c7f73e4 # v2.0.14
+        with:
+          rust-version: 1.95.0
+          manifest-path: Carapace/Cargo.toml
+          arguments: --all-features --config Carapace/deny.toml
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Check schema and independent vectors
+        working-directory: Carapace
+        run: |
+          python -m pip install --requirement requirements-cbor-vectors.txt
+          python cbor_vectors.py --check
+          cargo test --workspace --locked
+      - name: Check source layout, logs, inventory, and fixtures
+        working-directory: Carapace
+        run: |
+          scripts/check-release-workflow.sh
+          scripts/check-restore-layout.sh
+          scripts/check-test-inventory.sh
+          scripts/check-operational-logs.sh
+          scripts/state-fixtures.sh check
+      - name: Install pinned fuzz toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: nightly-2026-06-01
+      - name: Run all fuzz targets with bounded budgets
+        working-directory: Carapace
+        run: |
+          cargo install cargo-fuzz --version 0.13.1 --locked
+          scripts/check-fuzz-targets.sh --smoke
+      - name: Install pinned Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: Carapace/gui/package-lock.json
+      - name: Check GUI and browser behavior
+        working-directory: Carapace/gui
+        run: |
+          npm install --global npm@11.16.0
+          npm ci
+          npm run check
+          npm test
+          npx playwright install --with-deps chromium
+          npm run test:browser
+          npm run build
+      - name: Verify embedded GUI is current
+        working-directory: Carapace
+        run: git diff --exit-code -- crates/carapace-api/static
+
+  native-tests:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Carapace
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: Carapace
+      - name: Read pinned Chela revision
+        id: chela-pin
+        shell: bash
+        run: |
+          revision="$(tr -d '\r\n' < Carapace/chela-revision.txt)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Checkout chela
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: SecretSplitKit/Chela
+          ref: ${{ steps.chela-pin.outputs.revision }}
+          token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
+          path: chela
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+      - name: Run native workspace tests
+        working-directory: Carapace
+        run: cargo test --workspace --locked
+
   build:
-    permissions:
-      contents: write # softprops/action-gh-release attaches assets to the release
+    needs: [quality, native-tests]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
@@ -25,21 +148,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            cross: true
     runs-on: ${{ matrix.os }}
-    # aarch64 cross targets rely on toolchain components (linux: apt
-    # cross-gcc, windows: MSVC ARM64 tools) that aren't guaranteed on every
-    # runner image; don't let a cross-target hiccup block the native builds.
-    continue-on-error: ${{ matrix.cross == true }}
     steps:
       # Path dependency on chela-engine/chela-bip39/chela-share
       # (`../../../chela/...`) requires both repos as siblings.
@@ -48,20 +161,36 @@ jobs:
         with:
           path: Carapace
 
+      - name: Read pinned Chela revision
+        id: chela-pin
+        shell: bash
+        run: |
+          revision="$(tr -d '\r\n' < Carapace/chela-revision.txt)"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "CHELA_REV=$revision" >> "$GITHUB_ENV"
+
       - name: Checkout chela
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: SecretSplitKit/Chela
-          ref: main
+          ref: ${{ steps.chela-pin.outputs.revision }}
           # The default GITHUB_TOKEN cannot read the separate private Chela repo;
           # provide a PAT/App token as CHELA_CHECKOUT_TOKEN. The fallback works only
           # if Chela is public.
           token: ${{ secrets.CHELA_CHECKOUT_TOKEN || github.token }}
           path: chela
 
+      - name: Verify Chela revision
+        shell: bash
+        run: |
+          actual_revision="$(git -C chela rev-parse HEAD)"
+          test "$actual_revision" = "$CHELA_REV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       - name: Install aarch64 cross-compiler (Linux)
@@ -74,16 +203,61 @@ jobs:
 
       - name: Build
         working-directory: Carapace
-        run: cargo build --release --locked --target ${{ matrix.target }} -p carapaced
+        run: cargo build --release --locked --target ${{ matrix.target }} -p carapace-api --bin carapaced -p carapace --bin carapace
+
+      - name: Verify expected binaries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: Carapace
+        run: |
+          test -s "target/${{ matrix.target }}/release/carapaced"
+          test -x "target/${{ matrix.target }}/release/carapaced"
+          test -s "target/${{ matrix.target }}/release/carapace"
+          test -x "target/${{ matrix.target }}/release/carapace"
+
+      - name: Verify expected binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: Carapace
+        run: |
+          $daemon = Get-Item "target/${{ matrix.target }}/release/carapaced.exe"
+          $client = Get-Item "target/${{ matrix.target }}/release/carapace.exe"
+          if ($daemon.Length -eq 0 -or $client.Length -eq 0) {
+            throw "A release executable is empty."
+          }
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          path: Carapace
+          format: cyclonedx-json
+          output-file: Carapace/sbom-${{ matrix.target }}.cdx.json
+          upload-artifact: false
 
       - name: Stage artifact (Unix)
         if: runner.os != 'Windows'
         shell: bash
         working-directory: Carapace
         run: |
-          staging="${BIN_NAME}-${{ matrix.target }}"
+          staging="carapace-${{ matrix.target }}"
           mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$staging/"
+          cp "target/${{ matrix.target }}/release/carapaced" "$staging/"
+          cp "target/${{ matrix.target }}/release/carapace" "$staging/"
+          cp "sbom-${{ matrix.target }}.cdx.json" "$staging/SBOM.cdx.json"
+          echo "chela_revision=${CHELA_REV}" > "$staging/BUILD-METADATA.txt"
+          if [[ "${{ matrix.target }}" == *-linux-gnu ]]; then
+            carapaced_glibc_minimum="$(strings "target/${{ matrix.target }}/release/carapaced" | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)"
+            carapace_glibc_minimum="$(strings "target/${{ matrix.target }}/release/carapace" | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)"
+            test -n "$carapaced_glibc_minimum"
+            test -n "$carapace_glibc_minimum"
+            echo "carapaced_glibc_minimum=${carapaced_glibc_minimum}" >> "$staging/BUILD-METADATA.txt"
+            echo "carapace_glibc_minimum=${carapace_glibc_minimum}" >> "$staging/BUILD-METADATA.txt"
+          else
+            vtool -show-build "target/${{ matrix.target }}/release/carapaced" | grep -F 'minos 11.0'
+            vtool -show-build "target/${{ matrix.target }}/release/carapace" | grep -F 'minos 11.0'
+            echo "carapaced_macos_minimum=11.0" >> "$staging/BUILD-METADATA.txt"
+            echo "carapace_macos_minimum=11.0" >> "$staging/BUILD-METADATA.txt"
+          fi
           tar czf "${staging}.tar.gz" "$staging"
           echo "ASSET=Carapace/${staging}.tar.gz" >> "$GITHUB_ENV"
 
@@ -92,19 +266,60 @@ jobs:
         shell: pwsh
         working-directory: Carapace
         run: |
-          $staging = "${env:BIN_NAME}-${{ matrix.target }}"
+          $staging = "carapace-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "$staging/"
+          Copy-Item "target/${{ matrix.target }}/release/carapaced.exe" "$staging/"
+          Copy-Item "target/${{ matrix.target }}/release/carapace.exe" "$staging/"
+          Copy-Item "sbom-${{ matrix.target }}.cdx.json" "$staging/SBOM.cdx.json"
+          Set-Content -Path "$staging/BUILD-METADATA.txt" -Value "chela_revision=${env:CHELA_REV}"
           Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
           echo "ASSET=Carapace/${staging}.zip" >> $env:GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          name: carapace-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
-      - name: Attach to GitHub release
+  publish:
+    needs: [quality, native-tests, build]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum carapace-* > SHA256SUMS
+
+      - name: Create approved detached signature
+        working-directory: release-assets
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_FINGERPRINT: ${{ secrets.RELEASE_SIGNING_FINGERPRINT }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY"
+          test -n "$RELEASE_SIGNING_FINGERPRINT"
+          printf '%s' "$RELEASE_SIGNING_KEY" | gpg --batch --import
+          actual="$(gpg --batch --with-colons --fingerprint "$RELEASE_SIGNING_FINGERPRINT" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$actual" = "$RELEASE_SIGNING_FINGERPRINT"
+          gpg --batch --local-user "$RELEASE_SIGNING_FINGERPRINT" --detach-sign --armor --output SHA256SUMS.asc SHA256SUMS
+
+      - name: Attest release artifact provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-assets/carapace-*
+
+      - name: Attach complete artifact set to GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
-          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
+          files: release-assets/*

@@ -126,6 +126,72 @@ async fn republish_bumps_epoch_and_syncs_update() -> Result<()> {
     Ok(())
 }
 
+/// An owner device can remain offline across several published epochs, restart only from
+/// its durable state, and then converge to the latest bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn long_offline_owner_reboots_and_resyncs_latest_vault() -> Result<()> {
+    let state_b = tempfile::tempdir()?;
+    let daemon_a = Daemon::start(State::from_seeds([0x25; 32], K_ROOT)).await?;
+    let daemon_b = Daemon::start(State::from_seeds_in(state_b.path(), [0x27; 32], K_ROOT)).await?;
+    let source = tempfile::tempdir()?;
+    std::fs::write(source.path().join("offline.txt"), b"epoch one")?;
+    let (vid, _) = daemon_a.new_vid();
+    assert_eq!(daemon_a.publish_vault(source.path(), vid).await?, 1);
+    let first_output = tempfile::tempdir()?;
+    assert!(daemon_b
+        .sync_from(daemon_a.addr()?, first_output.path())
+        .await?
+        .iter()
+        .any(|result| result.vid == vid && result.epoch == 1));
+    daemon_b.shutdown().await;
+    drop(daemon_b);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    for (epoch, content) in [(2, b"epoch two".as_slice()), (3, b"epoch three latest")] {
+        std::fs::write(source.path().join("offline.txt"), content)?;
+        assert_eq!(daemon_a.publish_vault(source.path(), vid).await?, epoch);
+    }
+
+    let mut rebooted_b = None;
+    let mut last_lock_error = None;
+    for _ in 0..50 {
+        match Daemon::start(State::from_seeds_in(state_b.path(), [0x27; 32], K_ROOT)).await {
+            Ok(daemon) => {
+                rebooted_b = Some(daemon);
+                break;
+            }
+            Err(error) if error.to_string().contains("Database already open") => {
+                last_lock_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let rebooted_b = rebooted_b.with_context(|| {
+        format!(
+            "prior offline-device database lock did not settle: {:#}",
+            last_lock_error.expect("a retry failure has a lock error")
+        )
+    })?;
+    let resumed_output = tempfile::tempdir()?;
+    let results = rebooted_b
+        .sync_from(daemon_a.addr()?, resumed_output.path())
+        .await?;
+    let latest = results
+        .iter()
+        .find(|result| result.vid == vid)
+        .context("rebooted offline device did not resync the vault")?;
+    assert_eq!(latest.epoch, 3);
+    assert_eq!(
+        std::fs::read(latest.out_dir.join("offline.txt"))?,
+        b"epoch three latest"
+    );
+
+    rebooted_b.shutdown().await;
+    daemon_a.shutdown().await;
+    Ok(())
+}
+
 /// W3: a poison announce (node-signed so it passes delegation, but pointing at an unbacked
 /// digest) must not starve the legitimate vaults; B reconstructs the real vault and skips it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

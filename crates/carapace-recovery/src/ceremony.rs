@@ -789,6 +789,28 @@ mod tests {
         assert!(cer.can_release(T0 + DELAY));
     }
 
+    #[test]
+    fn wall_clock_changes_do_not_reduce_the_recovery_delay_floor() {
+        let s = setup();
+        let rsid = u64::from(s.shares[0].recovery_set_id);
+        let open = an_open(&s, rsid, T0);
+        let mut cer = CeremonyState::open(&open, s.roster.clone(), 3, DELAY, T0).unwrap();
+        for trustee in s.trustees.iter().take(3) {
+            let mut approval = CeremonyApprove {
+                ceremony_id: [0xCE; 16],
+                ts: T0,
+                by: [0; 32],
+                sig: [0; 64],
+            };
+            approval.sign(trustee);
+            cer.approve(&approval).unwrap();
+        }
+
+        assert!(!cer.can_release(T0.saturating_sub(24 * 60 * 60)));
+        assert!(!cer.can_release(T0 + DELAY - 1));
+        assert!(cer.can_release(T0 + 365 * 24 * 60 * 60));
+    }
+
     /// W1: `open_from_grant` binds the open to the grant - a mismatched subject is refused.
     #[test]
     fn open_from_grant_rejects_subject_mismatch() {

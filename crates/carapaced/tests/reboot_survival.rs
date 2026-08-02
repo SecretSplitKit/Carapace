@@ -277,7 +277,7 @@ async fn reboot_via_load_or_generate(sealed_key: Option<&str>) -> Result<()> {
     let (src, _expected) = make_tree();
 
     let (vid, node_id, digest, chunks) = {
-        let d = Daemon::start(State::load_or_generate(state_dir.path())?).await?;
+        let d = Daemon::start(State::load_or_generate_insecure(state_dir.path())?).await?;
         let (vid, _nonce) = d.new_vid();
         assert_eq!(d.publish_vault(src.path(), vid).await?, 1);
         assert_eq!(
@@ -304,7 +304,7 @@ async fn reboot_via_load_or_generate(sealed_key: Option<&str>) -> Result<()> {
 
     // Reboot from the same dir (re-reads the key files); a `k_root` that did not round-trip
     // would fail `rederive_manifest` and drop the vault from published_vaults.
-    let d2 = Daemon::start(State::load_or_generate(state_dir.path())?).await?;
+    let d2 = Daemon::start(State::load_or_generate_insecure(state_dir.path())?).await?;
     assert_eq!(
         d2.node_id(),
         node_id,
@@ -341,6 +341,34 @@ async fn fresh_dir_boots_and_creates_state_db() -> Result<()> {
     assert!(
         state_dir.path().join("state.redb").exists(),
         "a fresh boot must create state.redb"
+    );
+    Ok(())
+}
+
+/// A missing database beside durable artifacts must fail before networking starts and must
+/// not create a replacement empty database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_state_database_fails_closed() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state = || State::from_seeds_in(state_dir.path(), [0x61; 32], [0x62; 32]);
+
+    let first = Daemon::start(state()).await?;
+    first.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let db_path = state_dir.path().join("state.redb");
+    std::fs::remove_file(&db_path)?;
+    let err = Daemon::start(state())
+        .await
+        .err()
+        .expect("missing durable state must fail");
+    assert!(
+        err.to_string().contains("durable artifacts exist"),
+        "unexpected startup error: {err:#}"
+    );
+    assert!(
+        !db_path.exists(),
+        "failed startup must not create an empty replacement database"
     );
     Ok(())
 }

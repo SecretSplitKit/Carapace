@@ -78,6 +78,7 @@
 		<div class="status-and-theme">
 			<span class="live-dot" class:live={$live} title={$live ? 'Live updates connected' : 'Reconnecting…'}
 			></span>
+			<span class="connection-text">{$live ? 'Live' : 'Reconnecting…'}</span>
 			<button type="button" onclick={toggleTheme} aria-label="Toggle color theme">
 				{theme === 'light' ? 'Molt (light)' : 'Dark'}
 			</button>
@@ -172,7 +173,35 @@
 		display: inline-block;
 	}
 
-	.live-dot.live {
+		.live-dot.live {
 		background: var(--verdigris);
-	}
-</style>
+		}
+
+		.connection-text {
+			font-size: var(--step--1);
+			color: var(--muted);
+		}
+
+		@media (max-width: 640px) {
+			.app {
+				padding: 1rem;
+			}
+
+			header {
+				gap: 0.75rem;
+			}
+
+			nav {
+				order: 3;
+				flex-basis: 100%;
+			}
+
+			nav a {
+				padding: 0.55em 0.65em;
+			}
+
+			.status-and-theme {
+				margin-left: auto;
+			}
+		}
+	</style>

@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { api } from '$lib/api';
 	import { status } from '$lib/statusStore';
-	import { notes, noteFriendGrant } from '$lib/notes';
 	import { formatBytes, copyToClipboard } from '$lib/format';
 	import CopyHex from './CopyHex.svelte';
 
@@ -22,6 +21,10 @@
 	let confirming = $state<string | null>(null);
 	let removing = $state<string | null>(null);
 	let unfriendNote = $state<{ friend: string; resplit: boolean; rsids: number[] } | null>(null);
+
+	function storageGrant(user: string): number | null {
+		return $status?.friends.grants.find((grant) => grant.user === user)?.grant_bytes ?? null;
+	}
 
 	async function refresh() {
 		loading = true;
@@ -64,7 +67,6 @@
 				.filter(Boolean);
 			const bytes = Math.round(grantGiB * 1024 ** 3);
 			const res = await api.addFriend(ticketHex.trim(), addrs.length ? addrs : undefined, bytes);
-			noteFriendGrant(res.friend, bytes);
 			addResult = `Friend added (${res.friend.slice(0, 12)}…).`;
 			ticketHex = '';
 			addrsInput = '';
@@ -98,7 +100,8 @@
 
 	<div class="grid">
 		<div class="card">
-			<h3>Invite a friend</h3>
+			<h2>Invite a friend</h2>
+			<p class="dependency">Local operation · the ticket becomes peer-dependent when your friend accepts it</p>
 			<button class="primary" type="button" onclick={issueTicket} disabled={issuing}>
 				{issuing ? 'Issuing…' : 'Create invite ticket'}
 			</button>
@@ -114,7 +117,8 @@
 		</div>
 
 		<div class="card">
-			<h3>Add a friend from a ticket</h3>
+			<h2>Add a friend from a ticket</h2>
+			<p class="dependency">Peer-dependent operation · an unused ticket is safe to retry</p>
 			<form onsubmit={(e) => (e.preventDefault(), addFriend())}>
 				<label for="ticket-hex" class="muted">Ticket they sent you</label>
 				<input id="ticket-hex" bind:value={ticketHex} placeholder="carapace: ticket or its hex" />
@@ -135,7 +139,7 @@
 	{#if unfriendNote}
 		<div class="card {unfriendNote.resplit ? 'at-risk' : 'healthy'}" style="margin-top: 1.5rem">
 			{#if unfriendNote.resplit}
-				<h3>Re-split required</h3>
+				<h2>Re-split required</h2>
 				<p>
 					{unfriendNote.friend.slice(0, 12)}… was a trustee. A trustee re-split is now running for
 					recovery set{unfriendNote.rsids.length > 1 ? 's' : ''}
@@ -162,10 +166,10 @@
 				<div class="card friend-row">
 					<CopyHex value={f} />
 					<span class="muted">
-						{#if $notes.friendStorageGrants[f] !== undefined}
-							≈{formatBytes($notes.friendStorageGrants[f])} agreed (recorded in this browser)
+						{#if storageGrant(f) !== null}
+							{formatBytes(storageGrant(f)!)} storage grant
 						{:else}
-							storage limit not recorded here
+							storage grant unavailable
 						{/if}
 					</span>
 					{#if confirming === f}
@@ -191,8 +195,8 @@
 		</div>
 	{/if}
 	<p class="muted" style="font-size: var(--step--1); margin-top: 0.5rem">
-		The daemon doesn't yet report a friend's storage/trustee/relay role or agreed limit back to the
-		GUI - the figures above are only what this browser set when adding the friend.
+		Storage grants above come from durable daemon state. Trustee and relay roles appear in their
+		own recovery and replica status views.
 	</p>
 </section>
 

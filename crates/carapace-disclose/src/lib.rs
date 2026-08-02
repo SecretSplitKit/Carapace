@@ -30,7 +30,6 @@
 //! recallable.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use carapace_crypto::content;
@@ -97,6 +96,8 @@ pub enum DiscloseError {
     UnsafePath(String),
     /// Filesystem I/O during reconstruction failed.
     Io(std::io::Error),
+    /// Shared restore validation or output failed.
+    Restore(carapace_restore::Error),
 }
 
 impl std::fmt::Display for DiscloseError {
@@ -117,6 +118,7 @@ impl std::fmt::Display for DiscloseError {
             }
             DiscloseError::UnsafePath(p) => write!(f, "unsafe granted path: {p}"),
             DiscloseError::Io(e) => write!(f, "reconstruction io: {e}"),
+            DiscloseError::Restore(e) => write!(f, "{e}"),
         }
     }
 }
@@ -126,6 +128,11 @@ impl std::error::Error for DiscloseError {}
 impl From<std::io::Error> for DiscloseError {
     fn from(e: std::io::Error) -> Self {
         DiscloseError::Io(e)
+    }
+}
+impl From<carapace_restore::Error> for DiscloseError {
+    fn from(e: carapace_restore::Error) -> Self {
+        DiscloseError::Restore(e)
     }
 }
 
@@ -219,11 +226,18 @@ pub fn open_file(
     vid: &[u8; 32],
     fetch: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
 ) -> Result<Vec<u8>, DiscloseError> {
-    let mut out = Vec::with_capacity(file.size as usize);
+    let lengths: Vec<u64> = file.chunks.iter().map(|chunk| chunk.len).collect();
+    let capacity = carapace_restore::checked_file_layout(&file.path, file.size, &lengths)?;
+    let mut out = Vec::with_capacity(capacity);
     for c in &file.chunks {
         let ct = fetch(&c.chunk_id).ok_or(DiscloseError::MissingChunk(c.chunk_id))?;
         let pt =
             content::open_chunk(&c.chunk_key, &c.nonce, &ct, vid).map_err(DiscloseError::Chunk)?;
+        if u64::try_from(pt.len()).ok() != Some(c.len) {
+            return Err(DiscloseError::Restore(
+                carapace_restore::Error::InvalidLayout(file.path.clone()),
+            ));
+        }
         out.extend_from_slice(&pt);
     }
     if *blake3::hash(&out).as_bytes() != file.file_hash {
@@ -242,18 +256,46 @@ pub fn write_grant(
     out_dir: &Path,
     fetch: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
 ) -> Result<Vec<PathBuf>, DiscloseError> {
-    let mut written = Vec::with_capacity(body.files.len());
-    for file in &body.files {
-        let bytes = open_file(file, vid, &fetch)?;
-        // A grant is a cross-user document; treat its paths as hostile (reject
-        // absolute paths and `..` escape) exactly as vault reconstruction does.
-        let dest = safe_join(out_dir, &file.path)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&dest, &bytes)?;
+    let paths = carapace_restore::validate_operation(
+        body.files
+            .iter()
+            .map(|file| (file.path.as_str(), file.size)),
+    )?;
+    carapace_restore::reject_existing_hard_link_aliases(out_dir, &paths)?;
+    let mut written = Vec::with_capacity(paths.len());
+    let mut journal = carapace_restore::RestoreJournal::begin(out_dir, &paths)?;
+    for (index, (file, relative)) in body.files.iter().zip(paths).enumerate() {
+        let lengths: Vec<u64> = file.chunks.iter().map(|chunk| chunk.len).collect();
+        carapace_restore::checked_file_layout(&file.path, file.size, &lengths)?;
+        let chunks = file.chunks.iter().map(|chunk| {
+            let ciphertext =
+                fetch(&chunk.chunk_id).ok_or(DiscloseError::MissingChunk(chunk.chunk_id))?;
+            let plaintext = content::open_chunk(&chunk.chunk_key, &chunk.nonce, &ciphertext, vid)
+                .map_err(DiscloseError::Chunk)?;
+            if plaintext.len() as u64 != chunk.len {
+                return Err(DiscloseError::Restore(
+                    carapace_restore::Error::InvalidLayout(file.path.clone()),
+                ));
+            }
+            Ok(plaintext)
+        });
+        let dest = carapace_restore::write_atomic_chunks(
+            out_dir,
+            &relative,
+            chunks,
+            file.size,
+            &file.file_hash,
+            0o600,
+            0,
+        )
+        .map_err(|error| match error {
+            carapace_restore::StreamError::Source(error) => error,
+            carapace_restore::StreamError::Restore(error) => DiscloseError::Restore(error),
+        })?;
         written.push(dest);
+        journal.mark_complete(index)?;
     }
+    journal.finish()?;
     Ok(written)
 }
 
@@ -302,6 +344,11 @@ impl DisclosureTable {
         self.by_chunk
             .get(chunk_id)
             .is_some_and(|users| users.contains(user))
+    }
+
+    /// All chunk ids that must remain available for issued, permanent disclosures.
+    pub fn chunk_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.by_chunk.keys().copied()
     }
 
     /// Serialize the whole table to deterministic det-CBOR for at-rest
@@ -374,26 +421,6 @@ impl DisclosureTable {
     }
 }
 
-/// Join a grant-supplied relative path onto `base`, rejecting absolute paths and
-/// any `..` escape (a foreign grant may be hostile). Mirrors the vault's
-/// reconstruction guard.
-fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, DiscloseError> {
-    let mut out = base.to_path_buf();
-    for part in rel.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        if part == ".." || part.contains('\\') {
-            return Err(DiscloseError::UnsafePath(rel.to_string()));
-        }
-        out.push(part);
-    }
-    if out == base {
-        return Err(DiscloseError::UnsafePath(rel.to_string()));
-    }
-    Ok(out)
-}
-
 fn hex(b: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
@@ -408,6 +435,7 @@ mod tests {
     use super::*;
     use carapace_crypto::kdf;
     use carapace_wire::GrantChunk;
+    use std::fs;
 
     /// Seal a plaintext chunk under a vault's content key and return the wire
     /// GrantChunk plus its ciphertext, exactly as an owner would after ingest.
@@ -679,14 +707,13 @@ mod tests {
     }
 
     #[test]
-    fn safe_join_rejects_escapes() {
-        let base = Path::new("/out");
-        assert!(safe_join(base, "../etc/passwd").is_err());
-        assert!(safe_join(base, "/abs").is_ok()); // leading '/' -> empty first part, kept relative
+    fn restore_path_validation_rejects_escapes() {
+        assert!(carapace_restore::validate_path("../etc/passwd").is_err());
+        assert!(carapace_restore::validate_path("/abs").is_err());
         assert_eq!(
-            safe_join(base, "a/b.txt").unwrap(),
-            Path::new("/out/a/b.txt")
+            carapace_restore::validate_path("a/b.txt").unwrap(),
+            Path::new("a/b.txt")
         );
-        assert!(safe_join(base, "").is_err());
+        assert!(carapace_restore::validate_path("").is_err());
     }
 }

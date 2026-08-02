@@ -1,0 +1,20 @@
+[package]
+name = "carapace-restore"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom = "0.2"
+unicode-normalization = "0.1"
+blake3 = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"

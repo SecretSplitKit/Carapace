@@ -1,0 +1,17 @@
+{
+  "node_id": "",
+  "addr": [],
+  "relay_url": null,
+  "friends": { "count": 0, "list": [], "grants": [] },
+  "peers": [],
+  "vaults": { "published": [], "held_replicas": [] },
+  "share_health": { "recovery_sets_owned": 0, "shares_held": 0, "sets": [], "recovery": [] },
+  "recovery_grants": { "minted": [], "held": [] },
+  "ceremonies": [],
+  "resplits": [],
+  "pending_resplits": [],
+  "reachability": "direct",
+  "relay_networks": 0,
+  "relay_diversity_warning": true,
+  "por_latency_anomaly_count": 0
+}

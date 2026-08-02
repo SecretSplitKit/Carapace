@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { status } from '$lib/statusStore';
-	import { notes } from '$lib/notes';
 	import { api } from '$lib/api';
 	import ShellHero from './ShellHero.svelte';
 	import CopyHex from './CopyHex.svelte';
@@ -48,13 +47,13 @@
 		};
 
 		const setsOwned = s.share_health.recovery_sets_owned;
-		const rootSet = Object.values($notes.recoverySets).find((n) => n.scope.kind === 'root');
+		const rootSet = s.share_health.sets.find((set) => set.scope.kind === 'root');
 		const sharesPlate: Plate = {
 			key: 'shares',
 			label: 'Recovery shares',
 			achieved: setsOwned > 0 ? 1 : 0,
 			target: 1,
-			valueLabel: rootSet ? `${rootSet.m}-of-${rootSet.n}` : setsOwned > 0 ? 'split' : '—',
+			valueLabel: rootSet ? `${rootSet.threshold}-of-${rootSet.issued}` : setsOwned > 0 ? 'split' : '—',
 			state: setsOwned > 0 ? 'healthy' : 'empty',
 			note:
 				setsOwned > 0

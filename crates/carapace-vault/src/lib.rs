@@ -54,6 +54,8 @@ pub enum VaultError {
     BadMtime,
     /// The system CSPRNG failed.
     Rng,
+    /// Shared restore validation or output failed.
+    Restore(carapace_restore::Error),
 }
 
 impl std::fmt::Display for VaultError {
@@ -74,6 +76,7 @@ impl std::fmt::Display for VaultError {
             VaultError::NonUtf8Path(p) => write!(f, "non-UTF8 file path: {p}"),
             VaultError::BadMtime => write!(f, "invalid file mtime"),
             VaultError::Rng => write!(f, "system RNG failed"),
+            VaultError::Restore(e) => write!(f, "{e}"),
         }
     }
 }
@@ -98,6 +101,11 @@ impl From<carapace_wire::Error> for VaultError {
 impl From<StoreError> for VaultError {
     fn from(e: StoreError) -> Self {
         VaultError::Store(e)
+    }
+}
+impl From<carapace_restore::Error> for VaultError {
+    fn from(e: carapace_restore::Error) -> Self {
+        VaultError::Restore(e)
     }
 }
 
@@ -392,8 +400,10 @@ pub fn reconstruct_file<S: ChunkStore>(
     store: &S,
     keys: &ChunkKeys,
 ) -> Result<Vec<u8>, VaultError> {
-    let mut out = Vec::with_capacity(entry.size as usize);
-    for (id, pt_hash, _len) in &entry.chunks {
+    let lengths: Vec<u64> = entry.chunks.iter().map(|chunk| chunk.2).collect();
+    let capacity = carapace_restore::checked_file_layout(&entry.path, entry.size, &lengths)?;
+    let mut out = Vec::with_capacity(capacity);
+    for (id, pt_hash, len) in &entry.chunks {
         let ct = store.get(id)?.ok_or(VaultError::MissingChunk(*id))?;
         let secret = keys.get(id).ok_or(VaultError::MissingKey(*id))?;
         let pt = content::open_chunk(&secret.chunk_key, &secret.nonce, &ct, vid)?;
@@ -401,6 +411,11 @@ pub fn reconstruct_file<S: ChunkStore>(
         // (but validly-keyed) chunk for this id.
         if blake3::hash(&pt).as_bytes() != pt_hash {
             return Err(VaultError::ChunkHashMismatch(*id));
+        }
+        if u64::try_from(pt.len()).ok() != Some(*len) {
+            return Err(VaultError::Restore(carapace_restore::Error::InvalidLayout(
+                entry.path.clone(),
+            )));
         }
         out.extend_from_slice(&pt);
     }
@@ -418,48 +433,50 @@ pub fn reconstruct<S: ChunkStore>(
     keys: &ChunkKeys,
     out_dir: &Path,
 ) -> Result<(), VaultError> {
-    for entry in &manifest.files {
-        if entry.deleted {
-            continue;
-        }
-        let bytes = reconstruct_file(entry, &manifest.vid, store, keys)?;
-        let dest = safe_join(out_dir, &entry.path)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        write_file_with_meta(&dest, &bytes, entry)?;
+    let live: Vec<_> = manifest
+        .files
+        .iter()
+        .filter(|entry| !entry.deleted)
+        .collect();
+    let paths = carapace_restore::validate_operation(
+        live.iter().map(|entry| (entry.path.as_str(), entry.size)),
+    )?;
+    carapace_restore::reject_existing_hard_link_aliases(out_dir, &paths)?;
+    let mut journal = carapace_restore::RestoreJournal::begin(out_dir, &paths)?;
+    for (index, (entry, relative)) in live.into_iter().zip(paths).enumerate() {
+        let lengths: Vec<u64> = entry.chunks.iter().map(|chunk| chunk.2).collect();
+        carapace_restore::checked_file_layout(&entry.path, entry.size, &lengths)?;
+        let chunks = entry.chunks.iter().map(|(id, pt_hash, len)| {
+            let ct = store.get(id)?.ok_or(VaultError::MissingChunk(*id))?;
+            let secret = keys.get(id).ok_or(VaultError::MissingKey(*id))?;
+            let plaintext =
+                content::open_chunk(&secret.chunk_key, &secret.nonce, &ct, &manifest.vid)?;
+            if blake3::hash(&plaintext).as_bytes() != pt_hash {
+                return Err(VaultError::ChunkHashMismatch(*id));
+            }
+            if plaintext.len() as u64 != *len {
+                return Err(VaultError::Restore(carapace_restore::Error::InvalidLayout(
+                    entry.path.clone(),
+                )));
+            }
+            Ok(plaintext)
+        });
+        carapace_restore::write_atomic_chunks(
+            out_dir,
+            &relative,
+            chunks,
+            entry.size,
+            &entry.file_hash,
+            entry.mode,
+            entry.mtime,
+        )
+        .map_err(|error| match error {
+            carapace_restore::StreamError::Source(error) => error,
+            carapace_restore::StreamError::Restore(error) => VaultError::Restore(error),
+        })?;
+        journal.mark_complete(index)?;
     }
-    Ok(())
-}
-
-/// Write `bytes` to `dest`, restoring the entry's `mtime` (and unix `mode`) so a
-/// subsequent [`ingest_dir`] round-trips to the identical [`FileEntry`] and does
-/// not ping-pong metadata between devices (§11). The existing file is removed
-/// first so a restored read-only mode from a prior round cannot block the overwrite.
-///
-/// ponytail: in-place write (remove + create + write), NOT temp-file + atomic
-/// rename, so a concurrent external reader can peek a partial file. Upgrade path:
-/// write `dest.tmp` then `fs::rename` (and fsync the dir) if that ever matters.
-fn write_file_with_meta(dest: &Path, bytes: &[u8], entry: &FileEntry) -> Result<(), VaultError> {
-    use std::io::Write;
-    let _ = fs::remove_file(dest);
-    let mut f = fs::File::create(dest)?;
-    f.write_all(bytes)?;
-    f.flush()?;
-    let mtime = std::time::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(entry.mtime))
-        .ok_or(VaultError::BadMtime)?;
-    // Restore mtime after the write (which would otherwise stamp "now").
-    f.set_modified(mtime)?;
-    drop(f);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            dest,
-            fs::Permissions::from_mode((entry.mode & 0o7777) as u32),
-        )?;
-    }
+    journal.finish()?;
     Ok(())
 }
 
@@ -513,30 +530,4 @@ fn file_mtime(meta: &fs::Metadata) -> Result<u64, VaultError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| VaultError::BadMtime)
-}
-
-/// Join a manifest-supplied relative path onto `base`, rejecting absolute paths
-/// and any `..` escape (a manifest may be hostile).
-///
-/// S9 (deferred to the foreign-manifest phase): for a cross-user hostile manifest,
-/// a Windows ADS component (`foo:bar`) is not filtered (a blanket `:` reject would
-/// break legit unix names), and reconstruct's write follows a pre-existing symlink
-/// at the destination. Phase 1 manifests are same-user-trusted; tighten both before
-/// honoring a friend's manifest.
-fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, VaultError> {
-    let mut out = base.to_path_buf();
-    for part in rel.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        if part == ".." || part.contains('\\') {
-            return Err(VaultError::UnsafePath(rel.to_string()));
-        }
-        out.push(part);
-    }
-    // Reject a rel that resolved to nothing (e.g. "" or "/").
-    if out == base {
-        return Err(VaultError::UnsafePath(rel.to_string()));
-    }
-    Ok(out)
 }

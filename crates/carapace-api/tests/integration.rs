@@ -77,8 +77,14 @@ async fn status_requires_the_bearer_token() {
     let addr = api.local_addr;
 
     // No token -> 401.
-    let (code, _) = get(addr, "/api/status", "");
+    let (code, response) = get(addr, "/api/status", "");
     assert_eq!(code, 401, "missing token must be 401");
+    assert!(
+        split_response(&response)
+            .1
+            .contains("\"code\":\"unauthorized\""),
+        "authentication errors must have a stable code: {response}"
+    );
 
     // Wrong token (same length as the real 64-hex token) -> 401. This exercises the
     // constant-time compare's equal-length, mismatched-content path.
@@ -106,6 +112,87 @@ async fn status_requires_the_bearer_token() {
         body.contains(&node_hex),
         "status must report the real node id {node_hex}: {body}"
     );
+    for required in [
+        "\"friends\"",
+        "\"vaults\"",
+        "\"share_health\"",
+        "\"recovery_grants\"",
+        "\"ceremonies\"",
+        "\"resplits\"",
+        "\"pending_resplits\"",
+        "\"reachability\"",
+        "\"relay_networks\"",
+        "\"relay_diversity_warning\"",
+    ] {
+        assert!(
+            body.contains(required),
+            "status response must include the GUI field {required}: {body}"
+        );
+    }
+    assert!(
+        body.contains("\"grants\""),
+        "status must include friend grants: {body}"
+    );
+    assert!(
+        body.contains("\"sets\""),
+        "status must include authoritative recovery sets: {body}"
+    );
+    api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_are_authenticated_bounded_and_identity_free() {
+    let (api, daemon, _dir) = boot().await;
+    let (code, _) = get(api.local_addr, "/api/metrics", "");
+    assert_eq!(code, 401, "metrics must require the bearer token");
+
+    let (code, response) = get(
+        api.local_addr,
+        "/api/metrics",
+        &format!("Authorization: Bearer {}\r\n", api.token),
+    );
+    assert_eq!(
+        code, 200,
+        "authenticated metrics request failed: {response}"
+    );
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let metrics: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(metrics["schema"], 1);
+    for section in [
+        "storage",
+        "replicas",
+        "maintenance",
+        "garbage_collection",
+        "ceremonies",
+        "migrations",
+        "recovery",
+    ] {
+        assert!(
+            metrics.get(section).is_some(),
+            "missing metrics section {section}"
+        );
+    }
+    assert_eq!(metrics["limits"]["count_ceiling"], 1_000_000);
+    assert_eq!(metrics["ceremonies"]["per_subject_capacity"], 8);
+    assert_eq!(metrics["ceremonies"]["fanout_capacity"], 128);
+    assert_eq!(
+        metrics["garbage_collection"]["live_set_capacity"],
+        1_000_000
+    );
+    assert!(
+        metrics["maintenance"]["last_failure_count"]
+            .as_u64()
+            .unwrap()
+            <= 1_000_000
+    );
+    let encoded = metrics.to_string();
+    assert!(!encoded.contains(&hex::encode(daemon.node_id())));
+    for forbidden in ["node_id", "user_id", "path", "state_dir", "vid", "rsid"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "metrics exposed {forbidden}: {encoded}"
+        );
+    }
     api.shutdown();
 }
 
@@ -153,11 +240,10 @@ async fn websocket_upgrade_requires_the_token() {
     let (code, _) = raw(addr, &req);
     assert_eq!(code, 401, "WS upgrade without a token must be 401");
 
-    // With the token in the query string -> 101 Switching Protocols.
+    // With the HTTP-only session cookie -> 101 Switching Protocols.
     let req = format!(
-        "GET /api/events?token={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{ws_headers}\r\n",
-        api.token,
-        addr.port()
+        "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: carapace_session={}\r\n{ws_headers}\r\n",
+        addr.port(), api.token
     );
     let (code, _) = raw(addr, &req);
     assert_eq!(code, 101, "WS upgrade with the token must switch protocols");
@@ -233,6 +319,17 @@ async fn index_injects_the_token_and_references_built_assets() {
     assert!(lower.contains("object-src 'none'"), "{headers}");
     assert!(lower.contains("frame-ancestors 'none'"), "{headers}");
     assert!(lower.contains("base-uri 'none'"), "{headers}");
+    assert!(
+        lower.contains("set-cookie: carapace_session=")
+            && lower.contains("httponly")
+            && lower.contains("samesite=strict")
+            && lower.contains("path=/api/events"),
+        "the WebSocket token cookie must be restricted: {headers}"
+    );
+    assert!(
+        !body.contains("/api/events?token="),
+        "the session token must not appear in a WebSocket URL"
+    );
     // The inline token script must run under a nonce, never 'unsafe-inline' scripts.
     assert!(
         lower.contains("script-src 'self' 'nonce-"),
@@ -324,6 +421,10 @@ async fn unknown_api_path_is_404_json_not_the_token_shell() {
         "unknown /api path must not serve the token shell: {resp}"
     );
     assert!(body.contains("\"error\""), "404 body must be JSON: {resp}");
+    assert!(
+        body.contains("\"code\":\"not_found\""),
+        "404 body must have a stable error code: {resp}"
+    );
     api.shutdown();
 }
 
@@ -364,4 +465,84 @@ async fn recovery_split_round_trips_over_the_api() {
     );
     assert!(!resp.contains("\"error\""), "no error expected: {resp}");
     api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_split_accepts_the_trustee_delivery_contract() {
+    let (api, _d, _dir) = boot().await;
+    let body = format!(
+        r#"{{"rsid":2,"scope":{{"kind":"vault","vid":"{}"}},"m":2,"trustees":["not-hex"]}}"#,
+        "00".repeat(32)
+    );
+    let req = format!(
+        "POST /api/recovery/split HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        api.local_addr.port(),
+        api.token,
+        body.len()
+    );
+    let (code, resp) = raw(api.local_addr, &req);
+    assert_eq!(
+        code, 400,
+        "invalid trustee delivery request must be rejected: {resp}"
+    );
+    assert!(
+        resp.contains("invalid hex: not-hex"),
+        "the response must identify the invalid trustee field: {resp}"
+    );
+    api.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owned_device_sync_restores_a_published_vault_over_the_api() {
+    let source_state = State::from_seeds([0x31; 32], [0x41; 32]);
+    let target_state = State::from_seeds([0x32; 32], [0x41; 32]);
+    let source = Arc::new(Daemon::start(source_state).await.unwrap());
+    let target = Arc::new(Daemon::start(target_state).await.unwrap());
+
+    let source_dir = tempfile::tempdir().unwrap();
+    std::fs::write(source_dir.path().join("sync.txt"), b"owned device sync").unwrap();
+    let (vid, _) = source.new_vid();
+    source.publish_vault(source_dir.path(), vid).await.unwrap();
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let api = serve(Arc::clone(&target), state_dir.path(), 0)
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "peer": {
+            "node": hex::encode(source.node_id()),
+            "addrs": source.dialable_addr_strings(),
+        },
+        "out_dir": out.path().display().to_string(),
+    })
+    .to_string();
+    let req = format!(
+        "POST /api/sync HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\
+         Authorization: Bearer {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        api.local_addr.port(),
+        api.token,
+        body.len()
+    );
+    let (code, resp) = raw(api.local_addr, &req);
+    assert_eq!(code, 200, "sync must succeed: {resp}");
+    assert!(
+        resp.contains(&hex::encode(vid)),
+        "response must name the vault: {resp}"
+    );
+    assert!(
+        resp.contains("\"epoch\":1"),
+        "response must name the epoch: {resp}"
+    );
+    assert_eq!(
+        std::fs::read(out.path().join(hex::encode(vid)).join("sync.txt")).unwrap(),
+        b"owned device sync"
+    );
+
+    api.shutdown();
+    source.shutdown().await;
+    target.shutdown().await;
 }

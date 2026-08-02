@@ -1,0 +1,3 @@
+# Independent Appendix B oracle dependencies. CI installs these exact versions.
+blake3==1.0.4
+cryptography==44.0.2

@@ -54,16 +54,35 @@ fn make_tree() -> (tempfile::TempDir, BTreeMap<String, Vec<u8>>) {
     (dir, expected)
 }
 
+#[tokio::test]
+async fn a_second_root_split_is_refused() -> Result<()> {
+    let daemon = Daemon::start(seeds(0x41, 0x51)).await?;
+    daemon.recovery_split(1, RecoveryScope::Root, 2, 3, false)?;
+    let error = daemon
+        .recovery_split(2, RecoveryScope::Root, 2, 3, false)
+        .expect_err("a second root split must fail");
+    assert!(error.to_string().contains("active root recovery split"));
+
+    // A vault-scoped split does not create another independent root split.
+    daemon.recovery_split(3, RecoveryScope::Vault([7; 32]), 2, 3, false)?;
+    daemon.shutdown().await;
+    Ok(())
+}
+
 /// THE missing acceptance test: a fresh claimant recovers `K_root` through the full
 /// ceremony, then reconstructs the owner's vault CONTENT from a surviving replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
-    // Owner A and three friends B, C, D (trustees). B additionally holds a vault replica.
+    // Owner A, trustees B/C/D, and a distinct retained-replica node E.
     let a = Daemon::start(seeds(0x01, 0xA0)).await?;
-    let b = Daemon::start(seeds(0x11, 0xB0)).await?;
+    let b_state = tempfile::tempdir()?;
+    let b_seed = [0x11; 32];
+    let b_root = [0xB0; 32];
+    let b = Daemon::start(State::from_seeds_in(b_state.path(), b_seed, b_root)).await?;
     let c = Daemon::start(seeds(0x21, 0xC0)).await?;
     let d = Daemon::start(seeds(0x31, 0xD0)).await?;
-    for t in [&b, &c, &d] {
+    let e = Daemon::start(seeds(0x41, 0xE0)).await?;
+    for t in [&b, &c, &d, &e] {
         a_befriends(&a, t).await?;
     }
 
@@ -72,13 +91,18 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
     let (src, expected) = make_tree();
     let (vid, _nonce) = a.new_vid();
     a.publish_vault(src.path(), vid).await?;
-    let placed = a.place_replicas(vid, &[b.addr()?], 1).await?;
+    let placed = a.place_replicas(vid, &[e.addr()?], 1).await?;
     assert_eq!(
         placed,
-        vec![b.node_id()],
-        "B accepted the replica placement"
+        vec![e.node_id()],
+        "E accepted the replica placement"
     );
-    assert!(b.holds_replica(&vid), "B stored the vault blobs");
+    assert!(e.holds_replica(&vid), "E stored the vault blobs");
+
+    // B learns and rollback-checks A's signed announce as a trustee/document peer. B is
+    // deliberately not the blob replica named by that announce.
+    let doc_only = tempfile::tempdir()?;
+    assert!(b.sync_from(a.addr()?, doc_only.path()).await?.is_empty());
 
     // A splits K_root 2-of-3 to B, C, D (W3 grants delivered).
     let subject = a.user_id();
@@ -87,6 +111,7 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
         .recovery_split_grant(7, RecoveryScope::Root, 2, &trustees, DELAY, false)
         .await?;
     assert_eq!(report.delivered.len(), 3, "all three grants delivered");
+    let refs = b.claimant_announce_refs(&subject)?;
     let roster = [b.user_id(), c.user_id(), d.user_id()];
 
     // ---- A "loses every device": shut the owner down. The replica (B) and trustees
@@ -131,6 +156,13 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
         "re-derived user key equals the original owner's"
     );
 
+    // Restart the document trustee after it released its share. Its durable admission proof
+    // must still bind this ceremony to the claimant's exact new node.
+    b.shutdown().await;
+    drop(b);
+    let b = Daemon::start(State::from_seeds_in(b_state.path(), b_seed, b_root)).await?;
+    b.set_test_clock(T0 + DELAY);
+
     // §8.4 data recovery: stand the claimant up as a Daemon on the recovered K_root + its own
     // node identity, then reconstruct off replica B. The fresh device presents a card its
     // re-derived user key signed; B admits it as an owner-delegated ReplicaDevice and serves
@@ -142,10 +174,30 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
         subject,
         "the recovered daemon is the same user as the lost owner"
     );
+    // Seed the local loopback address resolver for E. Production can resolve the NodeID
+    // through discovery with no direct address in the handoff.
+    a_befriends(&recovered_daemon, &e).await?;
 
     let out = tempfile::tempdir()?;
     let reconstructed = recovered_daemon
-        .reconstruct_from_replica(b.addr()?, b.addr()?, out.path())
+        .recover_retained_at(
+            &[
+                (
+                    b.node_id(),
+                    b.addr()?.ip_addrs().map(ToString::to_string).collect(),
+                ),
+                (
+                    c.node_id(),
+                    c.addr()?.ip_addrs().map(ToString::to_string).collect(),
+                ),
+                (
+                    d.node_id(),
+                    d.addr()?.ip_addrs().map(ToString::to_string).collect(),
+                ),
+            ],
+            &refs,
+            out.path(),
+        )
         .await?;
     let got = reconstructed
         .iter()
@@ -164,7 +216,7 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
     }
 
     recovered_daemon.shutdown().await;
-    for t in [b, c, d] {
+    for t in [b, c, d, e] {
         t.shutdown().await;
     }
     Ok(())

@@ -1,5 +1,4 @@
 import { writable } from 'svelte/store';
-import { apiToken } from './token';
 import { api } from './api';
 import type { StatusSnapshot } from './types';
 
@@ -9,11 +8,13 @@ export const live = writable(false);
 
 let socket: WebSocket | null = null;
 let retryMs = 1000;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let stopped = true;
 
 function connect(): void {
-	if (typeof window === 'undefined') return;
+	if (typeof window === 'undefined' || stopped) return;
 	const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-	const url = `${proto}//${location.host}/api/events?token=${encodeURIComponent(apiToken())}`;
+	const url = `${proto}//${location.host}/api/events`;
 	socket = new WebSocket(url);
 
 	socket.onopen = () => {
@@ -29,9 +30,8 @@ function connect(): void {
 	};
 	socket.onclose = () => {
 		live.set(false);
-		// ponytail: fixed backoff ladder, not a full jittered retry policy -
-		// fine for a single loopback daemon that's either up or restarting.
-		setTimeout(connect, retryMs);
+		if (stopped) return;
+		retryTimer = setTimeout(connect, retryMs);
 		retryMs = Math.min(retryMs * 2, 15000);
 	};
 	socket.onerror = () => {
@@ -41,6 +41,8 @@ function connect(): void {
 
 /** Kick off the live feed, seeded by one REST fetch so the first paint isn't blank. */
 export function startStatusFeed(): void {
+	stopStatusFeed();
+	stopped = false;
 	api
 		.status()
 		.then((s) => status.set(s))
@@ -51,6 +53,13 @@ export function startStatusFeed(): void {
 }
 
 export function stopStatusFeed(): void {
-	socket?.close();
+	stopped = true;
+	if (retryTimer !== null) {
+		clearTimeout(retryTimer);
+		retryTimer = null;
+	}
+	const active = socket;
 	socket = null;
+	active?.close();
+	live.set(false);
 }

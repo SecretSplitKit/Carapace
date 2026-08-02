@@ -4,7 +4,9 @@
 //! 72 h delay uses an injected clock (`set_test_clock`), never a real sleep.
 
 use anyhow::{Context, Result};
-use carapace_wire::AnnounceRef;
+use carapace_crypto::{identity::user_key_from_seed, kdf::k_userid};
+use carapace_recovery::open_recovery;
+use carapace_wire::{AnnounceRef, CeremonyAbort, Signed};
 use carapaced::{max_epoch_refs, ClaimantDevice, Daemon, RecoveryScope, State};
 use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -361,6 +363,169 @@ async fn non_trustee_cannot_open() -> Result<()> {
     );
     a.shutdown().await;
     stranger.shutdown().await;
+    Ok(())
+}
+
+/// Unknown valid signers cannot allocate alarm or abort records on a trustee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_signer_cannot_grow_ceremony_state() -> Result<()> {
+    let (a, b, c, d, _k_root) = setup().await?;
+    let rogue = ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]);
+    let before = c.ceremony_record_counts();
+    let database = c.state_dir().join("state.redb");
+    let durable_before = std::fs::read(&database)?;
+
+    for n in 0..32u128 {
+        let mut abort = CeremonyAbort {
+            ceremony_id: n.to_be_bytes(),
+            by: [0; 32],
+            sig: [0; 64],
+        };
+        abort.sign(&rogue);
+        b.send_ceremony_abort(&c.addr()?, &abort).await?;
+    }
+
+    assert_eq!(
+        c.ceremony_record_counts(),
+        before,
+        "an unknown signer must not allocate ceremony state"
+    );
+    assert_eq!(
+        std::fs::read(&database)?,
+        durable_before,
+        "unknown abort flooding must not amplify durable commits"
+    );
+    teardown([a, b, c, d]).await;
+    Ok(())
+}
+
+/// Repeated signature-valid opens from a signer outside every trust role do not allocate
+/// ceremony records or change the durable database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthenticated_recovery_open_flood_has_no_state_or_commit_amplification() -> Result<()> {
+    let (a, b, c, d, _k_root) = setup().await?;
+    let rogue = ed25519_dalek::SigningKey::from_bytes(&[0xE2; 32]);
+    let before = c.ceremony_record_counts();
+    let database = c.state_dir().join("state.redb");
+    let durable_before = std::fs::read(&database)?;
+    for value in 0..32u128 {
+        let open = open_recovery(
+            &rogue,
+            value.to_be_bytes(),
+            a.user_id(),
+            1,
+            "rogue".into(),
+            [0xE3; 32],
+            [0xE4; 32],
+            "flood".into(),
+            T0,
+        );
+        b.deliver_recovery_open(&c.addr()?, &open).await?;
+    }
+    assert_eq!(c.ceremony_record_counts(), before);
+    assert_eq!(std::fs::read(&database)?, durable_before);
+    teardown([a, b, c, d]).await;
+    Ok(())
+}
+
+/// Oversized user-controlled ceremony text is refused before alarm insertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_ceremony_text_is_refused() -> Result<()> {
+    let (a, b, c, d, _k_root) = setup().await?;
+    let claimant = ClaimantDevice::new()?;
+    let before = c.ceremony_record_counts();
+    let err = b
+        .ceremony_sponsor_open(
+            a.user_id(),
+            "x".repeat(900 * 1024),
+            claimant.ceremony_enc(),
+            claimant.new_node(),
+            "test".into(),
+            T0,
+        )
+        .expect_err("oversized claimant text must be refused");
+
+    assert!(
+        err.to_string().contains("claimant display exceeds"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        c.ceremony_record_counts(),
+        before,
+        "refused text must not insert an alarm"
+    );
+    teardown([a, b, c, d]).await;
+    Ok(())
+}
+
+/// A signature-valid oversized open from a real co-trustee is refused on the inbound path
+/// before it can allocate or change durable state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_oversized_recovery_open_has_no_state_or_commit_amplification() -> Result<()> {
+    let (a, b, c, d, _k_root) = setup().await?;
+    let sponsor = user_key_from_seed(&k_userid(&[0xB0; 32]));
+    assert_eq!(sponsor.verifying_key().to_bytes(), b.user_id());
+    let open = open_recovery(
+        &sponsor,
+        [0xE5; 16],
+        a.user_id(),
+        7,
+        "x".repeat(900 * 1024),
+        [0xE6; 32],
+        [0xE7; 32],
+        "oversized inbound".into(),
+        T0,
+    );
+    let before = c.ceremony_record_counts();
+    let database = c.state_dir().join("state.redb");
+    let durable_before = std::fs::read(&database)?;
+    b.deliver_recovery_open(&c.addr()?, &open).await?;
+    assert_eq!(c.ceremony_record_counts(), before);
+    assert_eq!(std::fs::read(&database)?, durable_before);
+    teardown([a, b, c, d]).await;
+    Ok(())
+}
+
+/// The inbound path applies the five-per-subject limit before it inserts an alarm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn inbound_recovery_open_is_rate_limited_before_alarm() -> Result<()> {
+    let (a, b, c, d, _k_root) = setup().await?;
+    let subject = a.user_id();
+    let claimant = ClaimantDevice::new()?;
+
+    for n in 0..5 {
+        let (open, _id) = b.ceremony_sponsor_open(
+            subject,
+            format!("claimant {n}"),
+            claimant.ceremony_enc(),
+            claimant.new_node(),
+            "rate-limit test".into(),
+            T0 + n,
+        )?;
+        b.deliver_recovery_open(&c.addr()?, &open).await?;
+    }
+    assert_eq!(
+        c.ceremony_record_counts().1,
+        5,
+        "the first five authenticated opens create alarms"
+    );
+
+    let (sixth, _id) = d.ceremony_sponsor_open(
+        subject,
+        "sixth claimant".into(),
+        claimant.ceremony_enc(),
+        claimant.new_node(),
+        "must be limited".into(),
+        T0 + 5,
+    )?;
+    d.deliver_recovery_open(&c.addr()?, &sixth).await?;
+    assert_eq!(
+        c.ceremony_record_counts().1,
+        5,
+        "a limited open must not insert an alarm"
+    );
+
+    teardown([a, b, c, d]).await;
     Ok(())
 }
 

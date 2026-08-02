@@ -4,12 +4,14 @@
 export interface StatusSnapshot {
 	node_id: string;
 	addr: string[];
-	friends: { count: number; list: string[] };
+	friends: { count: number; list: string[]; grants: FriendGrant[] };
+	peers: PeerOption[];
 	vaults: { published: PublishedVault[]; held_replicas: string[] };
-	share_health: { recovery_sets_owned: number; shares_held: number };
+	share_health: { recovery_sets_owned: number; shares_held: number; sets: RecoverySetStatus[]; recovery: RecoveryHealth[] };
 	// W3 (§8, §7.3): per owned recovery set, the minted grants (rsid + trustees) this owner
 	// retains - the set W15 can print paper cards for - plus subjects whose grants we hold.
 	recovery_grants: { minted: MintedGrant[]; held: string[] };
+	ceremonies: RecoveryCeremony[];
 	// W5 (§9.3 step 4): open trustee re-splits after an unfriend, streamed live.
 	resplits: ResplitStatus[];
 	// §9.3.4: re-splits detected on unfriend but awaiting the user's prompt to start.
@@ -17,6 +19,52 @@ export interface StatusSnapshot {
 	reachability: string;
 	relay_networks: number;
 	relay_diversity_warning: boolean;
+}
+
+export interface FriendGrant {
+	user: string;
+	grant_bytes: number;
+}
+
+export interface PeerOption {
+	user: string;
+	display: string;
+	node: string;
+	addrs: string[];
+}
+
+export interface RecoveryHealth {
+	rsid: number;
+	live: number;
+	target: number;
+	recommendation: string;
+	needed: number;
+}
+
+export interface RecoverySetStatus {
+	rsid: number;
+	scope: RecoveryScope;
+	threshold: number;
+	issued: number;
+	trustees: { user: string; delivered: boolean }[];
+	warnings: string[];
+}
+
+/** A live recovery ceremony that this device has seen. */
+export interface RecoveryCeremony {
+	ceremony_id: string;
+	subject: string;
+	sponsor: string;
+	claimant_display: string;
+	reason: string;
+	phase: string;
+	approvals: number;
+	threshold: number;
+	is_self_subject: boolean;
+	takeover: boolean;
+	trustee: boolean;
+	approved: boolean;
+	alarm: boolean;
 }
 
 /** One owned recovery set's minted grant surface (W3): which trustees hold a share and
@@ -80,6 +128,7 @@ export interface UnfriendResult {
 export interface PublishedVault {
 	vid: string;
 	epoch: number;
+	name: string;
 }
 
 export interface FriendsList {
@@ -115,10 +164,21 @@ export interface FetchGrantResult {
 	written: string[];
 }
 
+export interface SyncResult {
+	restored: { vid: string; epoch: number; out_dir: string }[];
+}
+
 export type RecoveryScope = { kind: 'root' } | { kind: 'vault'; vid: string };
 
 export interface SplitResult {
 	shares: string[];
+	warnings: string[];
+}
+
+export interface TrusteeSplitResult {
+	rsid: number;
+	delivered: string[];
+	undelivered: string[];
 	warnings: string[];
 }
 
@@ -130,6 +190,7 @@ export interface CeremonyOpenResult {
 	ceremony_id: string;
 	open_hex: string;
 	fanout_reached: number;
+	sponsor_package: string;
 }
 
 export interface CeremonyApproveResult {

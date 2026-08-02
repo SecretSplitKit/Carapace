@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   carapaced run --state-dir <PATH> [--publish <DIR> [--watch] --vid <64-hex>] [--api-port <PORT>]
+//!   carapaced claimant --state-dir <PATH> [--api-port <PORT>]
 //!
 //! `run` loads/generates the device state, starts the daemon (serving the blob
 //! store + `carapace/1` control protocol), optionally publishes a vault, starts the
@@ -14,20 +15,145 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use carapaced::{Daemon, NetConfig, State};
+use zeroize::Zeroizing;
+
+#[path = "carapaced/state_ops.rs"]
+mod state_ops;
 
 /// Default bind for the embedded relay when `--relay` is given no explicit socket.
 const DEFAULT_RELAY_BIND: &str = "0.0.0.0:9991";
+
+trait PassphrasePrompt {
+    fn read(&self) -> Result<Zeroizing<String>>;
+}
+
+struct ControllingTerminalPrompt;
+
+impl PassphrasePrompt for ControllingTerminalPrompt {
+    fn read(&self) -> Result<Zeroizing<String>> {
+        #[cfg(unix)]
+        let _terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .context("terminal-passphrase mode requires a controlling terminal")?;
+        let passphrase = Zeroizing::new(
+            rpassword::prompt_password("Carapace identity passphrase: ")
+                .context("read passphrase from the controlling terminal")?,
+        );
+        ensure_nonempty_passphrase(passphrase)
+    }
+}
+
+fn ensure_nonempty_passphrase(passphrase: Zeroizing<String>) -> Result<Zeroizing<String>> {
+    if passphrase.is_empty() {
+        bail!("the terminal passphrase is empty");
+    }
+    Ok(passphrase)
+}
+
+fn read_operator_passphrase(prompt: &dyn PassphrasePrompt) -> Result<Zeroizing<String>> {
+    ensure_nonempty_passphrase(prompt.read()?)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("run") => run(args.collect()).await,
-        Some(other) => bail!("unknown command {other:?}; try: carapaced run --state-dir <PATH>"),
-        None => bail!(
-            "usage: carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>] [--api-port <PORT>]"
-        ),
+        Some("claimant") => claimant(args.collect()).await,
+        Some("inspect-state") => state_ops::inspect_state(args.collect()),
+        Some("initialize-empty") => state_ops::initialize_empty(args.collect()),
+        Some("restore-backup") => state_ops::restore_backup(args.collect()),
+        Some("reset-security-state") => state_ops::reset_security_state(args.collect()),
+        Some("migrate-legacy-state") => state_ops::migrate_legacy_state(args.collect()),
+        Some("migrate-keys") => migrate_keys(args.collect()),
+        Some(other) => {
+            bail!("unknown command {other:?}; try: carapaced run, claimant, or a state operator command")
+        }
+        None => bail!("usage: carapaced <run|claimant|inspect-state|initialize-empty|restore-backup|reset-security-state|migrate-legacy-state|migrate-keys> --state-dir <PATH>"),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClaimantArgs {
+    state_dir: PathBuf,
+    api_port: u16,
+}
+
+fn parse_claimant_args(rest: Vec<String>) -> Result<ClaimantArgs> {
+    let mut state_dir = None;
+    let mut api_port = 0;
+    let mut it = rest.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--state-dir" => {
+                state_dir = Some(it.next().context("--state-dir needs a value")?.into())
+            }
+            "--api-port" => {
+                api_port = it
+                    .next()
+                    .context("--api-port needs a value")?
+                    .parse()
+                    .context("--api-port must be a u16 port")?
+            }
+            other => bail!("unknown claimant flag {other:?}"),
+        }
+    }
+    Ok(ClaimantArgs {
+        state_dir: state_dir.context("--state-dir is required")?,
+        api_port,
+    })
+}
+
+async fn claimant(rest: Vec<String>) -> Result<()> {
+    let args = parse_claimant_args(rest)?;
+    let api = carapace_api::serve_claimant(&args.state_dir, args.api_port).await?;
+    println!("claimant API: {}", api.url());
+    println!(
+        "claimant API token: {} (bearer, 0600)",
+        args.state_dir.join("claimant-api-token").display()
+    );
+    println!("claimant recovery is active; press Ctrl-C to stop");
+    wait_for_stop().await?;
+    api.shutdown();
+    Ok(())
+}
+
+fn migrate_keys(rest: Vec<String>) -> Result<()> {
+    let mut state_dir: Option<PathBuf> = None;
+    let mut confirmed: Option<PathBuf> = None;
+    let mut it = rest.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--state-dir" => {
+                state_dir = Some(it.next().context("--state-dir needs a value")?.into())
+            }
+            "--confirm-state-dir" => {
+                confirmed = Some(
+                    it.next()
+                        .context("--confirm-state-dir needs a value")?
+                        .into(),
+                )
+            }
+            other => bail!("unknown migrate-keys flag {other:?}"),
+        }
+    }
+    let state_dir = state_dir.context("--state-dir is required")?;
+    let confirmed = confirmed.context("--confirm-state-dir is required")?;
+    let canonical = std::fs::canonicalize(&state_dir)
+        .with_context(|| format!("resolve state directory {state_dir:?}"))?;
+    let confirmed_canonical = std::fs::canonicalize(&confirmed)
+        .with_context(|| format!("resolve confirmed state directory {confirmed:?}"))?;
+    if canonical != confirmed_canonical {
+        bail!("confirmed state directory does not match --state-dir");
+    }
+    let backup = State::migrate_legacy_keys(&canonical)?;
+    println!(
+        "key migration complete; protected backup: {}",
+        backup.display()
+    );
+    Ok(())
 }
 
 async fn run(rest: Vec<String>) -> Result<()> {
@@ -40,6 +166,8 @@ async fn run(rest: Vec<String>) -> Result<()> {
     let mut relays: Vec<carapaced::RelayUrl> = Vec::new();
     let mut run_relay: Option<SocketAddr> = None;
     let mut relay_host: Option<String> = None;
+    let mut insecure_plaintext_keys = false;
+    let mut terminal_passphrase = false;
 
     let mut it = rest.into_iter().peekable();
     while let Some(flag) = it.next() {
@@ -80,6 +208,8 @@ async fn run(rest: Vec<String>) -> Result<()> {
             "--relay-host" => {
                 relay_host = Some(it.next().context("--relay-host needs a host or ip")?)
             }
+            "--insecure-plaintext-keys" => insecure_plaintext_keys = true,
+            "--terminal-passphrase" => terminal_passphrase = true,
             // A friend's self-hosted relay URL to consume (repeatable). These form
             // this node's usable relay set for relay fallback (§6).
             "--relay-url" => relays.push(
@@ -93,8 +223,27 @@ async fn run(rest: Vec<String>) -> Result<()> {
     }
 
     let state_dir = state_dir.context("--state-dir is required")?;
-    let state = State::load_or_generate(&state_dir)?;
     let networked = bind.is_some() || run_relay.is_some() || !relays.is_empty();
+    if insecure_plaintext_keys && networked {
+        bail!("--insecure-plaintext-keys cannot be used with non-loopback or relay operation");
+    }
+    if insecure_plaintext_keys && terminal_passphrase {
+        bail!("--terminal-passphrase cannot be combined with --insecure-plaintext-keys");
+    }
+    let state = if insecure_plaintext_keys {
+        eprintln!(
+            "carapace: WARNING insecure development mode stores identity secrets in local files"
+        );
+        State::load_or_generate_insecure(&state_dir)?
+    } else if terminal_passphrase {
+        eprintln!(
+            "carapace: WARNING terminal-passphrase mode stays locked after unattended restart; recovery takeover delay and alarms cannot run while locked"
+        );
+        let passphrase = read_operator_passphrase(&ControllingTerminalPrompt)?;
+        State::load_protected_local(&state_dir, passphrase.as_bytes())?
+    } else {
+        State::load_or_generate(&state_dir)?
+    };
     let daemon = Arc::new(if networked {
         let cfg = NetConfig {
             bind,
@@ -194,4 +343,59 @@ fn hex(b: &[u8]) -> String {
         let _ = write!(s, "{byte:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn values(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn claimant_arguments_default_to_an_ephemeral_port() {
+        let parsed = parse_claimant_args(values(&["--state-dir", "/tmp/claimant"])).unwrap();
+        assert_eq!(parsed.state_dir, PathBuf::from("/tmp/claimant"));
+        assert_eq!(parsed.api_port, 0);
+    }
+
+    #[test]
+    fn claimant_arguments_accept_an_api_port() {
+        let parsed = parse_claimant_args(values(&[
+            "--state-dir",
+            "/tmp/claimant",
+            "--api-port",
+            "4711",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.api_port, 4711);
+    }
+
+    #[test]
+    fn claimant_arguments_reject_missing_and_extra_values() {
+        let missing = parse_claimant_args(Vec::new()).unwrap_err();
+        assert!(missing.to_string().contains("--state-dir is required"));
+        let extra =
+            parse_claimant_args(values(&["--state-dir", "/tmp/c", "--bind", "x"])).unwrap_err();
+        assert!(extra.to_string().contains("unknown claimant flag"));
+    }
+
+    struct FakePrompt(&'static str);
+    impl PassphrasePrompt for FakePrompt {
+        fn read(&self) -> Result<Zeroizing<String>> {
+            Ok(Zeroizing::new(self.0.to_string()))
+        }
+    }
+
+    #[test]
+    fn terminal_passphrase_prompt_rejects_empty_input() {
+        assert!(read_operator_passphrase(&FakePrompt("")).is_err());
+        assert_eq!(
+            read_operator_passphrase(&FakePrompt("operator secret"))
+                .unwrap()
+                .as_str(),
+            "operator secret"
+        );
+    }
 }

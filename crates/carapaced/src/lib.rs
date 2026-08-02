@@ -18,10 +18,204 @@
 //! third party with no `K_content` gets explicit per-chunk keys, never
 //! `K_manifest`.
 
+mod ops;
 mod persist;
 mod state;
 
 pub use state::State;
+
+/// A read-only validation summary for an existing daemon state directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateInspection {
+    /// Number of owned vault records that name durable encrypted blobs.
+    pub owned_vaults: usize,
+    /// Number of replica vaults held for friends.
+    pub held_replicas: usize,
+    /// Number of recovery shares held for other users.
+    pub held_shares: usize,
+    /// Number of owned recovery sets.
+    pub recovery_sets: usize,
+    /// Number of active or retained recovery ceremonies.
+    pub ceremonies: usize,
+}
+
+/// Result of one durable encrypted-blob garbage-collection run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GarbageCollectionReport {
+    /// Blob ids protected as current vault, replica, or permanent disclosure data.
+    pub retained_blobs: usize,
+    /// Superseded owned-chunk authorization rows removed before the blob sweep.
+    pub removed_authorizations: usize,
+}
+
+/// Validate an existing state database without starting networking or changing state.
+///
+/// This opens every durable category, authenticates each sealed row with `K_root`, and
+/// checks that the sealed database identity matches the supplied root and node keys.
+pub fn inspect_existing_state(state: &State) -> Result<StateInspection> {
+    let state_dir = state
+        .dir
+        .as_ref()
+        .context("state inspection requires a durable state directory")?;
+    inspect_state_database(state, &state_dir.join("state.redb"))
+}
+
+/// Validate one candidate state database against the supplied identity without mutation.
+pub fn inspect_state_database(state: &State, db_path: &Path) -> Result<StateInspection> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static INSPECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+    ensure!(
+        db_path.is_file(),
+        "state database {db_path:?} does not exist"
+    );
+    let parent = db_path.parent().context("state database has no parent")?;
+    let copy_path = parent.join(format!(
+        ".carapace-inspect-{}-{}",
+        std::process::id(),
+        INSPECTION_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    copy_private_database(db_path, &copy_path)
+        .with_context(|| format!("create read-only inspection copy of {db_path:?}"))?;
+    struct RemoveCopy(PathBuf);
+    impl Drop for RemoveCopy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = RemoveCopy(copy_path.clone());
+    let db = persist::open_existing_db(&copy_path)?;
+    let identity = persist::StateIdentity {
+        user: state.user_key().verifying_key().to_bytes(),
+        node: state.node_key.verifying_key().to_bytes(),
+    };
+    let loaded = persist::load_all_read_only(&db, &state.k_root, &identity)?;
+    Ok(StateInspection {
+        owned_vaults: loaded.vault_blob_sources.len(),
+        held_replicas: loaded.shared.held.len(),
+        held_shares: loaded.shared.held_shares.len(),
+        recovery_sets: loaded.shared.split_states.len(),
+        ceremonies: loaded.shared.ceremonies.len(),
+    })
+}
+
+#[cfg(unix)]
+fn copy_private_database(source: &Path, destination: &Path) -> Result<()> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    let source = openat(
+        CWD,
+        source,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let destination = openat(
+        CWD,
+        destination,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(std::io::Error::from)?;
+    let mut source = std::fs::File::from(source);
+    let mut destination = std::fs::File::from(destination);
+    std::io::copy(&mut source, &mut destination)?;
+    destination.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_private_database(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::copy(source, destination)?;
+    Ok(())
+}
+
+/// Create a new, identity-bound empty database without starting networking.
+pub fn initialize_empty_state(state: &State) -> Result<()> {
+    let state_dir = state
+        .dir
+        .as_ref()
+        .context("state initialization requires a durable state directory")?;
+    state::ensure_private_directory(state_dir)?;
+    let db_path = state_dir.join("state.redb");
+    ensure!(
+        !db_path.exists(),
+        "state database {db_path:?} already exists"
+    );
+    let blobs = state_dir.join("blobs");
+    if blobs.exists() {
+        ensure!(
+            blobs.read_dir()?.next().is_none(),
+            "blob data exists in {blobs:?}; inspect or restore state instead"
+        );
+    }
+
+    let db = persist::open_db(&db_path)?;
+    let shared = Shared::default();
+    let docs = DocStore::default();
+    let identity = persist::StateIdentity {
+        user: state.user_key().verifying_key().to_bytes(),
+        node: state.node_key.verifying_key().to_bytes(),
+    };
+    let initialized = persist::try_commit_all(&db, &shared, &docs, &state.k_root, &identity);
+    drop(db);
+    if let Err(error) = initialized {
+        let _ = std::fs::remove_file(&db_path);
+        return Err(error).context("initialize empty state database");
+    }
+    if let Err(error) = inspect_state_database(state, &db_path) {
+        let _ = std::fs::remove_file(&db_path);
+        return Err(error).context("verify empty state database");
+    }
+    Ok(())
+}
+
+/// Explicitly migrate a validated legacy database to complete identity-bound schema 2.
+///
+/// The caller must obtain operator confirmation before this function. It creates and
+/// synchronizes a protected backup before the one-transaction migration.
+pub fn migrate_legacy_state(state: &State) -> Result<PathBuf> {
+    let state_dir = state
+        .dir
+        .as_ref()
+        .context("legacy migration requires a durable state directory")?;
+    let db_path = state_dir.join("state.redb");
+    inspect_state_database(state, &db_path).context("validate legacy state before migration")?;
+    let backup = state_dir.join("state.redb.before-schema-2");
+    ensure!(!backup.exists(), "legacy migration backup already exists");
+    copy_private_database(&db_path, &backup).context("create protected migration backup")?;
+    #[cfg(unix)]
+    std::fs::File::open(state_dir)?.sync_all()?;
+
+    let db = persist::open_existing_db(&db_path)?;
+    let identity = persist::StateIdentity {
+        user: state.user_key().verifying_key().to_bytes(),
+        node: state.node_key.verifying_key().to_bytes(),
+    };
+    persist::migrate_legacy(&db, &state.k_root, &identity)?;
+    persist::load_all(&db, &state.k_root, &identity)
+        .context("verify migrated schema-2 database")?;
+    Ok(backup)
+}
+
+/// Activate a recovered identity without exposing either seed outside this process.
+///
+/// This stores both seeds in the operating-system credential store, creates an empty
+/// identity-bound state database, and verifies that database. It refuses to replace any
+/// existing identity or durable state. After this function succeeds, drop the returned
+/// state and start the normal daemon from `state_dir`.
+pub fn activate_recovered_identity(
+    state_dir: &Path,
+    node_seed: [u8; 32],
+    k_root: [u8; 32],
+) -> Result<State> {
+    let state = State::install_recovered(state_dir, node_seed, k_root)?;
+    if let Err(error) = initialize_empty_state(&state) {
+        state.remove_installed_recovery();
+        return Err(error).context("initialize recovered identity state");
+    }
+    Ok(state)
+}
 
 /// Re-export so callers without an `iroh` dependency (e.g. the CLI) can parse
 /// friends' relay URLs for [`Daemon::start_on`].
@@ -49,10 +243,10 @@ use carapace_recovery::{
     verify_share_grant, CeremonyPhase, CeremonyState, PolicyWarning, RecoveryRateLimiter,
 };
 use carapace_replica::{
-    build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
-    Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_POR_FAIL_LIMIT, DEFAULT_POR_INTERVAL_SECS,
-    DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY, DEFAULT_RATE_REFILL_PER_SEC, DEFAULT_WIDE_EVERY,
-    MAX_REPLICA_BLOBS,
+    build_audit, build_wide_audit, verify_bao_range_responses, Audit, AuditAction, AuditTracker,
+    Health, Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_POR_FAIL_LIMIT,
+    DEFAULT_POR_INTERVAL_SECS, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
+    DEFAULT_RATE_REFILL_PER_SEC, DEFAULT_WIDE_EVERY, MAX_REPLICA_BLOBS,
 };
 use carapace_share::{
     answer_attest_challenge, build_attest_challenge, AttestTracker, Share, ShareAction,
@@ -98,6 +292,43 @@ const POR_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// unreachable peer's QUIC connect can hang for ~30 s, stalling the whole round;
 /// bounding it makes an offline peer fail fast to the "unreachable" path (C1).
 const POR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of current, replica, and disclosed blobs protected in one GC run.
+const MAX_GC_LIVE_BLOBS: usize = 1_000_000;
+
+/// Maximum UTF-8 byte length for each user-controlled ceremony text field.
+const MAX_CEREMONY_TEXT_BYTES: usize = 1_024;
+
+/// Maximum number of active alarm or pre-open abort records held in memory.
+const MAX_CEREMONY_RECORDS: usize = 1_024;
+
+/// Maximum concurrent tracked ceremonies for one recovery subject.
+const MAX_ACTIVE_CEREMONIES_PER_SUBJECT: usize = 8;
+
+/// Maximum peers contacted by one recovery-open fan-out operation.
+const MAX_CEREMONY_FANOUT: usize = 128;
+
+/// Maximum failure count exposed for one maintenance round.
+const MAX_OPERATION_FAILURE_COUNT: usize = 4_096;
+
+/// Maximum number of distinct signer aborts retained for one ceremony.
+const MAX_ABORTS_PER_CEREMONY: usize = 64;
+
+/// Durable recovery-open history bounds and terminal replay protection.
+const RECOVERY_RATE_WINDOW_SECS: u64 = 24 * 60 * 60;
+const MAX_RECOVERY_OPENS_PER_WINDOW: usize = 5;
+const MAX_RECOVERY_RATE_KEYS: usize = 4_096;
+const MAX_CEREMONY_TOMBSTONES: usize = 4_096;
+const CEREMONY_COMPLETION_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Default minimum time for the owner to see and stop an account-recovery attempt.
+pub const MIN_RECOVERY_DELAY_SECS: u64 = 72 * 60 * 60;
+
+/// Maximum trustee roster size accepted by recovery orchestration.
+const MAX_RECOVERY_TRUSTEES: usize = 32;
+
+/// Maximum cached peer addresses and authenticated blob-reader identities.
+const MAX_PEER_RECORDS: usize = 4_096;
 
 /// §9.3.4 re-split liveness window: a remaining friend counts as "online now" on the
 /// re-split status surface only if it answered us within this window. Sized to a few
@@ -209,6 +440,48 @@ pub struct MaintenanceReport {
     pub errors: Vec<String>,
 }
 
+/// Identity-free, bounded-capacity inputs for local operational metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationalCapacity {
+    /// Total replica bytes this device grants to current friends.
+    pub replica_grant_bytes: u64,
+    /// Owner-side replica assignments across all current vaults.
+    pub replica_assignments: usize,
+    /// Owned vaults whose blob source needs a fresh fetch.
+    pub storage_refetch_needed: usize,
+    /// Active tracked recovery ceremonies.
+    pub ceremony_active: usize,
+    /// Durable terminal ceremony replay records.
+    pub ceremony_tombstones: usize,
+    /// Subjects with durable recovery-open rate history.
+    pub ceremony_subject_rate_keys: usize,
+    /// Sponsors with durable recovery-open rate history.
+    pub ceremony_sponsor_rate_keys: usize,
+    /// Global active-ceremony capacity.
+    pub ceremony_capacity: usize,
+    /// Per-subject active-ceremony capacity.
+    pub ceremony_per_subject_capacity: usize,
+    /// Terminal replay-record capacity.
+    pub ceremony_tombstone_capacity: usize,
+    /// Maximum peers contacted by one recovery-open fan-out.
+    pub ceremony_fanout_capacity: usize,
+}
+
+/// Bounded, identity-free maintenance history for the authenticated metrics API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationalHistory {
+    /// Wall-clock time of the last completed maintenance round, or zero before one runs.
+    pub last_maintenance_at: u64,
+    /// Wall-clock time of the last failed maintenance item, or zero when none is known.
+    pub last_failure_at: u64,
+    /// Number of failed items in the last maintenance round.
+    pub last_failure_count: usize,
+    /// Consecutive maintenance rounds that had at least one failed item.
+    pub consecutive_failed_rounds: u64,
+    /// True if blob garbage collection succeeded in the last completed round.
+    pub last_gc_succeeded: bool,
+}
+
 /// Outcome of an owner-side split-and-grant (§8, W3): which trustees were reached and
 /// hold a fresh grant, plus any §8.3 issuance policy warnings.
 #[derive(Clone, Debug, Default)]
@@ -237,6 +510,54 @@ pub struct RecoveryGrantReport {
     /// The announce refs currently carried in the trustees' grants: `(vid, epoch)`
     /// per referenced vault. Advances as the owner publishes new epochs (§10.2).
     pub refs: Vec<([u8; 32], u64)>,
+}
+
+/// Complete authoritative metadata for one durable owner recovery set.
+#[derive(Clone, Debug)]
+pub struct RecoverySetReport {
+    pub rsid: u64,
+    pub scope: RecoveryScope,
+    pub threshold: usize,
+    pub issued: usize,
+    pub trustees: Vec<([u8; 32], bool)>,
+    pub warnings: Vec<PolicyWarning>,
+}
+
+/// One established friend's authoritative local replica-storage grant.
+#[derive(Clone, Copy, Debug)]
+pub struct FriendGrantReport {
+    pub user: [u8; 32],
+    pub grant_bytes: u64,
+}
+
+/// One authoritative peer option for local control clients.
+#[derive(Clone, Debug)]
+pub struct PeerOption {
+    /// Friend user identity.
+    pub user: [u8; 32],
+    /// Display name from the newest verified contact card.
+    pub display: String,
+    /// One delegated node identity.
+    pub node: [u8; 32],
+    /// Last verified or observed address hints for the node.
+    pub addrs: Vec<String>,
+}
+
+/// One authoritative published-vault option for local control clients.
+#[derive(Clone, Debug)]
+pub struct VaultOption {
+    pub vid: [u8; 32],
+    pub epoch: u64,
+    /// Stable local label derived from the authoritative working directory.
+    pub name: String,
+}
+
+/// One verified trustee endpoint for a claimant ceremony package.
+#[derive(Clone, Debug)]
+pub struct ClaimantTrusteeHint {
+    pub user: [u8; 32],
+    pub node: [u8; 32],
+    pub addrs: Vec<String>,
 }
 
 /// The §10.2 share-health surface for one owned recovery set, for the status API.
@@ -270,6 +591,8 @@ pub struct PorRound {
     /// Whether a repair (re-replication + re-announce) actually changed the member
     /// set as a result of this round's losses.
     pub repaired: bool,
+    /// Identity-free count of replicas whose latest probe latency shifted far above baseline.
+    pub latency_anomalies: usize,
 }
 
 /// A reconstructed vault, returned by [`Daemon::sync_from`].
@@ -404,6 +727,8 @@ struct Shared {
     /// polynomial (a secret, kept beside `k_root`) so `recovery_extend` issues further shares
     /// on the same polynomial without re-splitting.
     split_states: HashMap<u64, RecoverySet>,
+    /// Transient reservation while an asynchronous root split delivers its grants.
+    root_split_pending: bool,
     /// Recovery ceremonies this device tracks AS A TRUSTEE, keyed by ceremony id: the state
     /// machine plus this trustee's approval/takeover flags. The delay-gated release reads
     /// `state.can_release` here.
@@ -420,6 +745,14 @@ struct Shared {
     /// subject. A per-signer-deduped list, not a single slot, so a stranger's inert abort
     /// cannot crowd out the authoritative subject abort.
     aborted_ceremonies: HashMap<[u8; 16], Vec<CeremonyAbort>>,
+    /// Durable sliding-window histories. Both the subject and sponsor budgets must pass.
+    ceremony_subject_rate: HashMap<[u8; 32], Vec<u64>>,
+    ceremony_sponsor_rate: HashMap<[u8; 32], Vec<u64>>,
+    /// Compact terminal records stop replay from recreating removed ceremony state.
+    ceremony_tombstones: HashMap<[u8; 16], CeremonyTombstone>,
+    /// Ceremonies for which this trustee sent a share, bound to the exact recovered node from
+    /// the verified `RecoveryOpen`. The active ceremony expiry bounds this admission proof.
+    ceremony_released: HashMap<[u8; 16], [u8; 32]>,
     /// Injected wall clock for the ceremony delay gate (0 = real time). Test-only knob so the
     /// 72 h abort delay is exercised without sleeping; only the ceremony paths read it.
     test_now: u64,
@@ -682,6 +1015,23 @@ struct AlarmRecord {
     takeover: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CeremonyTerminal {
+    Completed,
+    Aborted,
+    Expired,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct CeremonyTombstone {
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    terminal_at: u64,
+    terminal: CeremonyTerminal,
+}
+
 /// One recovery-ceremony row for the status API (§8.5 step 2/6): phase, approvals,
 /// and the alarm flags, so a client can raise the anti-silent-takeover signal and
 /// show ceremony progress. Built from [`Daemon::ceremony_statuses`].
@@ -725,6 +1075,21 @@ pub enum RecoveryScope {
     Vault([u8; 32]),
 }
 
+fn ensure_root_split_available(shared: &Shared, scope: RecoveryScope) -> Result<()> {
+    if !matches!(scope, RecoveryScope::Root) {
+        return Ok(());
+    }
+    ensure!(
+        !shared.root_split_pending
+            && !shared
+                .split_states
+                .values()
+                .any(|set| matches!(set.scope, RecoveryScope::Root)),
+        "an active root recovery split already exists; use the explicit atomic replacement flow"
+    );
+    Ok(())
+}
+
 /// How a node authenticated itself on this daemon's `carapace/1` control stream,
 /// used by the blob-read gate ([`authorize_fetch`]) to bind a raw `iroh-blobs`
 /// dialer's NodeID to a verified identity.
@@ -754,6 +1119,7 @@ struct ControlHandler {
     /// the whole state through it BEFORE any externally visible effect.
     db: Arc<redb::Database>,
     blobs: IrohBlobStore,
+    replica_ingress: PathBuf,
     shared: Arc<RwLock<Shared>>,
     /// Default per-friend storage grant recorded when this node ACCEPTS a friend request;
     /// `serve_replica_store` later enforces it as that friend's replica quota (W1).
@@ -765,6 +1131,8 @@ struct ControlHandler {
     /// announces (store-and-forward) and consults the newest self-card so a revoked own
     /// device presenting an old self-card is refused (W7).
     docs: Arc<Mutex<DocStore>>,
+    /// Fast in-memory inbound limiter. Durable subject and sponsor histories are in `Shared`.
+    recovery_limiter: Arc<Mutex<RecoveryRateLimiter>>,
 }
 
 impl ControlHandler {
@@ -773,7 +1141,16 @@ impl ControlHandler {
     /// `shared`->`docs`. Fail-loud on commit failure.
     fn persist_locked(&self, s: &Shared) {
         let docs = self.docs.lock().expect("docs lock");
-        persist::commit_all(&self.db, s, &docs, &self.k_root);
+        persist::commit_all(
+            &self.db,
+            s,
+            &docs,
+            &self.k_root,
+            &persist::StateIdentity {
+                user: self.self_user,
+                node: self.node_key.verifying_key().to_bytes(),
+            },
+        );
     }
 
     async fn serve(&self, conn: Connection) -> Result<()> {
@@ -901,16 +1278,33 @@ impl ControlHandler {
             let mut s = self.shared.write().expect("shared lock");
             match classify_dialer(&s, &self.self_user, card, remote, now, newest_self.as_ref()) {
                 Some(auth) => {
-                    s.blob_auth.insert(*remote, auth);
-                    Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    if s.blob_auth.contains_key(remote) || s.blob_auth.len() < MAX_PEER_RECORDS {
+                        s.blob_auth.insert(*remote, auth);
+                        Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    } else {
+                        Serve::No
+                    }
                 }
                 // W8/§7.4 a + §8.4: a dialer served no ordinary docs may be a delegated device
                 // of an owner whose vault we replicate. Record ReplicaDevice so its fetches of
                 // that owner's replica-held chunks are admitted, and serve back the retained
                 // owner card + announce so a recovering owner-device (that lost every original
                 // device) can drive `select_targets` and satisfy the C1 delegated-signer check.
+                None if recovery_claimant_device(&s, card, remote, now) => {
+                    if s.blob_auth.contains_key(remote) || s.blob_auth.len() < MAX_PEER_RECORDS {
+                        s.blob_auth.insert(*remote, BlobAuth::Friend(card.user));
+                        Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    } else {
+                        Serve::No
+                    }
+                }
                 None => match replica_owner_device(&s, card, remote, now) {
                     Some(owner) => {
+                        if !s.blob_auth.contains_key(remote)
+                            && s.blob_auth.len() >= MAX_PEER_RECORDS
+                        {
+                            return Ok(());
+                        }
                         s.blob_auth.insert(*remote, BlobAuth::ReplicaDevice(owner));
                         let cards: Vec<ContactCard> =
                             s.friends.get(&owner).cloned().into_iter().collect();
@@ -1090,31 +1484,27 @@ impl ControlHandler {
         // size (<= the granted quota), so the store never grows past the quota.
         let count = read_u64(recv).await?;
         ensure!(
-            count <= MAX_REPLICA_BLOBS,
-            "replica push declared {count} blobs, over the cap of {MAX_REPLICA_BLOBS}"
+            count > 0 && count <= MAX_REPLICA_BLOBS,
+            "replica push declared invalid blob count {count}; valid range is 1..={MAX_REPLICA_BLOBS}"
         );
-        let mut received: u64 = 0;
-        // S3: do not pre-reserve `count` (peer-declared, up to MAX_REPLICA_BLOBS): a
-        // tiny push could force a ~32 MiB reservation. Grow as blobs arrive; the real
-        // bound is the `received <= inv.approx_bytes` byte cap below.
-        let mut stored: Vec<[u8; 32]> = Vec::new();
+        let mut stage =
+            ReplicaIngressStage::create(&self.replica_ingress, count, inv.approx_bytes, &announce)?;
         for i in 0..count {
-            let bytes = read_blob(recv).await?;
-            received = received.saturating_add(bytes.len() as u64);
+            stage.receive(recv, i).await?;
+        }
+        stage.finish()?;
+        // Hold through the durable replica-state commit. GC uses the same store guard, so it
+        // cannot remove these write-time tags before replica roots reach state.redb.
+        let _blob_mutation = self.blobs.begin_durable_mutation().await;
+        let mut stored: Vec<[u8; 32]> = Vec::new();
+        for (path, expected_hash) in stage.files() {
+            let bytes = std::fs::read(path)?;
+            let stored_hash = self.blobs.add(&bytes).await?;
             ensure!(
-                received <= inv.approx_bytes,
-                "replica push exceeded its advertised {} bytes",
-                inv.approx_bytes
+                stored_hash == *expected_hash,
+                "served blob hash changed after validation"
             );
-            if i == 0 {
-                let env = ManifestEnvelope::from_bytes(&bytes)
-                    .map_err(|e| anyhow::anyhow!("replica envelope decode: {e}"))?;
-                env.verify()
-                    .map_err(|e| anyhow::anyhow!("replica envelope bad sig: {e}"))?;
-            }
-            // The iroh blob hash is the ChunkID (and the envelope digest for i==0);
-            // record it so the fetch gate can bind it to this replica-held vault (W8).
-            stored.push(self.blobs.add(&bytes).await?);
+            stored.push(stored_hash);
         }
         // Durability barrier: force the FsStore to commit the received blobs so
         // the §3.2.3 ordering below is real — never persist replica bookkeeping
@@ -1242,44 +1632,116 @@ impl ControlHandler {
     /// `open.ceremony_enc`. The delay clock anchors to a LOCAL `first_seen` never reset by a
     /// re-send, so a backdated sponsor `opened_at` cannot collapse the abort window (E4).
     async fn serve_recovery_open(&self, open: RecoveryOpen, send: &mut SendStream) -> Result<()> {
-        if open.verify().is_err() {
+        if open.verify().is_err() || !ceremony_text_is_valid(&open) {
             send.finish()?; // an unsigned/forged open is neither an alarm nor trackable
             return Ok(());
+        }
+        // Authenticate a new trustee-tracked open against its held grant before it can
+        // consume the subject's inbound rate budget. Charge before alarm insertion, and
+        // do not charge a repeat request for a ceremony that is already tracked.
+        let inbound_rate_subject = {
+            let s = self.shared.read().expect("shared lock");
+            if s.ceremonies.contains_key(&open.ceremony_id)
+                || s.ceremony_tombstones.contains_key(&open.ceremony_id)
+            {
+                None
+            } else {
+                let now = ceremony_now(&s);
+                s.held_grants.get(&open.subject).and_then(|grant| {
+                    validated_recovery_open(&self.self_user, &open, grant, now)
+                        .ok()
+                        .map(|_| (open.subject, now))
+                })
+            }
+        };
+        if let Some((subject, now)) = inbound_rate_subject {
+            let accepted = self
+                .recovery_limiter
+                .lock()
+                .expect("recovery limiter lock")
+                .check_and_record(subject, now)
+                .is_ok();
+            if !accepted {
+                let mut s = self.shared.write().expect("shared lock");
+                if finish_ceremony(
+                    &mut s,
+                    open.ceremony_id,
+                    open.subject,
+                    open.by,
+                    now,
+                    CeremonyTerminal::Rejected,
+                ) {
+                    self.persist_locked(&s);
+                }
+                send.finish()?;
+                return Ok(());
+            }
         }
         let mut share_to_send: Option<CeremonyShare> = None;
         {
             let mut s = self.shared.write().expect("shared lock");
             let now = ceremony_now(&s);
+            if s.ceremony_tombstones.contains_key(&open.ceremony_id) {
+                drop(s);
+                send.finish()?;
+                return Ok(());
+            }
             let is_self = open.subject == self.self_user;
             // Does the SPONSOR qualify for a durable alarm? Mirrors persist::enc_alarms's
             // bound and gates whether a stranger's open may force a full-state commit at all
             // (else an unauthenticated dialer spraying ceremony ids fsyncs per dial). The
             // subject is NOT a qualifier - it is public, so an attacker would set it to us.
-            let sponsor_qualifies = s.held_grants.contains_key(&open.by)
-                || s.friends.contains_key(&open.by)
-                || self
-                    .docs
-                    .lock()
-                    .expect("docs lock")
-                    .card(&open.by)
-                    .is_some();
+            let sponsor_qualifies = open.by == self.self_user
+                || signer_qualifies(
+                    &open.by,
+                    &s.held_grants,
+                    &s.friends,
+                    &self.docs.lock().expect("docs lock"),
+                );
+            if !sponsor_qualifies {
+                drop(s);
+                send.finish()?;
+                return Ok(());
+            }
             // Track whether anything DURABLE changed, so a no-op open skips the commit.
             let mut dirty = false;
+            let is_new = !s.ceremonies.contains_key(&open.ceremony_id)
+                && !s.ceremony_alarms.contains_key(&open.ceremony_id);
+            if is_new {
+                if admit_new_ceremony(&mut s, open.subject, open.by, now).is_err() {
+                    if finish_ceremony(
+                        &mut s,
+                        open.ceremony_id,
+                        open.subject,
+                        open.by,
+                        now,
+                        CeremonyTerminal::Rejected,
+                    ) {
+                        self.persist_locked(&s);
+                    }
+                    drop(s);
+                    send.finish()?;
+                    return Ok(());
+                }
+                dirty = true;
+            }
             // Alarm for every observer, deduped by ceremony id. Only a qualifying-sponsor
             // alarm is durable (enc_alarms filters the rest), so only that sets `dirty`.
-            let alarm_new = !s.ceremony_alarms.contains_key(&open.ceremony_id);
-            s.ceremony_alarms
-                .entry(open.ceremony_id)
-                .or_insert_with(|| AlarmRecord {
-                    subject: open.subject,
-                    sponsor: open.by,
-                    claimant_display: open.claimant_display.clone(),
-                    reason: open.reason.clone(),
-                    is_self_subject: is_self,
-                    aborted: false,
-                    takeover: false,
-                });
-            if alarm_new && sponsor_qualifies {
+            let alarm_new = !s.ceremony_alarms.contains_key(&open.ceremony_id)
+                && s.ceremony_alarms.len() < MAX_CEREMONY_RECORDS;
+            if alarm_new {
+                s.ceremony_alarms.insert(
+                    open.ceremony_id,
+                    AlarmRecord {
+                        subject: open.subject,
+                        sponsor: open.by,
+                        claimant_display: open.claimant_display.clone(),
+                        reason: open.reason.clone(),
+                        is_self_subject: is_self,
+                        aborted: false,
+                        takeover: false,
+                    },
+                );
                 dirty = true;
             }
             // A subject-signed abort may have arrived BEFORE this open (unordered fan-out).
@@ -1303,17 +1765,21 @@ impl ControlHandler {
             if let Some(grant) = s.held_grants.get(&open.subject).cloned() {
                 // Track once, anchoring `first_seen` at first observation; a re-send never
                 // resets it (E4).
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    s.ceremonies.entry(open.ceremony_id)
-                {
-                    if let Ok(state) = track_from_grant(&self.self_user, &open, &grant, now) {
-                        e.insert(TrackedCeremony {
-                            state,
-                            approved: false,
-                            takeover: false,
-                        });
-                        // A tracked ceremony (persisted, the E4 delay anchor) was created.
-                        dirty = true;
+                if s.ceremonies.len() < MAX_CEREMONY_RECORDS {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        s.ceremonies.entry(open.ceremony_id)
+                    {
+                        if let Ok(state) =
+                            validated_recovery_open(&self.self_user, &open, &grant, now)
+                        {
+                            e.insert(TrackedCeremony {
+                                state,
+                                approved: false,
+                                takeover: false,
+                            });
+                            // A tracked ceremony (persisted, the E4 delay anchor) was created.
+                            dirty = true;
+                        }
                     }
                 }
                 // Fold in an abort that beat the open: cancel the freshly (or previously)
@@ -1327,7 +1793,11 @@ impl ControlHandler {
                     }
                 }
                 if let Some(tc) = s.ceremonies.get(&open.ceremony_id) {
-                    if tc.approved && !tc.takeover && tc.state.can_release(now) {
+                    if tc.approved
+                        && !tc.takeover
+                        && !ceremony_is_expired(tc, now)
+                        && tc.state.can_release(now)
+                    {
                         // Seal to the claimant's ceremony key, signed with our USER key so the
                         // claimant authenticates us against the roster.
                         if let Ok(cs) = build_ceremony_share(
@@ -1340,6 +1810,13 @@ impl ControlHandler {
                         }
                     }
                 }
+            }
+            if share_to_send.is_some()
+                && s.ceremony_released
+                    .insert(open.ceremony_id, open.new_node)
+                    .is_none()
+            {
+                dirty = true;
             }
             // Commit the ceremony tracking (E4 `first_seen` anchor, alarm, beat-the-open
             // abort/takeover flag) BEFORE sending our share, so a reboot cannot forget an
@@ -1386,28 +1863,68 @@ impl ControlHandler {
     async fn serve_ceremony_abort(&self, ab: CeremonyAbort, send: &mut SendStream) -> Result<()> {
         if ab.verify().is_ok() {
             let mut s = self.shared.write().expect("shared lock");
+            let signer_qualifies = ab.by == self.self_user
+                || signer_qualifies(
+                    &ab.by,
+                    &s.held_grants,
+                    &s.friends,
+                    &self.docs.lock().expect("docs lock"),
+                );
+            if !signer_qualifies {
+                drop(s);
+                send.finish()?;
+                return Ok(());
+            }
+            let mut dirty = false;
+            let mut terminal_abort = None;
             // Record every signature-valid abort keyed by ceremony id even if nothing is
             // tracked yet (unordered fan-out may deliver it before our `RecoveryOpen`);
             // `serve_recovery_open` decides authority (by == subject) later. Dedup by signer so
             // a griefing stranger cannot crowd out the authoritative subject abort.
-            let seen = s.aborted_ceremonies.entry(ab.ceremony_id).or_default();
-            if !seen.iter().any(|a| a.by == ab.by) {
-                seen.push(ab.clone());
+            let can_add_record = s.aborted_ceremonies.contains_key(&ab.ceremony_id)
+                || s.aborted_ceremonies.len() < MAX_CEREMONY_RECORDS;
+            if can_add_record {
+                let seen = s.aborted_ceremonies.entry(ab.ceremony_id).or_default();
+                if seen.len() < MAX_ABORTS_PER_CEREMONY && !seen.iter().any(|a| a.by == ab.by) {
+                    seen.push(ab.clone());
+                    dirty = true;
+                }
             }
             if let Some(tc) = s.ceremonies.get_mut(&ab.ceremony_id) {
-                if tc.state.abort(&ab).is_ok() {
+                if !tc.takeover && tc.state.abort(&ab).is_ok() {
                     tc.takeover = true;
+                    dirty = true;
+                    terminal_abort = Some(tc.state.subject);
                 }
             }
             if let Some(al) = s.ceremony_alarms.get_mut(&ab.ceremony_id) {
-                if ab.by == al.subject {
+                if ab.by == al.subject && (!al.aborted || !al.takeover) {
                     al.aborted = true;
                     al.takeover = true;
+                    dirty = true;
                 }
+            }
+            if let Some(subject) = terminal_abort {
+                let sponsor = s
+                    .ceremony_alarms
+                    .get(&ab.ceremony_id)
+                    .map_or(ab.by, |alarm| alarm.sponsor);
+                let now = ceremony_now(&s);
+                finish_ceremony(
+                    &mut s,
+                    ab.ceremony_id,
+                    subject,
+                    sponsor,
+                    now,
+                    CeremonyTerminal::Aborted,
+                );
+                dirty = true;
             }
             // Persist the recorded abort (bounded to qualifying signers) + takeover flag
             // BEFORE finishing, so it still blocks a release after a reboot.
-            self.persist_locked(&s);
+            if dirty {
+                self.persist_locked(&s);
+            }
         }
         send.finish()?;
         Ok(())
@@ -1589,13 +2106,12 @@ pub struct Daemon {
     /// `publish_merged` never interleave on the same vid. The outer `Mutex` only guards the
     /// get-or-insert of the per-vid lock and is never held across an `.await`.
     publish_locks: Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
-    /// Per-subject recovery-open rate limiter (§8.5): a forged/abusive `RecoveryOpen` cannot
-    /// exhaust an honest subject's budget. Own mutex so `ceremony_open` need not touch `shared`.
-    recovery_limiter: Mutex<RecoveryRateLimiter>,
     /// Serializes §9.3 re-split stand-up + drive so `unfriend` and the maintenance loop never
     /// advance the same re-split concurrently; without it two runs could `begin_resplit` the
     /// same `old_rsid` into two independent fresh splits, burning an rsid + a Shamir split.
     resplit_lock: tokio::sync::Mutex<()>,
+    /// Bounded, identity-free operational history. It never contains error text.
+    operational_history: Mutex<OperationalHistory>,
     /// The embedded relay server (§6), held to keep it running. `Some` iff this node runs a
     /// relay. Probed each maintenance round to drive the advertise/withdraw lifecycle (W6).
     relay: Option<CarapaceRelay>,
@@ -1716,7 +2232,16 @@ impl Daemon {
     /// As [`persist_locked`] but for a caller that already holds the `docs` lock too,
     /// preserving the `shared`->`docs` lock order.
     fn persist_locked_with(&self, s: &Shared, docs: &DocStore) {
-        persist::commit_all(&self.db, s, docs, &self.k_root);
+        persist::commit_all(
+            &self.db,
+            s,
+            docs,
+            &self.k_root,
+            &persist::StateIdentity {
+                user: self.user_id(),
+                node: self.node_id(),
+            },
+        );
     }
 
     /// Bind the endpoint from `state`, start serving the blob store and the `carapace/1`
@@ -1764,6 +2289,7 @@ impl Daemon {
         // Open the durable state (design §3.2/§3.5): the redb source of truth on disk.
         // Startup order is strict - load BEFORE the router accepts, or a peer could
         // replay a card against an empty store and legitimize it (§3.5).
+        state::ensure_private_directory(&state_dir)?;
         let db_path = state_dir.join("state.redb");
         // Tripwire (§3.5/req 10): state.redb absent beside a SURVIVING durable artifact -
         // served blobs OR the identity keys (`root.key`/`node.key`). The keys arm catches
@@ -1774,17 +2300,19 @@ impl Daemon {
         // to avoid a false positive on a genuine first run.
         let survivor_present = state_dir.join("blobs").exists()
             || state_dir.join("root.key").exists()
-            || state_dir.join("node.key").exists();
+            || state_dir.join("node.key").exists()
+            || state_dir.join("credential.id").exists();
         if !persist::db_exists(&db_path) && survivor_present && !keys_freshly_generated {
-            eprintln!(
-                "carapace: WARNING durable artifacts (blobs/ or identity keys) present but \
-                 {db_path:?} is absent - starting with EMPTY durable state (rollback/abort/PoR \
-                 history and the fetch gate are reset). If this is not a fresh install, restore \
-                 state.redb before serving."
+            anyhow::bail!(
+                "durable artifacts exist but {db_path:?} is absent; restore state.redb or use an explicit operator recovery command"
             );
         }
         let db = Arc::new(persist::open_db(&db_path)?);
-        let loaded = persist::load_all(&db, &k_root)?;
+        let identity = persist::StateIdentity {
+            user: self_user,
+            node: self_node,
+        };
+        let loaded = persist::load_all(&db, &k_root, &identity)?;
         let card_version_floor = loaded.card_version;
         let vault_blob_sources = loaded.vault_blob_sources;
 
@@ -1839,7 +2367,12 @@ impl Daemon {
         let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await?;
         // Durable served blob store: FsStore at `<state_dir>/blobs`. Blobs are already
         // ciphertext, so no extra sealing.
-        let blobs = IrohBlobStore::load(&state_dir.join("blobs")).await?;
+        let blob_directory = state_dir.join("blobs");
+        state::ensure_private_directory(&blob_directory)?;
+        let blobs = IrohBlobStore::load(&blob_directory).await?;
+        let replica_ingress = state_dir.join(".replica-ingress");
+        cleanup_replica_ingress(&replica_ingress)?;
+        state::ensure_private_directory(&replica_ingress)?;
 
         // DERIVE: re-derive each owned vault's decrypted `Manifest` from the envelope in
         // FsStore + `K_manifest` (never persisted in clear). A vault whose envelope is
@@ -1856,12 +2389,8 @@ impl Daemon {
                     let keys = chunk_keys_from_manifest(&manifest, &*vkeys.k_content);
                     rebuilt_vaults.push((vid, digest, chunk_ids, manifest, keys));
                 }
-                Err(e) => {
-                    eprintln!(
-                        "carapace: WARNING vault {} manifest could not be re-derived at startup \
-                         ({e}); marked needs-refetch (republish or anti-entropy will repair)",
-                        hex32(&vid)
-                    );
+                Err(_) => {
+                    ops::log("recovery.manifest_rederive_failed", None);
                     // Keep the blob source as the durable needs-refetch record; dropping it
                     // here would let the next persist silently erase this vault from disk.
                     refetch_vaults.push((vid, digest, chunk_ids));
@@ -1906,6 +2435,7 @@ impl Daemon {
         // The rollback-guarded document store, shared between `sync_from` and `serve_docs`
         // (store-and-forward, §6/W7). Loaded from disk so rollback high-water marks survive.
         let docs = Arc::new(Mutex::new(loaded.docs));
+        let recovery_limiter = Arc::new(Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)));
 
         let hello = Hello {
             protocol: 1,
@@ -1920,11 +2450,13 @@ impl Daemon {
             k_root: k_root.clone(),
             db: Arc::clone(&db),
             blobs: blobs.clone(),
+            replica_ingress,
             shared: Arc::clone(&shared),
             default_grant_bytes: limits.quota_bytes,
             // Feed hints from friend cards learned on the accept path (§6).
             hints: ep.hints(),
             docs: Arc::clone(&docs),
+            recovery_limiter: Arc::clone(&recovery_limiter),
         };
         // §7.4/D3 + W8 fetch authorization: every `iroh_blobs::ALPN` get-request is gated by
         // `authorize_fetch` against the dialer's authenticated node id and the ChunkID.
@@ -1936,7 +2468,7 @@ impl Daemon {
         {
             let s = shared.read().expect("shared lock");
             let d = docs.lock().expect("docs lock");
-            persist::commit_all(&db, &s, &d, &k_root);
+            persist::commit_all(&db, &s, &d, &k_root, &identity);
         }
 
         let gate_shared = Arc::clone(&shared);
@@ -1961,9 +2493,8 @@ impl Daemon {
             k_root,
             docs,
             publish_locks: Mutex::new(HashMap::new()),
-            // §8.5: at most 5 recovery opens per subject per 24 h window.
-            recovery_limiter: Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)),
             resplit_lock: tokio::sync::Mutex::new(()),
+            operational_history: Mutex::new(OperationalHistory::default()),
             relay,
             relay_host: cfg.relay_host,
             state_dir,
@@ -2026,6 +2557,15 @@ impl Daemon {
             .expect("shared lock")
             .por
             .round(node, vid)
+    }
+
+    /// Identity-free count of current PoR latency anomaly signals.
+    pub fn por_latency_anomaly_count(&self) -> usize {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .por
+            .latency_anomaly_count()
     }
 
     /// Whether this daemon holds an owned-vault chunk in the owner-gated fetch set
@@ -2105,6 +2645,9 @@ impl Daemon {
             }
         }
 
+        // Hold through the epoch/state transaction. The collector cannot remove a new blob's
+        // write-time tag while the hash is not yet in the durable root set.
+        let blob_mutation = self.blobs.begin_durable_mutation().await;
         let env_digest = self.blobs.add(&ingest.envelope.to_bytes()).await?;
         ensure!(
             env_digest == ingest.digest,
@@ -2211,6 +2754,8 @@ impl Daemon {
                 })
                 .unwrap_or_default()
         };
+        // The durable state now names each new blob. Release GC before optional network work.
+        drop(blob_mutation);
 
         // Push the new epoch to enrolled replicas OUTSIDE the shared lock. Best-effort: an
         // offline replica is caught by the PoR/repair path, so a failed push must not fail
@@ -2220,20 +2765,16 @@ impl Daemon {
                 Ok(blobs) => {
                     let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
                     for peer in &push_targets {
-                        if let Err(e) = self.invite_and_push(peer, vid, epoch, total, &blobs).await
+                        if self
+                            .invite_and_push(peer, vid, epoch, total, &blobs)
+                            .await
+                            .is_err()
                         {
-                            eprintln!(
-                                "carapaced: epoch push of {} to replica {} failed (best-effort): {e:#}",
-                                hex32(&vid),
-                                hex32(peer.id.as_bytes())
-                            );
+                            ops::log("replica.epoch_push_failed", None);
                         }
                     }
                 }
-                Err(e) => eprintln!(
-                    "carapaced: could not gather blobs to push epoch of {} to replicas: {e:#}",
-                    hex32(&vid)
-                ),
+                Err(_) => ops::log("replica.blob_gather_failed", None),
             }
         }
         Ok(epoch)
@@ -2284,11 +2825,8 @@ impl Daemon {
                 let Some(daemon) = weak.upgrade() else {
                     break; // daemon gone
                 };
-                if let Err(e) = daemon.publish_vault(&src, vid).await {
-                    eprintln!(
-                        "carapace watch: re-ingest of {} failed: {e:#}",
-                        src.display()
-                    );
+                if daemon.publish_vault(&src, vid).await.is_err() {
+                    ops::log("vault.watch_reingest_failed", None);
                 }
             }
         });
@@ -2353,6 +2891,101 @@ impl Daemon {
         out_root: &Path,
     ) -> Result<Vec<Reconstructed>> {
         self.sync_impl(doc_peer, blob_peer, out_root).await
+    }
+
+    /// Recover vaults after claimant activation. Pull verified documents from every
+    /// trustee, bind announces to the signed-grant references, select the maximum epoch,
+    /// and fetch blobs from each distinct replica named by the accepted announce.
+    pub async fn recover_retained_at(
+        &self,
+        trustees: &[([u8; 32], Vec<String>)],
+        refs: &[AnnounceRef],
+        out_root: &Path,
+    ) -> Result<Vec<Reconstructed>> {
+        let wanted: HashMap<([u8; 32], u64, [u8; 32]), ()> = max_epoch_refs(refs)
+            .into_iter()
+            .map(|reference| ((reference.vid, reference.epoch, reference.digest), ()))
+            .collect();
+        let mut accepted: HashMap<[u8; 32], (EndpointAddr, VaultAnnounce)> = HashMap::new();
+        for (node, addrs) in trustees {
+            let doc_peer = endpoint_addr(*node, addrs)?;
+            let targets = match self.pull_verified_targets(&doc_peer).await {
+                Ok(targets) => targets,
+                Err(_) => continue,
+            };
+            for (vid, announce) in targets {
+                if wanted.contains_key(&(vid, announce.epoch, announce.digest)) {
+                    match accepted.get(&vid) {
+                        Some((_, current)) if current.epoch >= announce.epoch => {}
+                        _ => {
+                            accepted.insert(vid, (doc_peer.clone(), announce));
+                        }
+                    }
+                }
+            }
+        }
+
+        ensure!(
+            !accepted.is_empty(),
+            "no rollback-checked trustee announce matched the recovery references"
+        );
+
+        let mut out = Vec::new();
+        for (vid, (doc_peer, announce)) in accepted {
+            for replica in &announce.replicas {
+                let blob_peer = {
+                    let s = self.shared.read().expect("shared lock");
+                    resolve_peer(&s.peer_addrs, replica)
+                };
+                let Some(blob_peer) = blob_peer else { continue };
+                if blob_peer.id != doc_peer.id && self.authenticate_to(&blob_peer).await.is_err() {
+                    continue;
+                }
+                if let Ok(restored) = self
+                    .reconstruct_one(&blob_peer, &vid, &announce, out_root)
+                    .await
+                {
+                    out.push(restored);
+                    break;
+                }
+            }
+        }
+        out.sort_by_key(|vault| vault.vid);
+        Ok(out)
+    }
+
+    async fn pull_verified_targets(
+        &self,
+        doc_peer: &EndpointAddr,
+    ) -> Result<Vec<([u8; 32], VaultAnnounce)>> {
+        let conn = self.ep.connect(doc_peer.clone(), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let own_card = {
+            let s = self.shared.read().expect("shared lock");
+            s.cards.first().cloned().context("no own card")?
+        };
+        write_msg(&mut send, &own_card).await?;
+        let mut cards = Vec::new();
+        let mut announces = Vec::new();
+        while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
+            match ty {
+                ContactCard::TYPE => cards.push(ContactCard::from_map(body)?),
+                VaultAnnounce::TYPE => announces.push(VaultAnnounce::from_map(body)?),
+                _ => {}
+            }
+        }
+        send.finish()?;
+        let now = unix_now();
+        let self_user = self.user_id();
+        let targets = {
+            let mut docs = self.docs.lock().expect("docs lock");
+            for card in &cards {
+                let _ = docs.offer_card(card);
+            }
+            select_targets(&mut docs, &self_user, &cards, &announces, now)
+        };
+        self.persist_snapshot();
+        Ok(targets)
     }
 
     async fn sync_impl(
@@ -2451,7 +3084,7 @@ impl Daemon {
         for (vid, ann) in &targets {
             match self.reconstruct_one(&blob_peer, vid, ann, out_root).await {
                 Ok(r) => out.push(r),
-                Err(e) => eprintln!("carapaced: skipping vault {}: {e:#}", hex32(vid)),
+                Err(_) => ops::log("vault.reconstruct_failed", None),
             }
         }
         Ok(out)
@@ -2665,6 +3298,8 @@ impl Daemon {
         keys: &ChunkKeys,
         store: &MemoryStore,
     ) -> Result<()> {
+        // Serialize all served-store writes through their state commit against GC.
+        let _blob_mutation = self.blobs.begin_durable_mutation().await;
         let vkeys = VaultKeys::derive(&*self.k_root, *vid);
         let envelope = seal_manifest(manifest, &vkeys, &self.node_key)?;
         let digest = self.blobs.add(&envelope.to_bytes()).await?;
@@ -2891,6 +3526,10 @@ impl Daemon {
         );
         {
             let mut s = self.shared.write().expect("shared lock");
+            ensure!(
+                s.peer_addrs.contains_key(&peer_node) || s.peer_addrs.len() < MAX_PEER_RECORDS,
+                "peer address cache is full"
+            );
             s.friendships.insert(acceptor_user, friendship.clone());
             s.friends.insert(acceptor_user, accept.card.clone());
             s.friend_grants
@@ -3582,7 +4221,9 @@ impl Daemon {
         // (§9.3.4 reachability signal).
         {
             let mut s = self.shared.write().expect("shared lock");
-            s.peer_addrs.insert(node, peer.clone());
+            if s.peer_addrs.contains_key(&node) || s.peer_addrs.len() < MAX_PEER_RECORDS {
+                s.peer_addrs.insert(node, peer.clone());
+            }
             s.peer_last_seen.insert(node, unix_now());
         }
         Ok(Some(node))
@@ -3638,7 +4279,10 @@ impl Daemon {
             // C1: an unreachable replica is a transport failure, not a retention answer - it
             // must never advance the loss streak (else a transiently-offline friend is evicted
             // without grace). Only a peer that answered is judged on content.
-            let action = match self.fetch_audit_samples(addr, &audit).await {
+            let started = std::time::Instant::now();
+            let fetched = self.fetch_audit_samples(addr, &audit).await;
+            let elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let action = match fetched {
                 None => {
                     let mut s = self.shared.write().expect("shared lock");
                     let a = s.por.record_unreachable(*node, vid, now);
@@ -3646,8 +4290,11 @@ impl Daemon {
                     a
                 }
                 Some(responses) => {
-                    let outcome = verify_audit_response(&audit, &responses);
+                    let outcome = verify_bao_range_responses(&audit, &responses);
                     let mut s = self.shared.write().expect("shared lock");
+                    if s.por.record_latency(*node, vid, elapsed_ms) {
+                        round.latency_anomalies += 1;
+                    }
                     let a = s.por.record_outcome(*node, vid, outcome, now);
                     self.persist_locked(&s);
                     a
@@ -3694,13 +4341,15 @@ impl Daemon {
         };
         let mut out = Vec::with_capacity(audit.samples.len());
         for s in &audit.samples {
-            let got =
-                match tokio::time::timeout(POR_FETCH_TIMEOUT, scratch.fetch(&conn, s.chunk_id))
-                    .await
-                {
-                    Ok(Ok(())) => scratch.get_bytes(s.chunk_id).await.ok(),
-                    _ => None,
-                };
+            let got = match tokio::time::timeout(
+                POR_FETCH_TIMEOUT,
+                scratch.fetch_verified_range(&conn, s.chunk_id, s.offset, s.len),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => Some(bytes),
+                _ => None,
+            };
             out.push(got);
         }
         Some(out)
@@ -3836,6 +4485,13 @@ impl Daemon {
     pub async fn maintenance_round(&self, now: u64) -> MaintenanceReport {
         let mut report = MaintenanceReport::default();
 
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            if cleanup_ceremonies(&mut s, now) {
+                self.persist_locked(&s);
+            }
+        }
+
         let (owned_vaults, recovery_sets, held_rsids, peer_addrs) = {
             let s = self.shared.read().expect("shared lock");
             let owned: Vec<[u8; 32]> = s
@@ -3918,7 +4574,51 @@ impl Daemon {
             self.drive_relay_health(alive);
         }
 
+        // 7) Reconcile durable blob-retention tags. Authorization pruning commits before
+        // stale tags are removed, so a crash can leave extra ciphertext but cannot delete
+        // current, replica, or permanently disclosed data.
+        let gc_succeeded = if let Err(error) = self.garbage_collect_blobs().await {
+            report
+                .errors
+                .push(format!("blob garbage collection: {error:#}"));
+            false
+        } else {
+            true
+        };
+
+        {
+            let mut history = self
+                .operational_history
+                .lock()
+                .expect("operational history lock");
+            record_maintenance_history(&mut history, now, report.errors.len(), gc_succeeded);
+        }
+
         report
+    }
+
+    /// Reconcile current blob reachability and schedule superseded ciphertext for bounded GC.
+    pub async fn garbage_collect_blobs(&self) -> Result<GarbageCollectionReport> {
+        // Take the store mutation guard BEFORE reading roots. A publisher holds the same guard
+        // through its state commit, so this snapshot cannot predate a completed blob mutation.
+        let blob_mutation = self.blobs.begin_durable_mutation().await;
+        let (retained, removed_authorizations) = {
+            let mut s = self.shared.write().expect("shared lock");
+            let roots = blob_retention_set(&s)?;
+            let removed = prune_owned_authorizations(&mut s, &roots.owned);
+            if removed != 0 {
+                self.persist_locked(&s);
+            }
+            (roots.all, removed)
+        };
+
+        self.blobs
+            .garbage_collect_during(&retained, &blob_mutation)
+            .await?;
+        Ok(GarbageCollectionReport {
+            retained_blobs: retained.len(),
+            removed_authorizations,
+        })
     }
 
     /// Spawn the background maintenance loop (§10.1/§10.2) and return its handle. The loop
@@ -3964,6 +4664,36 @@ impl Daemon {
     /// the current wall clock.
     pub fn recovery_health(&self) -> Vec<RecoveryHealthReport> {
         self.recovery_health_at(unix_now())
+    }
+
+    /// Return identity-free capacity counters for the authenticated local metrics API.
+    pub fn operational_capacity(&self) -> OperationalCapacity {
+        let shared = self.shared.read().expect("shared lock");
+        OperationalCapacity {
+            replica_grant_bytes: shared
+                .friend_grants
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add),
+            replica_assignments: shared.members.values().map(Vec::len).sum(),
+            storage_refetch_needed: shared.needs_refetch.len(),
+            ceremony_active: shared.ceremonies.len(),
+            ceremony_tombstones: shared.ceremony_tombstones.len(),
+            ceremony_subject_rate_keys: shared.ceremony_subject_rate.len(),
+            ceremony_sponsor_rate_keys: shared.ceremony_sponsor_rate.len(),
+            ceremony_capacity: MAX_CEREMONY_RECORDS,
+            ceremony_per_subject_capacity: MAX_ACTIVE_CEREMONIES_PER_SUBJECT,
+            ceremony_tombstone_capacity: MAX_CEREMONY_TOMBSTONES,
+            ceremony_fanout_capacity: MAX_CEREMONY_FANOUT,
+        }
+    }
+
+    /// Return bounded, identity-free maintenance history.
+    pub fn operational_history(&self) -> OperationalHistory {
+        *self
+            .operational_history
+            .lock()
+            .expect("operational history lock")
     }
 
     /// [`Daemon::recovery_health`] evaluated at an explicit `now` (injected clock for
@@ -4052,8 +4782,8 @@ impl Daemon {
     /// writes). Takes `&self` idempotently so the signal path can flush even while other
     /// `Arc<Daemon>` clones live.
     pub async fn shutdown(&self) {
-        if let Err(e) = self.router.shutdown().await {
-            eprintln!("carapaced: router shutdown: {e}");
+        if self.router.shutdown().await.is_err() {
+            ops::log("router.shutdown_failed", None);
         }
         self.ep.close().await;
     }
@@ -4267,6 +4997,54 @@ impl Daemon {
             .collect()
     }
 
+    /// Published vaults with stable local names for selector UIs.
+    pub fn vault_options(&self) -> Vec<VaultOption> {
+        let s = self.shared.read().expect("shared lock");
+        let mut values: Vec<VaultOption> = s
+            .vault_blobs
+            .keys()
+            .map(|vid| {
+                let epoch = s.epochs.get(vid).copied().unwrap_or(0);
+                let name = s
+                    .working_dirs
+                    .get(vid)
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("Vault {}", &hex32(vid)[..12]));
+                VaultOption {
+                    vid: *vid,
+                    epoch,
+                    name,
+                }
+            })
+            .collect();
+        values.sort_by(|a, b| a.name.cmp(&b.name).then(a.vid.cmp(&b.vid)));
+        values
+    }
+
+    /// Verified friend-card nodes and address hints for selector UIs.
+    pub fn peer_options(&self) -> Vec<PeerOption> {
+        let s = self.shared.read().expect("shared lock");
+        let mut values = Vec::new();
+        for card in s.friends.values() {
+            for node in &card.nodes {
+                let addrs = resolve_peer(&s.peer_addrs, &node.node_id)
+                    .map(|addr| addr.ip_addrs().map(ToString::to_string).collect())
+                    .unwrap_or_else(|| node.addrs.clone());
+                values.push(PeerOption {
+                    user: card.user,
+                    display: card.display.clone(),
+                    node: node.node_id,
+                    addrs,
+                });
+            }
+        }
+        values.sort_by(|a, b| a.display.cmp(&b.display).then(a.node.cmp(&b.node)));
+        values
+    }
+
     /// Every vault this daemon stores as a replica for some owner.
     pub fn held_replica_vids(&self) -> Vec<[u8; 32]> {
         self.shared
@@ -4429,6 +5207,17 @@ impl Daemon {
     // Let the loopback control API drive network paths with a node id + address strings, so
     // the API crate never depends on iroh's `EndpointAddr` directly.
 
+    /// [`Daemon::sync_from`] against a peer named by node id and dialable addresses.
+    pub async fn sync_from_at(
+        &self,
+        node: [u8; 32],
+        addrs: &[String],
+        out_root: &Path,
+    ) -> Result<Vec<Reconstructed>> {
+        let peer = endpoint_addr(node, addrs)?;
+        self.sync_from(peer, out_root).await
+    }
+
     /// [`Daemon::befriend`] against a peer named by node id + dialable addresses.
     pub async fn befriend_at(
         &self,
@@ -4486,6 +5275,8 @@ impl Daemon {
         n: u8,
         allow_over_cap: bool,
     ) -> Result<(Vec<String>, Vec<PolicyWarning>)> {
+        let mut s = self.shared.write().expect("shared lock");
+        ensure_root_split_available(&s, scope)?;
         let (shares, state, warnings) = match scope {
             RecoveryScope::Root => split_root(&self.k_root, m, Some(n), allow_over_cap),
             RecoveryScope::Vault(vid) => {
@@ -4494,13 +5285,9 @@ impl Daemon {
         }
         .map_err(|e| anyhow::anyhow!("recovery split failed: {e:?}"))?;
         let jsons = shares.iter().map(share_to_json).collect();
-        {
-            let mut s = self.shared.write().expect("shared lock");
-            s.split_states.insert(rsid, RecoverySet { scope, state });
-            // Persist the SEALed split-state so `recovery_extend` can extend the same
-            // polynomial after a restart.
-            self.persist_locked(&s);
-        }
+        s.split_states.insert(rsid, RecoverySet { scope, state });
+        // Persist the sealed split state before returning any shares.
+        self.persist_locked(&s);
         Ok((jsons, warnings))
     }
 
@@ -4554,6 +5341,14 @@ impl Daemon {
             !trustees.is_empty(),
             "a recovery split needs at least one trustee"
         );
+        ensure!(
+            trustees.len() <= MAX_RECOVERY_TRUSTEES,
+            "a recovery split supports at most {MAX_RECOVERY_TRUSTEES} trustees"
+        );
+        ensure!(
+            recovery_delay >= MIN_RECOVERY_DELAY_SECS,
+            "recovery delay must be at least {MIN_RECOVERY_DELAY_SECS} seconds"
+        );
         let n = u8::try_from(trustees.len()).context("too many trustees (max 32)")?;
         let subject = self.user_id();
 
@@ -4596,6 +5391,14 @@ impl Daemon {
             shares.len(),
             resolved.len()
         );
+
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            ensure_root_split_available(&s, scope)?;
+            if matches!(scope, RecoveryScope::Root) {
+                s.root_split_pending = true;
+            }
+        }
 
         // The latest announce refs - the pointers a recovering quorum follows to the current
         // manifest + a live replica (§7.3).
@@ -4651,6 +5454,9 @@ impl Daemon {
         {
             let mut s = self.shared.write().expect("shared lock");
             s.split_states.insert(rsid, RecoverySet { scope, state });
+            if matches!(scope, RecoveryScope::Root) {
+                s.root_split_pending = false;
+            }
             s.share_sets
                 .insert(rsid, AttestTracker::new(m, shares.len(), roster));
             s.granted.insert(
@@ -4795,6 +5601,107 @@ impl Daemon {
             .collect()
     }
 
+    /// Return complete durable recovery-set facts for API and GUI status.
+    pub fn recovery_sets(&self) -> Vec<RecoverySetReport> {
+        let s = self.shared.read().expect("shared lock");
+        let mut reports = s
+            .split_states
+            .iter()
+            .map(|(rsid, set)| {
+                let threshold = usize::from(set.state.threshold());
+                let issued = set.state.issued_count();
+                let mut warnings = Vec::new();
+                if issued == threshold {
+                    warnings.push(PolicyWarning::ZeroSlack);
+                }
+                if issued > 3 * threshold - 1 {
+                    warnings.push(PolicyWarning::OverSoftCap);
+                }
+                let trustees = s
+                    .granted
+                    .get(rsid)
+                    .map(|grant| {
+                        grant
+                            .trustees
+                            .iter()
+                            .map(|trustee| (trustee.user, trustee.delivered))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                RecoverySetReport {
+                    rsid: *rsid,
+                    scope: set.scope,
+                    threshold,
+                    issued,
+                    trustees,
+                    warnings,
+                }
+            })
+            .collect::<Vec<_>>();
+        reports.sort_by_key(|report| report.rsid);
+        reports
+    }
+
+    /// Return established friends and their durable local storage grants.
+    pub fn friend_grants(&self) -> Vec<FriendGrantReport> {
+        let s = self.shared.read().expect("shared lock");
+        let mut reports = s
+            .friendships
+            .keys()
+            .map(|user| FriendGrantReport {
+                user: *user,
+                grant_bytes: s.friend_grants.get(user).copied().unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        reports.sort_by_key(|report| report.user);
+        reports
+    }
+
+    /// Return the verified roster and current address hints from a held recovery grant.
+    /// The grant signature is checked before any values are returned.
+    pub fn claimant_trustee_hints(&self, subject: &[u8; 32]) -> Result<Vec<ClaimantTrusteeHint>> {
+        let grant = self
+            .held_grant(subject)
+            .context("no verified recovery grant for claimant subject")?;
+        verify_share_grant(&grant)
+            .map_err(|error| anyhow::anyhow!("held grant failed verification: {error:?}"))?;
+        let s = self.shared.read().expect("shared lock");
+        let mut rows = Vec::with_capacity(grant.cotrustees.len() + 1);
+        let own_node = self.node_id();
+        let own_addrs = self
+            .addr()
+            .map(|address| address.ip_addrs().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        rows.push(ClaimantTrusteeHint {
+            user: self.user_id(),
+            node: own_node,
+            addrs: own_addrs,
+        });
+        for trustee in &grant.cotrustees {
+            let addrs = resolve_peer(&s.peer_addrs, &trustee.node)
+                .map(|address| address.ip_addrs().map(ToString::to_string).collect())
+                .unwrap_or_default();
+            rows.push(ClaimantTrusteeHint {
+                user: trustee.user,
+                node: trustee.node,
+                addrs,
+            });
+        }
+        rows.sort_by_key(|row| row.user);
+        rows.dedup_by_key(|row| row.user);
+        Ok(rows)
+    }
+
+    /// Return verified recovery announce references for a claimant restart handoff.
+    pub fn claimant_announce_refs(&self, subject: &[u8; 32]) -> Result<Vec<AnnounceRef>> {
+        let grant = self
+            .held_grant(subject)
+            .context("no verified recovery grant for claimant subject")?;
+        verify_share_grant(&grant)
+            .map_err(|error| anyhow::anyhow!("held grant failed verification: {error:?}"))?;
+        Ok(max_epoch_refs(&grant.refs))
+    }
+
     /// W15 (§8, §10.2): render the printable paper cards for owned recovery set `rsid` - one
     /// page per share, recoverable from the words alone offline. Pulls the retained shares from
     /// `granted`; no regeneration or re-split. SECURITY: the HTML embeds share WORDS (a bearer
@@ -4846,19 +5753,20 @@ impl Daemon {
         reason: String,
         now: u64,
     ) -> Result<(RecoveryOpen, [u8; 16])> {
+        ensure!(
+            claimant_display.len() <= MAX_CEREMONY_TEXT_BYTES,
+            "claimant display exceeds {MAX_CEREMONY_TEXT_BYTES} bytes"
+        );
+        ensure!(
+            reason.len() <= MAX_CEREMONY_TEXT_BYTES,
+            "recovery reason exceeds {MAX_CEREMONY_TEXT_BYTES} bytes"
+        );
         let grant = self.held_grant(&subject).context(
             "cannot open a recovery ceremony for a subject we hold no grant for (only a trustee may sponsor, §8.5)",
         )?;
         let share = verify_share_grant(&grant)
             .map_err(|e| anyhow::anyhow!("held grant failed verification: {e:?}"))?;
         let rsid = u64::from(share.recovery_set_id);
-        // Per-subject rate limit (§8.5): a trustee cannot spam opens for one subject.
-        {
-            let mut limiter = self.recovery_limiter.lock().expect("recovery limiter lock");
-            limiter
-                .check_and_record(subject, now)
-                .map_err(|e| anyhow::anyhow!("recovery open rate limited: {e:?}"))?;
-        }
         let mut ceremony_id = [0u8; 16];
         getrandom::getrandom(&mut ceremony_id)
             .map_err(|e| anyhow::anyhow!("generate ceremony id: {e}"))?;
@@ -4875,10 +5783,43 @@ impl Daemon {
         );
         // Track our own participation (roster = {us} ∪ the grant's co-trustees).
         let self_user = self.user_id();
-        let state = track_from_grant(&self_user, &open, &grant, now)
-            .map_err(|e| anyhow::anyhow!("sponsor cannot track its own ceremony: {e:?}"))?;
+        let state = match validated_recovery_open(&self_user, &open, &grant, now) {
+            Ok(state) => state,
+            Err(error) => {
+                let mut s = self.shared.write().expect("shared lock");
+                if finish_ceremony(
+                    &mut s,
+                    ceremony_id,
+                    subject,
+                    self_user,
+                    now,
+                    CeremonyTerminal::Failed,
+                ) {
+                    self.persist_locked(&s);
+                }
+                return Err(error).context("sponsor cannot track its own ceremony");
+            }
+        };
         {
             let mut s = self.shared.write().expect("shared lock");
+            if let Err(error) = admit_new_ceremony(&mut s, subject, self_user, now) {
+                if finish_ceremony(
+                    &mut s,
+                    ceremony_id,
+                    subject,
+                    self_user,
+                    now,
+                    CeremonyTerminal::Rejected,
+                ) {
+                    self.persist_locked(&s);
+                }
+                return Err(error).context("recovery open rate limited");
+            }
+            ensure!(
+                s.ceremony_alarms.contains_key(&ceremony_id)
+                    || s.ceremony_alarms.len() < MAX_CEREMONY_RECORDS,
+                "too many active recovery ceremony records"
+            );
             s.ceremony_alarms.insert(
                 ceremony_id,
                 AlarmRecord {
@@ -4915,7 +5856,7 @@ impl Daemon {
             resolve_ceremony_peers(&s, self.node_id(), &open.subject)
         };
         let mut reached = 0;
-        for addr in targets {
+        for addr in targets.into_iter().take(MAX_CEREMONY_FANOUT) {
             if self.deliver_recovery_open(&addr, open).await.is_ok() {
                 reached += 1;
             }
@@ -5117,7 +6058,15 @@ impl Daemon {
                     sponsor: al.sponsor,
                     claimant_display: al.claimant_display.clone(),
                     reason: al.reason.clone(),
-                    phase: if al.aborted { "aborted" } else { "open" },
+                    phase: match s.ceremony_tombstones.get(id).map(|value| value.terminal) {
+                        Some(CeremonyTerminal::Completed) => "completed",
+                        Some(CeremonyTerminal::Aborted) => "aborted",
+                        Some(CeremonyTerminal::Expired) => "expired",
+                        Some(CeremonyTerminal::Rejected) => "rejected",
+                        Some(CeremonyTerminal::Failed) => "failed",
+                        None if al.aborted => "aborted",
+                        None => "open",
+                    },
                     approvals: 0,
                     threshold: 0,
                     is_self_subject: al.is_self_subject,
@@ -5131,10 +6080,46 @@ impl Daemon {
 
     /// Test-only: pin the ceremony delay clock to `now` (0 restores real time), so a test can
     /// advance past the 72 h abort delay without sleeping.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn set_test_clock(&self, now: u64) {
         self.shared.write().expect("shared lock").test_now = now;
     }
+
+    /// Test-only count of bounded ceremony collections.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn ceremony_record_counts(&self) -> (usize, usize, usize) {
+        let s = self.shared.read().expect("shared lock");
+        (
+            s.ceremonies.len(),
+            s.ceremony_alarms.len(),
+            s.aborted_ceremonies.len(),
+        )
+    }
+}
+
+fn ceremony_text_is_valid(open: &RecoveryOpen) -> bool {
+    open.claimant_display.len() <= MAX_CEREMONY_TEXT_BYTES
+        && open.reason.len() <= MAX_CEREMONY_TEXT_BYTES
+}
+
+/// A party whose control messages can create bounded ceremony state.
+fn signer_qualifies(
+    signer: &[u8; 32],
+    held_grants: &HashMap<[u8; 32], ShareGrant>,
+    friends: &HashMap<[u8; 32], ContactCard>,
+    docs: &DocStore,
+) -> bool {
+    held_grants.contains_key(signer)
+        || held_grants.values().any(|grant| {
+            grant
+                .cotrustees
+                .iter()
+                .any(|trustee| trustee.user == *signer)
+        })
+        || friends.contains_key(signer)
+        || docs.card(signer).is_some()
 }
 
 /// Build a `GrantBody` disclosing exactly the manifest files named in `paths`. Errors if any
@@ -5180,6 +6165,58 @@ fn select_grant_body(manifest: &Manifest, keys: &ChunkKeys, paths: &[&str]) -> R
 /// in a grant's audience covering the chunk. A REPLICA-held chunk (`replica_chunks`) goes
 /// only to that owner's devices or a current replica-set member (W8). Everything else is
 /// default-denied.
+struct BlobRetentionSet {
+    all: HashSet<[u8; 32]>,
+    owned: HashSet<[u8; 32]>,
+}
+
+fn blob_retention_set(s: &Shared) -> Result<BlobRetentionSet> {
+    let mut retained = HashSet::new();
+    let mut owned = HashSet::new();
+    let mut insert = |id: [u8; 32], is_owned: bool| -> Result<()> {
+        retained.insert(id);
+        if is_owned {
+            owned.insert(id);
+        }
+        ensure!(
+            retained.len() <= MAX_GC_LIVE_BLOBS,
+            "blob GC live set exceeds {MAX_GC_LIVE_BLOBS} entries"
+        );
+        Ok(())
+    };
+
+    for vault in s.vault_blobs.values() {
+        insert(vault.digest, true)?;
+        for chunk in &vault.chunk_ids {
+            insert(*chunk, true)?;
+        }
+    }
+    for (digest, chunks) in s.needs_refetch.values() {
+        insert(*digest, true)?;
+        for chunk in chunks {
+            insert(*chunk, true)?;
+        }
+    }
+    for chunk in s.replica_chunks.keys() {
+        insert(*chunk, false)?;
+    }
+    // Disclosure is permanent in v1. Its ciphertext and owner-side gate row stay live even
+    // after the source vault advances to a new epoch.
+    for chunk in s.disclosure.chunk_ids() {
+        insert(chunk, true)?;
+    }
+    Ok(BlobRetentionSet {
+        all: retained,
+        owned,
+    })
+}
+
+fn prune_owned_authorizations(s: &mut Shared, retained: &HashSet<[u8; 32]>) -> usize {
+    let before = s.owned_chunks.len();
+    s.owned_chunks.retain(|chunk, _| retained.contains(chunk));
+    before.saturating_sub(s.owned_chunks.len())
+}
+
 fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
     // Consult the RETAINED owned-chunk set, not current-epoch `vault_blobs`, so a superseded
     // chunk stays gated instead of regressing to the residual (W2).
@@ -5263,6 +6300,20 @@ fn replica_owner_device(
         return None;
     }
     card_delegates_node(card, remote, now).then_some(owner)
+}
+
+/// Admit a newly recovered device to a trustee's document feed only while this trustee
+/// tracks a non-aborted ceremony for that subject. The presented card must be self-signed
+/// by the recovered user and delegate the authenticated remote node.
+fn recovery_claimant_device(s: &Shared, card: &ContactCard, remote: &[u8; 32], now: u64) -> bool {
+    card.verify().is_ok()
+        && card_delegates_node(card, remote, now)
+        && s.ceremonies.iter().any(|(id, ceremony)| {
+            ceremony.state.subject == card.user
+                && !ceremony.takeover
+                && !ceremony_is_expired(ceremony, now)
+                && s.ceremony_released.get(id) == Some(remote)
+        })
 }
 
 /// Whether a manifest-supplied relative path is safe to delete under an out dir (no absolute
@@ -5962,20 +7013,170 @@ fn ceremony_now(s: &Shared) -> u64 {
     }
 }
 
+fn record_maintenance_history(
+    history: &mut OperationalHistory,
+    now: u64,
+    failure_count: usize,
+    gc_succeeded: bool,
+) {
+    history.last_maintenance_at = now;
+    history.last_gc_succeeded = gc_succeeded;
+    history.last_failure_count = failure_count.min(MAX_OPERATION_FAILURE_COUNT);
+    if failure_count == 0 {
+        history.consecutive_failed_rounds = 0;
+    } else {
+        history.last_failure_at = now;
+        history.consecutive_failed_rounds = history.consecutive_failed_rounds.saturating_add(1);
+    }
+}
+
+fn record_rate(history: &mut HashMap<[u8; 32], Vec<u64>>, key: [u8; 32], now: u64) -> Result<()> {
+    for events in history.values_mut() {
+        events.retain(|time| now.saturating_sub(*time) < RECOVERY_RATE_WINDOW_SECS);
+    }
+    history.retain(|_, events| !events.is_empty());
+    ensure!(
+        history.contains_key(&key) || history.len() < MAX_RECOVERY_RATE_KEYS,
+        "recovery rate history is full"
+    );
+    let events = history.entry(key).or_default();
+    ensure!(
+        events.len() < MAX_RECOVERY_OPENS_PER_WINDOW,
+        "recovery open rate limit exceeded"
+    );
+    events.push(now);
+    Ok(())
+}
+
+fn record_ceremony_rates(
+    s: &mut Shared,
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    now: u64,
+) -> Result<()> {
+    // Apply to copies first so failure cannot charge only one of the two budgets.
+    let mut subjects = s.ceremony_subject_rate.clone();
+    let mut sponsors = s.ceremony_sponsor_rate.clone();
+    record_rate(&mut subjects, subject, now)?;
+    record_rate(&mut sponsors, sponsor, now)?;
+    s.ceremony_subject_rate = subjects;
+    s.ceremony_sponsor_rate = sponsors;
+    Ok(())
+}
+
+fn can_start_ceremony(s: &Shared, subject: &[u8; 32]) -> bool {
+    s.ceremonies.len() < MAX_CEREMONY_RECORDS
+        && s.ceremonies
+            .values()
+            .filter(|tracked| &tracked.state.subject == subject)
+            .count()
+            < MAX_ACTIVE_CEREMONIES_PER_SUBJECT
+}
+
+/// Apply the shared local and inbound admission policy for one new ceremony.
+/// Signature, grant, and role checks happen before this function because those inputs differ.
+fn admit_new_ceremony(
+    s: &mut Shared,
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    now: u64,
+) -> Result<()> {
+    ensure!(
+        can_start_ceremony(s, &subject),
+        "active recovery ceremony limit reached for this subject"
+    );
+    record_ceremony_rates(s, subject, sponsor, now)
+}
+
+fn finish_ceremony(
+    s: &mut Shared,
+    id: [u8; 16],
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    now: u64,
+    terminal: CeremonyTerminal,
+) -> bool {
+    if !s.ceremony_tombstones.contains_key(&id)
+        && s.ceremony_tombstones.len() >= MAX_CEREMONY_TOMBSTONES
+    {
+        return false;
+    }
+    s.ceremony_tombstones
+        .entry(id)
+        .or_insert(CeremonyTombstone {
+            subject,
+            sponsor,
+            terminal_at: now,
+            terminal,
+        });
+    s.ceremonies.remove(&id);
+    s.ceremony_released.remove(&id);
+    true
+}
+
+fn ceremony_is_expired(tracked: &TrackedCeremony, now: u64) -> bool {
+    let anchor = tracked.state.opened_at.max(tracked.state.first_seen);
+    now >= anchor
+        .saturating_add(tracked.state.recovery_delay)
+        .saturating_add(CEREMONY_COMPLETION_GRACE_SECS)
+}
+
+fn cleanup_ceremonies(s: &mut Shared, now: u64) -> bool {
+    let expired: Vec<([u8; 16], [u8; 32], [u8; 32])> = s
+        .ceremonies
+        .iter()
+        .filter(|(_, tracked)| ceremony_is_expired(tracked, now))
+        .map(|(id, tracked)| {
+            let sponsor = s
+                .ceremony_alarms
+                .get(id)
+                .map_or([0; 32], |alarm| alarm.sponsor);
+            (*id, tracked.state.subject, sponsor)
+        })
+        .collect();
+    let mut dirty = !expired.is_empty();
+    for (id, subject, sponsor) in expired {
+        let terminal = if s.ceremony_released.contains_key(&id) {
+            CeremonyTerminal::Completed
+        } else {
+            CeremonyTerminal::Expired
+        };
+        finish_ceremony(s, id, subject, sponsor, now, terminal);
+    }
+    let terminal_ids: Vec<[u8; 16]> = s.ceremony_tombstones.keys().copied().collect();
+    for id in terminal_ids {
+        dirty |= s.ceremony_alarms.remove(&id).is_some();
+        dirty |= s.aborted_ceremonies.remove(&id).is_some();
+    }
+    for history in [&mut s.ceremony_subject_rate, &mut s.ceremony_sponsor_rate] {
+        let before = history.len();
+        for events in history.values_mut() {
+            events.retain(|time| now.saturating_sub(*time) < RECOVERY_RATE_WINDOW_SECS);
+        }
+        history.retain(|_, events| !events.is_empty());
+        dirty |= history.len() != before;
+    }
+    dirty
+}
+
 /// Track an inbound `RecoveryOpen` against a held `ShareGrant` (§8.5): verify grant + open,
 /// bind the open to the grant's subject/rsid, derive the roster as `{this trustee} ∪ the
 /// grant's co-trustees`, and build the delay-anchored [`CeremonyState`] (`first_seen = now`).
 /// The roster is reconstructed here because a W3 grant is OWNER-signed and lists only the
 /// OTHER co-trustees, so the holder (`self_user`) is the missing entry.
-fn track_from_grant(
+fn validated_recovery_open(
     self_user: &[u8; 32],
     open: &RecoveryOpen,
     grant: &ShareGrant,
     now: u64,
-) -> Result<CeremonyState, carapace_recovery::RecoveryError> {
-    let share = verify_share_grant(grant)?;
+) -> Result<CeremonyState> {
+    open.verify()
+        .map_err(|error| anyhow::anyhow!("invalid recovery open signature: {error:?}"))?;
+    ensure!(ceremony_text_is_valid(open), "invalid recovery open text");
+    let share = verify_share_grant(grant)
+        .map_err(|error| anyhow::anyhow!("invalid held recovery grant: {error:?}"))?;
     if open.subject != grant.subject || open.rsid != u64::from(share.recovery_set_id) {
-        return Err(carapace_recovery::RecoveryError::GrantMismatch);
+        anyhow::bail!("recovery open does not match the held grant");
     }
     let mut roster: Vec<[u8; 32]> = Vec::with_capacity(1 + grant.cotrustees.len());
     roster.push(*self_user);
@@ -5985,6 +7186,7 @@ fn track_from_grant(
         }
     }
     CeremonyState::open(open, roster, share.threshold, grant.recovery_delay, now)
+        .map_err(|error| anyhow::anyhow!("invalid recovery-open transition: {error:?}"))
 }
 
 /// Resolve reachable recovery participants for `subject` (§8.5 step 2 fan-out audience): the
@@ -6070,11 +7272,11 @@ impl ClaimantDevice {
     /// Generate a fresh claimant device: a new node key plus a fresh ceremony HPKE
     /// keypair (the key the trustees seal their shares to).
     pub fn new() -> Result<Self> {
-        let mut node_seed = [0u8; 32];
-        getrandom::getrandom(&mut node_seed).map_err(|e| anyhow::anyhow!("node seed: {e}"))?;
-        let mut ikm = [0u8; 32];
-        getrandom::getrandom(&mut ikm).map_err(|e| anyhow::anyhow!("ceremony ikm: {e}"))?;
-        let (sk, pk) = seal::derive_keypair(&ikm);
+        let mut node_seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *node_seed).map_err(|e| anyhow::anyhow!("node seed: {e}"))?;
+        let mut ikm = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *ikm).map_err(|e| anyhow::anyhow!("ceremony ikm: {e}"))?;
+        let (sk, pk) = seal::derive_keypair(&*ikm);
         let ceremony_pub: [u8; 32] = pk
             .to_bytes()
             .try_into()
@@ -6136,8 +7338,10 @@ impl ClaimantDevice {
     pub fn recover_from(&self, shares: &[CeremonyShare], roster: &[[u8; 32]]) -> Result<Recovered> {
         let mut parsed: Vec<Share> = Vec::new();
         for cs in shares {
-            let json = open_ceremony_share(&self.ceremony_sk, cs, roster)
-                .map_err(|e| anyhow::anyhow!("open ceremony share: {e:?}"))?;
+            let json = Zeroizing::new(
+                open_ceremony_share(&self.ceremony_sk, cs, roster)
+                    .map_err(|e| anyhow::anyhow!("open ceremony share: {e:?}"))?,
+            );
             parsed.push(
                 share_from_json(&json).map_err(|e| anyhow::anyhow!("parse share json: {e:?}"))?,
             );
@@ -6173,6 +7377,24 @@ impl ClaimantDevice {
     ) -> Result<Recovered> {
         let shares = self.collect_raw(open, trustees).await?;
         self.recover_from(&shares, roster)
+    }
+
+    /// Collect and recover from trustee addresses supplied by a local control client.
+    ///
+    /// This wrapper keeps the iroh address type out of the claimant control API. The
+    /// caller supplies each trustee node id and its direct socket-address hints. Empty
+    /// hints are valid when discovery or a relay can resolve the node id.
+    pub async fn recover_at(
+        &self,
+        open: &RecoveryOpen,
+        roster: &[[u8; 32]],
+        trustees: &[([u8; 32], Vec<String>)],
+    ) -> Result<Recovered> {
+        let addresses = trustees
+            .iter()
+            .map(|(node, addrs)| endpoint_addr(*node, addrs))
+            .collect::<Result<Vec<_>>>()?;
+        self.recover(open, roster, &addresses).await
     }
 
     /// Dial one trustee, send the `open` request, and read its optional sealed share.
@@ -6268,17 +7490,158 @@ async fn write_blob(send: &mut SendStream, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn read_blob(recv: &mut RecvStream) -> Result<Vec<u8>> {
-    let len = read_u64(recv).await? as usize;
-    ensure!(
-        len <= MAX_REPLICA_BLOB,
-        "replica blob length {len} exceeds cap"
-    );
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("read blob: {e}"))?;
-    Ok(buf)
+fn cleanup_replica_ingress(root: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "replica ingress staging root is not a real directory"
+            );
+            std::fs::remove_dir_all(root).context("remove stale replica ingress staging")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect replica ingress staging"),
+    }
+    Ok(())
+}
+
+struct ReplicaIngressStage {
+    directory: PathBuf,
+    expected_count: u64,
+    advertised_total: u64,
+    received_total: u64,
+    announce: VaultAnnounce,
+    files: Vec<(PathBuf, [u8; 32])>,
+}
+
+impl ReplicaIngressStage {
+    fn create(
+        root: &Path,
+        count: u64,
+        advertised_total: u64,
+        announce: &VaultAnnounce,
+    ) -> Result<Self> {
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| anyhow::anyhow!("create ingress id: {error}"))?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let directory = root.join(format!("push-{name}"));
+        state::ensure_private_directory(&directory)?;
+        Ok(Self {
+            directory,
+            expected_count: count,
+            advertised_total,
+            received_total: 0,
+            announce: announce.clone(),
+            files: Vec::new(),
+        })
+    }
+
+    async fn receive(&mut self, recv: &mut RecvStream, index: u64) -> Result<()> {
+        ensure!(index < self.expected_count, "replica blob count exceeded");
+        let len = read_u64(recv).await?;
+        self.validate_length(len)?;
+        let path = self.directory.join(format!("blob-{index:05}"));
+        self.receive_content(recv, index, len, path).await
+    }
+
+    fn validate_length(&mut self, len: u64) -> Result<()> {
+        ensure!(
+            len <= MAX_REPLICA_BLOB as u64,
+            "replica blob length {len} exceeds cap"
+        );
+        self.received_total = self
+            .received_total
+            .checked_add(len)
+            .context("replica byte total overflow")?;
+        ensure!(
+            self.received_total <= self.advertised_total,
+            "replica push exceeded its advertised {} bytes",
+            self.advertised_total
+        );
+        Ok(())
+    }
+
+    async fn receive_content(
+        &mut self,
+        recv: &mut RecvStream,
+        index: u64,
+        len: u64,
+        path: PathBuf,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = len;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining != 0 {
+            let take = usize::try_from(remaining.min(buffer.len() as u64)).expect("bounded read");
+            recv.read_exact(&mut buffer[..take])
+                .await
+                .map_err(|error| anyhow::anyhow!("read blob: {error}"))?;
+            use std::io::Write;
+            file.write_all(&buffer[..take])?;
+            hasher.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        Self::validate_content_length(len, file.metadata()?.len())?;
+        file.sync_all()?;
+        let hash = *hasher.finalize().as_bytes();
+        self.validate_file(index, &path, hash)?;
+        self.files.push((path, hash));
+        Ok(())
+    }
+
+    fn validate_content_length(declared: u64, actual: u64) -> Result<()> {
+        ensure!(declared == actual, "replica blob content is truncated");
+        Ok(())
+    }
+
+    fn validate_file(&self, index: u64, path: &Path, hash: [u8; 32]) -> Result<()> {
+        if index == 0 {
+            ensure!(
+                hash == self.announce.digest,
+                "replica envelope hash does not match announce"
+            );
+            let bytes = std::fs::read(path)?;
+            let envelope = ManifestEnvelope::from_bytes(&bytes)
+                .map_err(|error| anyhow::anyhow!("replica envelope decode: {error}"))?;
+            envelope
+                .verify()
+                .map_err(|error| anyhow::anyhow!("replica envelope bad sig: {error}"))?;
+            ensure!(
+                envelope.vid == self.announce.vid
+                    && envelope.epoch == self.announce.epoch
+                    && envelope.by == self.announce.by,
+                "replica envelope does not bind to announce"
+            );
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        ensure!(
+            self.files.len() as u64 == self.expected_count,
+            "replica blob count is truncated"
+        );
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn files(&self) -> &[(PathBuf, [u8; 32])] {
+        &self.files
+    }
+}
+
+impl Drop for ReplicaIngressStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 /// Resolve a peer node id to a dialable [`EndpointAddr`]: the last-known address if recorded,
@@ -6514,6 +7877,96 @@ fn hex32(b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn authenticated_malformed_blob_transport_is_atomic_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let announce = VaultAnnounce {
+            vid: [1; 32],
+            epoch: 1,
+            replicas: vec![],
+            digest: [2; 32],
+            by: [3; 32],
+            sig: [0; 64],
+        };
+        let mut stage = ReplicaIngressStage::create(root.path(), 2, 8, &announce).unwrap();
+        assert!(stage
+            .validate_length((MAX_REPLICA_BLOB as u64) + 1)
+            .is_err());
+        stage.validate_length(5).unwrap();
+        assert!(
+            stage.validate_length(4).is_err(),
+            "advertised total is enforced"
+        );
+        assert!(ReplicaIngressStage::validate_content_length(5, 4).is_err());
+        let wrong = stage.directory.join("blob-00000");
+        std::fs::write(&wrong, b"wrong envelope").unwrap();
+        assert!(stage
+            .validate_file(0, &wrong, *blake3::hash(b"wrong envelope").as_bytes())
+            .is_err());
+        assert!(stage.files.is_empty(), "rejected files are never activated");
+
+        // Model only the served-store I/O result. Validation above is the exact production
+        // validator. Authorization is published later, after every add and the sync barrier.
+        let authorization_before = HashSet::<[u8; 32]>::new();
+        let mut untagged_physical = HashSet::new();
+        let activation = (|| -> Result<()> {
+            for (index, hash) in [[7u8; 32], [8u8; 32]].iter().enumerate() {
+                untagged_physical.insert(*hash);
+                if index == 1 {
+                    anyhow::bail!("injected served-store failure");
+                }
+            }
+            Ok(())
+        })();
+        assert!(activation.is_err());
+        assert_eq!(authorization_before, HashSet::new());
+        assert!(
+            untagged_physical.len() <= 2,
+            "leftovers are bounded by the batch"
+        );
+    }
+
+    #[test]
+    fn replica_ingress_startup_removes_only_exact_stale_staging_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join(".replica-ingress");
+        state::ensure_private_directory(&root).unwrap();
+        std::fs::write(root.join("stale"), b"partial").unwrap();
+        let neighbor = parent.path().join("keep");
+        std::fs::write(&neighbor, b"keep").unwrap();
+        cleanup_replica_ingress(&root).unwrap();
+        assert!(!root.exists());
+        assert_eq!(std::fs::read(neighbor).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_copy_is_private_and_refuses_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("copy");
+        std::fs::write(&source, b"database bytes").unwrap();
+        copy_private_database(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"database bytes");
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let linked_source = directory.path().join("linked-source");
+        symlink(&source, &linked_source).unwrap();
+        assert!(copy_private_database(&linked_source, &directory.path().join("copy-2")).is_err());
+        let linked_destination = directory.path().join("linked-copy");
+        symlink(&source, &linked_destination).unwrap();
+        assert!(copy_private_database(&source, &linked_destination).is_err());
+    }
+
     const NOW: u64 = 1_800_000_000; // well before DELEG_NOT_AFTER
 
     fn kp(seed: u8) -> SigningKey {
@@ -6531,6 +7984,222 @@ mod tests {
         };
         a.sign(node);
         a
+    }
+
+    #[test]
+    fn ceremony_rates_are_bounded_atomic_and_idempotent_cleanup_is_fail_closed() {
+        let subject = [0x61; 32];
+        let sponsor = [0x62; 32];
+        let mut shared = Shared::default();
+        for now in 1..=MAX_RECOVERY_OPENS_PER_WINDOW as u64 {
+            record_ceremony_rates(&mut shared, subject, sponsor, now).unwrap();
+        }
+        let subjects_before = shared.ceremony_subject_rate.clone();
+        let sponsors_before = shared.ceremony_sponsor_rate.clone();
+        assert!(record_ceremony_rates(&mut shared, subject, sponsor, 6).is_err());
+        assert_eq!(shared.ceremony_subject_rate, subjects_before);
+        assert_eq!(shared.ceremony_sponsor_rate, sponsors_before);
+
+        let id = [0x71; 16];
+        assert!(finish_ceremony(
+            &mut shared,
+            id,
+            subject,
+            sponsor,
+            10,
+            CeremonyTerminal::Aborted,
+        ));
+        assert!(finish_ceremony(
+            &mut shared,
+            id,
+            subject,
+            sponsor,
+            20,
+            CeremonyTerminal::Completed,
+        ));
+        let terminal = shared.ceremony_tombstones[&id];
+        assert_eq!(terminal.terminal, CeremonyTerminal::Aborted);
+        assert_eq!(terminal.terminal_at, 10);
+
+        for (id, terminal) in [
+            ([0x72; 16], CeremonyTerminal::Rejected),
+            ([0x73; 16], CeremonyTerminal::Failed),
+        ] {
+            assert!(finish_ceremony(
+                &mut shared,
+                id,
+                subject,
+                sponsor,
+                21,
+                terminal,
+            ));
+            assert_eq!(shared.ceremony_tombstones[&id].terminal, terminal);
+        }
+
+        shared.ceremony_tombstones.clear();
+        for value in 0..MAX_CEREMONY_TOMBSTONES {
+            let mut key = [0u8; 16];
+            key[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            shared.ceremony_tombstones.insert(
+                key,
+                CeremonyTombstone {
+                    subject,
+                    sponsor,
+                    terminal_at: value as u64,
+                    terminal: CeremonyTerminal::Expired,
+                },
+            );
+        }
+        assert!(!finish_ceremony(
+            &mut shared,
+            [0xFF; 16],
+            subject,
+            sponsor,
+            30,
+            CeremonyTerminal::Expired,
+        ));
+        assert_eq!(shared.ceremony_tombstones.len(), MAX_CEREMONY_TOMBSTONES);
+    }
+
+    #[test]
+    fn ceremony_active_subject_cap_is_independent_for_each_subject() {
+        let signer = kp(0x59);
+        let sponsor = signer.verifying_key().to_bytes();
+        let subject = [0x5A; 32];
+        let other_subject = [0x5B; 32];
+        let mut shared = Shared::default();
+
+        for value in 0..MAX_ACTIVE_CEREMONIES_PER_SUBJECT {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            let open = open_recovery(
+                &signer,
+                id,
+                subject,
+                1,
+                "claimant".into(),
+                [0x5C; 32],
+                [0x5D; 32],
+                "recovery".into(),
+                100,
+            );
+            let state = CeremonyState::open(&open, vec![sponsor], 1, 100, 100).unwrap();
+            shared.ceremonies.insert(
+                id,
+                TrackedCeremony {
+                    state,
+                    approved: false,
+                    takeover: false,
+                },
+            );
+        }
+
+        assert!(!can_start_ceremony(&shared, &subject));
+        assert!(can_start_ceremony(&shared, &other_subject));
+    }
+
+    #[test]
+    fn maintenance_history_is_bounded_and_clears_the_failure_streak() {
+        let mut history = OperationalHistory::default();
+        record_maintenance_history(&mut history, 10, usize::MAX, false);
+        assert_eq!(history.last_maintenance_at, 10);
+        assert_eq!(history.last_failure_at, 10);
+        assert_eq!(history.last_failure_count, MAX_OPERATION_FAILURE_COUNT);
+        assert_eq!(history.consecutive_failed_rounds, 1);
+        assert!(!history.last_gc_succeeded);
+
+        record_maintenance_history(&mut history, 20, 1, false);
+        assert_eq!(history.consecutive_failed_rounds, 2);
+        record_maintenance_history(&mut history, 30, 0, true);
+        assert_eq!(history.last_maintenance_at, 30);
+        assert_eq!(history.last_failure_at, 20);
+        assert_eq!(history.last_failure_count, 0);
+        assert_eq!(history.consecutive_failed_rounds, 0);
+        assert!(history.last_gc_succeeded);
+    }
+
+    #[test]
+    fn ceremony_cleanup_classifies_released_state_and_blocks_reopen() {
+        let signer = kp(0x63);
+        let sponsor = signer.verifying_key().to_bytes();
+        let subject = [0x64; 32];
+        let id = [0x65; 16];
+        let open = open_recovery(
+            &signer,
+            id,
+            subject,
+            1,
+            "claimant".into(),
+            [0x66; 32],
+            [0x67; 32],
+            "lost device".into(),
+            100,
+        );
+        let state = CeremonyState::open(&open, vec![sponsor], 1, 10, 100).unwrap();
+        let mut shared = Shared::default();
+        shared.ceremonies.insert(
+            id,
+            TrackedCeremony {
+                state,
+                approved: true,
+                takeover: false,
+            },
+        );
+        shared.ceremony_alarms.insert(
+            id,
+            AlarmRecord {
+                subject,
+                sponsor,
+                claimant_display: "claimant".into(),
+                reason: "lost device".into(),
+                is_self_subject: false,
+                aborted: false,
+                takeover: false,
+            },
+        );
+        shared.ceremony_released.insert(id, open.new_node);
+
+        assert!(cleanup_ceremonies(
+            &mut shared,
+            100 + 10 + CEREMONY_COMPLETION_GRACE_SECS
+        ));
+        assert!(!shared.ceremonies.contains_key(&id));
+        assert!(!shared.ceremony_alarms.contains_key(&id));
+        assert!(!shared.ceremony_released.contains_key(&id));
+        assert_eq!(
+            shared.ceremony_tombstones[&id].terminal,
+            CeremonyTerminal::Completed
+        );
+        assert!(shared.ceremony_tombstones.contains_key(&open.ceremony_id));
+    }
+
+    #[test]
+    fn gc_retains_recoverable_and_replica_blobs_and_prunes_superseded_access() {
+        let vid = [0x10; 32];
+        let digest = [0x20; 32];
+        let current_chunk = [0x21; 32];
+        let replica_chunk = [0x30; 32];
+        let superseded_chunk = [0x40; 32];
+        let mut shared = Shared::default();
+        shared
+            .needs_refetch
+            .insert(vid, (digest, vec![current_chunk]));
+        shared.replica_chunks.insert(replica_chunk, [0x11; 32]);
+        shared.owned_chunks.insert(digest, vid);
+        shared.owned_chunks.insert(current_chunk, vid);
+        shared.owned_chunks.insert(superseded_chunk, vid);
+
+        let roots = blob_retention_set(&shared).expect("retention set");
+        assert_eq!(
+            roots.all,
+            HashSet::from([digest, current_chunk, replica_chunk])
+        );
+        assert_eq!(roots.owned, HashSet::from([digest, current_chunk]));
+
+        let removed = prune_owned_authorizations(&mut shared, &roots.owned);
+        assert_eq!(removed, 1);
+        assert!(!shared.owned_chunks.contains_key(&superseded_chunk));
+        assert!(shared.owned_chunks.contains_key(&current_chunk));
     }
 
     // C1: an announce is honored only if its signer node is delegated by the owner's newest card.
@@ -6633,6 +8302,84 @@ mod tests {
         assert!(
             !card_delegates_node(&card, &[0x42; 32], NOW),
             "unknown node id"
+        );
+    }
+
+    #[test]
+    fn recovery_claimant_admission_requires_exact_completed_ceremony() {
+        let sponsor_key = kp(0x21);
+        let subject_key = kp(0x22);
+        let recovered_node_key = kp(0x23);
+        let other_node_key = kp(0x24);
+        let wrong_subject_key = kp(0x25);
+        let id = [0x26; 16];
+        let subject = subject_key.verifying_key().to_bytes();
+        let recovered_node = recovered_node_key.verifying_key().to_bytes();
+        let open = open_recovery(
+            &sponsor_key,
+            id,
+            subject,
+            1,
+            "claimant".into(),
+            [0x27; 32],
+            recovered_node,
+            "lost device".into(),
+            100,
+        );
+        let state = CeremonyState::open(
+            &open,
+            vec![sponsor_key.verifying_key().to_bytes()],
+            1,
+            10,
+            100,
+        )
+        .unwrap();
+        let mut shared = Shared::default();
+        shared.ceremonies.insert(
+            id,
+            TrackedCeremony {
+                state,
+                approved: true,
+                takeover: false,
+            },
+        );
+        let card = card_with(&subject_key, &recovered_node_key, 1);
+
+        assert!(
+            !recovery_claimant_device(&shared, &card, &recovered_node, 110),
+            "a ceremony that did not release a share is not complete"
+        );
+
+        shared.ceremony_released.insert(id, recovered_node);
+        assert!(recovery_claimant_device(
+            &shared,
+            &card,
+            &recovered_node,
+            110
+        ));
+        assert!(
+            !recovery_claimant_device(
+                &shared,
+                &card,
+                &other_node_key.verifying_key().to_bytes(),
+                110,
+            ),
+            "the authenticated node must match RecoveryOpen.new_node"
+        );
+
+        let wrong_subject_card = card_with(&wrong_subject_key, &recovered_node_key, 1);
+        assert!(
+            !recovery_claimant_device(&shared, &wrong_subject_card, &recovered_node, 110),
+            "the card user must match the ceremony subject"
+        );
+        assert!(
+            !recovery_claimant_device(
+                &shared,
+                &card,
+                &recovered_node,
+                100 + 10 + CEREMONY_COMPLETION_GRACE_SECS,
+            ),
+            "an expired ceremony cannot admit a recovered node"
         );
     }
 
