@@ -16,7 +16,12 @@ required=(
 )
 
 hash_file() {
-  shasum -a 256 "$1" | awk '{print $1}'
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    command -v shasum >/dev/null 2>&1
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
 }
 
 generate() {

@@ -2,17 +2,18 @@
 set -euo pipefail
 
 status=0
+command -v grep >/dev/null 2>&1
 
 while IFS= read -r match; do
   [[ -z "$match" ]] && continue
   echo "Free-form daemon or API log call is not allowed: $match" >&2
   status=1
 done < <(
-  rg -n '(eprintln!|println!|dbg!|tracing::|log::)' \
-    crates/carapaced/src crates/carapace-api/src \
-    --glob '*.rs' \
-    --glob '!ops.rs' \
-    --glob '!**/bin/**' || true
+  grep -R -n -E '(eprintln!|println!|dbg!|tracing::|log::)' \
+    --include='*.rs' \
+    --exclude='ops.rs' \
+    --exclude-dir='bin' \
+    crates/carapaced/src crates/carapace-api/src || true
 )
 
 if (( status != 0 )); then
