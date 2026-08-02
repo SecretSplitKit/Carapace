@@ -29,7 +29,9 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Cargo reports path-only dependencies in the pinned Chela checkout as
+# wildcards. The lock file and chela-revision.txt pin these dependencies.
+wildcards = "warn"
 allow-wildcard-paths = true
 highlight = "all"
 

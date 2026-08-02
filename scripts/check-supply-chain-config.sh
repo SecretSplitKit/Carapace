@@ -13,6 +13,7 @@ grep -Fq 'rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0'
 grep -Fq 'unknown-registry = "deny"' deny.toml
 grep -Fq 'unknown-git = "deny"' deny.toml
 grep -Fq 'yanked = "deny"' deny.toml
+grep -Fq 'wildcards = "warn"' deny.toml
 grep -Fq 'allow-wildcard-paths = true' deny.toml
 grep -Fq '"Unlicense"' deny.toml
 
