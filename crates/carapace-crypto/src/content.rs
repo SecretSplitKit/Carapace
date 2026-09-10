@@ -25,6 +25,14 @@ pub fn chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Stream the normative FastCDC chunks with memory bounded by [`MAX_SIZE`].
+pub fn chunks_from_reader<R: std::io::Read>(
+    reader: R,
+) -> impl Iterator<Item = std::io::Result<Vec<u8>>> {
+    fastcdc::v2016::StreamCDC::with_level(reader, MIN_SIZE, AVG_SIZE, MAX_SIZE, NORMALIZATION)
+        .map(|chunk| chunk.map(|value| value.data).map_err(std::io::Error::other))
+}
+
 /// A sealed chunk plus everything a manifest needs to recover it. `chunk_key`
 /// and `nonce` are stored per-chunk in the (separately sealed) manifest, so the
 /// owner never needs the plaintext again to open the blob.
@@ -140,6 +148,14 @@ mod tests {
             pos += len;
         }
         assert_eq!(pos, data.len(), "chunks must cover the whole input");
+        let streamed: Vec<Vec<u8>> = chunks_from_reader(data.as_slice())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            streamed.iter().map(Vec::len).collect::<Vec<_>>(),
+            ranges.iter().map(|(_, len)| *len).collect::<Vec<_>>()
+        );
+        assert_eq!(streamed.concat(), data);
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub use merge::{
 };
 pub use store::{ChunkStore, FsStore, MemoryStore, StoreError};
 
-use carapace_crypto::content::{self, chunk_ranges};
+use carapace_crypto::content;
 use carapace_crypto::kdf::{self, Key32};
 use carapace_wire::{FileEntry, Manifest, ManifestEnvelope, Vv};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -20,6 +20,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -216,6 +217,7 @@ pub fn ingest_dir<S: ChunkStore>(
     prev: Option<&Manifest>,
     store: &mut S,
 ) -> Result<Ingest, VaultError> {
+    carapace_restore::refuse_pending_journal(dir)?;
     let node_pub = node_key.verifying_key().to_bytes();
 
     // Prior per-path entries, for VV carry-forward / bump and tombstoning.
@@ -227,20 +229,38 @@ pub fn ingest_dir<S: ChunkStore>(
     collect_files(dir, dir, &mut rel_paths)?;
     rel_paths.sort();
 
+    // Reject vaults that the restore side cannot faithfully materialize before
+    // encrypting or storing any content.
+    let mut restore_layout = Vec::with_capacity(rel_paths.len());
+    for rel in &rel_paths {
+        let path = rel_to_slash(rel)
+            .ok_or_else(|| VaultError::NonUtf8Path(rel.to_string_lossy().into_owned()))?;
+        restore_layout.push((path, fs::metadata(dir.join(rel))?.len()));
+    }
+    carapace_restore::validate_operation(
+        restore_layout
+            .iter()
+            .map(|(path, size)| (path.as_str(), *size)),
+    )?;
+
     let mut files = Vec::with_capacity(rel_paths.len());
     let mut key_map: ChunkKeys = HashMap::new();
     let mut on_disk: HashSet<String> = HashSet::with_capacity(rel_paths.len());
 
     for rel in &rel_paths {
         let full = dir.join(rel);
-        let meta = fs::metadata(&full)?;
-        let data = fs::read(&full)?;
-        let file_hash = *blake3::hash(&data).as_bytes();
+        let file = fs::File::open(&full)?;
+        let meta = file.metadata()?;
+        let mut file_hasher = blake3::Hasher::new();
+        let mut size = 0u64;
 
         let mut chunk_refs: Vec<([u8; 32], [u8; 32], u64)> = Vec::new();
-        for (off, len) in chunk_ranges(&data) {
-            let plaintext = &data[off..off + len];
-            let sealed = content::seal_chunk(&*keys.k_content, &keys.vid, plaintext)?;
+        for chunk in content::chunks_from_reader(&file) {
+            let plaintext = chunk?;
+            let len = plaintext.len();
+            size += len as u64;
+            file_hasher.update(&plaintext);
+            let sealed = content::seal_chunk(&*keys.k_content, &keys.vid, &plaintext)?;
             store.put(sealed.chunk_id, sealed.ciphertext)?;
             // pt_hash in the manifest lets a K_content holder re-derive key/nonce (Option B, §4).
             chunk_refs.push((sealed.chunk_id, sealed.pt_hash, len as u64));
@@ -250,6 +270,17 @@ pub fn ingest_dir<S: ChunkStore>(
             });
         }
 
+        let after = file.metadata()?;
+        if size != meta.len()
+            || after.len() != meta.len()
+            || after.modified()? != meta.modified()?
+        {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "file changed during ingest: {}",
+                full.display()
+            ))));
+        }
+        let file_hash = *file_hasher.finalize().as_bytes();
         let path = rel_to_slash(rel)
             .ok_or_else(|| VaultError::NonUtf8Path(rel.to_string_lossy().into_owned()))?;
         let version = match prev_by_path.get(path.as_str()) {
@@ -266,7 +297,7 @@ pub fn ingest_dir<S: ChunkStore>(
             path,
             mode: file_mode(&meta),
             mtime: file_mtime(&meta)?,
-            size: data.len() as u64,
+            size,
             chunks: chunk_refs,
             file_hash,
             version,
@@ -433,6 +464,12 @@ pub fn reconstruct<S: ChunkStore>(
     keys: &ChunkKeys,
     out_dir: &Path,
 ) -> Result<(), VaultError> {
+    carapace_restore::validate_operation(
+        manifest
+            .files
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.size)),
+    )?;
     let live: Vec<_> = manifest
         .files
         .iter()
@@ -477,6 +514,179 @@ pub fn reconstruct<S: ChunkStore>(
         journal.mark_complete(index)?;
     }
     journal.finish()?;
+    Ok(())
+}
+
+/// Apply one validated manifest tombstone through the hardened restore layer.
+pub fn remove_restored_file(root: &Path, relative: &str) -> Result<(), VaultError> {
+    let mut paths = carapace_restore::validate_operation([(relative, 0)])?;
+    carapace_restore::remove_file(root, &paths.remove(0))?;
+    Ok(())
+}
+
+pub fn has_pending_restore(root: &Path) -> Result<bool, VaultError> {
+    Ok(carapace_restore::has_pending_journal(root)?)
+}
+
+/// Preserve an interrupted restore tree before retrying it. The destination
+/// must be a freshly-created private directory supplied by the daemon.
+pub fn backup_interrupted_tree(source: &Path, destination: &Path) -> Result<(), VaultError> {
+    let source_meta = fs::symlink_metadata(source)?;
+    if unsupported_link(&source_meta) || !source_meta.is_dir() {
+        return Err(VaultError::Io(std::io::Error::other(
+            "interrupted restore source is not a directory",
+        )));
+    }
+    let destination_meta = fs::symlink_metadata(destination)?;
+    if unsupported_link(&destination_meta) || !destination_meta.is_dir() {
+        return Err(VaultError::Io(std::io::Error::other(
+            "restore backup destination is not a directory",
+        )));
+    }
+
+    let mut files = Vec::new();
+    collect_backup_files(source, source, &mut files)?;
+    let mut layout = Vec::with_capacity(files.len());
+    for relative in &files {
+        let path = rel_to_slash(relative)
+            .ok_or_else(|| VaultError::NonUtf8Path(relative.to_string_lossy().into_owned()))?;
+        layout.push((path, fs::symlink_metadata(source.join(relative))?.len()));
+    }
+    carapace_restore::validate_operation(layout.iter().map(|(path, size)| (path.as_str(), *size)))?;
+
+    let mut backup_directories = HashSet::new();
+    for (relative, (_, expected_size)) in files.into_iter().zip(layout.iter()) {
+        let target = destination.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+            let mut directory = parent;
+            while let Ok(relative_parent) = directory.strip_prefix(destination) {
+                backup_directories.insert(relative_parent.to_path_buf());
+                if relative_parent.as_os_str().is_empty() {
+                    break;
+                }
+                directory = directory.parent().expect("backup parent has an ancestor");
+            }
+        }
+        let mut input = open_backup_source(&source.join(&relative))?;
+        let before = input.metadata()?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        let copied = std::io::copy(&mut input.by_ref().take(*expected_size + 1), &mut output)?;
+        let after = input.metadata()?;
+        if copied != *expected_size
+            || before.len() != *expected_size
+            || after.len() != before.len()
+            || after.modified()? != before.modified()?
+        {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "file changed during interrupted restore backup: {}",
+                relative.display()
+            ))));
+        }
+        output.sync_all()?;
+    }
+    let mut backup_directories: Vec<_> = backup_directories.into_iter().collect();
+    backup_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for relative in backup_directories {
+        sync_backup_directory(&destination.join(relative))?;
+    }
+    Ok(())
+}
+
+fn collect_backup_files(
+    root: &Path,
+    directory: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), VaultError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if directory == root
+            && matches!(
+                entry.file_name().to_str(),
+                Some(".carapace-restore-journal" | ".carapace-restore-lock")
+            )
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        let ty = metadata.file_type();
+        if unsupported_link(&metadata) {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "unsupported link in interrupted restore: {}",
+                path.display()
+            ))));
+        }
+        if ty.is_dir() {
+            collect_backup_files(root, &path, out)?;
+        } else if ty.is_file() {
+            out.push(
+                path.strip_prefix(root)
+                    .expect("path is under root")
+                    .to_path_buf(),
+            );
+        } else {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "unsupported filesystem object in interrupted restore: {}",
+                path.display()
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn open_backup_source(path: &Path) -> Result<fs::File, VaultError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const O_NOFOLLOW: i32 = 0x20000;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const O_NOFOLLOW: i32 = 0x100;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if unsupported_link(&metadata) || !metadata.is_file() {
+        return Err(VaultError::Io(std::io::Error::other(format!(
+            "unsupported filesystem object in interrupted restore: {}",
+            path.display()
+        ))));
+    }
+    Ok(file)
+}
+
+fn unsupported_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(unix)]
+fn sync_backup_directory(path: &Path) -> Result<(), VaultError> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_backup_directory(_path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 

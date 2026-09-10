@@ -44,14 +44,18 @@ pub struct ClaimantState {
     pub(crate) claimant: Arc<Mutex<Option<ClaimantDevice>>>,
     pub(crate) state_dir: Arc<PathBuf>,
     pub(crate) token: Arc<str>,
+    persist_session: bool,
 }
 
 impl ClaimantState {
     pub(crate) fn new(state_dir: PathBuf, token: Arc<str>) -> Result<Self> {
         Ok(Self {
-            claimant: Arc::new(Mutex::new(Some(ClaimantDevice::new()?))),
+            claimant: Arc::new(Mutex::new(Some(ClaimantDevice::load_or_create(
+                &state_dir,
+            )?))),
             state_dir: Arc::new(state_dir),
             token,
+            persist_session: true,
         })
     }
 }
@@ -61,6 +65,8 @@ pub(crate) struct TrusteeAddress {
     node: String,
     #[serde(default)]
     addrs: Vec<String>,
+    #[serde(default)]
+    relay_url: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -73,6 +79,8 @@ pub(crate) struct RecoveryAnnounceRef {
 #[derive(Deserialize)]
 pub(crate) struct CompleteRequest {
     open_hex: String,
+    #[serde(default)]
+    sponsor_sig: String,
     confirmed_subject: String,
     roster: Vec<String>,
     trustees: Vec<TrusteeAddress>,
@@ -175,13 +183,25 @@ pub(crate) async fn status(State(state): State<ClaimantState>) -> Json<Value> {
 pub(crate) async fn cancel(
     State(state): State<ClaimantState>,
 ) -> Result<Json<Value>, ClaimantError> {
-    let fresh = ClaimantDevice::new().map_err(|_| {
+    let mut guard = state.claimant.lock().await;
+    if guard.is_none() {
+        return Err(ClaimantError(
+            StatusCode::CONFLICT,
+            "claimant activation is complete or active".into(),
+        ));
+    }
+    let fresh = (if state.persist_session {
+        ClaimantDevice::reset_persisted(&state.state_dir)
+    } else {
+        ClaimantDevice::new()
+    })
+    .map_err(|_| {
         ClaimantError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not create a fresh claimant session".into(),
         )
     })?;
-    let old = state.claimant.lock().await.replace(fresh);
+    let old = guard.replace(fresh);
     drop(old);
     crate::ops::log("claimant.cancelled", None);
     Ok(Json(json!({
@@ -250,6 +270,7 @@ pub(crate) async fn complete(
             Ok((
                 decode_32("trustee node", &trustee.node)?,
                 trustee.addrs.clone(),
+                trustee.relay_url.clone(),
             ))
         })
         .collect::<Result<Vec<_>, ClaimantError>>()?;
@@ -277,7 +298,35 @@ pub(crate) async fn complete(
         return Err(bad("the recovery open does not name this claimant session"));
     }
 
-    let recovered = match claimant.recover_at(&open, &roster, &trustees).await {
+    let refs = request
+        .announce_refs
+        .iter()
+        .map(|reference| {
+            Ok(carapace_wire::AnnounceRef {
+                vid: decode_32("vault id", &reference.vid)?,
+                epoch: reference.epoch,
+                digest: decode_32("manifest digest", &reference.digest)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ClaimantError>>();
+    let signature = hex::decode(&request.sponsor_sig)
+        .ok()
+        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+    let verified = refs
+        .as_ref()
+        .ok()
+        .zip(signature.as_ref())
+        .is_some_and(|(refs, signature)| {
+            carapaced::verify_claimant_package(&open, &roster, &trustees, refs, signature).is_ok()
+        });
+    if !verified {
+        *state.claimant.lock().await = Some(claimant);
+        return Err(bad("the sponsor package metadata signature is invalid"));
+    }
+    let recovered = match claimant
+        .recover_at_with_relays(&open, &roster, &trustees)
+        .await
+    {
         Ok(recovered) => recovered,
         Err(error) => {
             let _ = error;
@@ -299,7 +348,12 @@ pub(crate) async fn complete(
     let user_id = recovered.user_id;
     let new_node = recovered.new_node;
     let node_seed = claimant.node_seed();
-    if persist_restart_handoff(&state.state_dir, &request.trustees, &request.announce_refs).is_err()
+    if persist_restart_handoff(
+        &state.state_dir,
+        &request,
+        &carapaced::State::from_seeds(node_seed, *recovered.k_root),
+    )
+    .is_err()
     {
         *state.claimant.lock().await = Some(claimant);
         return Err(ClaimantError(
@@ -335,40 +389,109 @@ pub(crate) async fn complete(
     })))
 }
 
-#[derive(Serialize)]
-struct RestartHandoff<'a> {
-    r#type: &'static str,
+#[derive(Serialize, Deserialize)]
+struct RestartHandoff {
+    r#type: String,
     version: u8,
-    trustees: &'a [TrusteeAddress],
-    announce_refs: &'a [RecoveryAnnounceRef],
+    open_hex: String,
+    sponsor_sig: String,
+    roster: Vec<String>,
+    trustees: Vec<TrusteeAddress>,
+    announce_refs: Vec<RecoveryAnnounceRef>,
 }
 
 fn persist_restart_handoff(
     state_dir: &Path,
-    trustees: &[TrusteeAddress],
-    announce_refs: &[RecoveryAnnounceRef],
+    request: &CompleteRequest,
+    identity: &carapaced::State,
 ) -> Result<()> {
-    fs::create_dir_all(state_dir)?;
-    let path = state_dir.join("recovery-restart-handoff.json");
-    let temporary = state_dir.join(".recovery-restart-handoff.tmp");
+    carapaced::State::secure_directory(state_dir)?;
     let bytes = serde_json::to_vec(&RestartHandoff {
-        r#type: "carapace.recovery-restart-handoff",
-        version: 1,
-        trustees,
-        announce_refs,
+        r#type: "carapace.recovery-restart-handoff".into(),
+        version: 2,
+        open_hex: request.open_hex.clone(),
+        sponsor_sig: request.sponsor_sig.clone(),
+        roster: request.roster.clone(),
+        trustees: request.trustees.clone(),
+        announce_refs: request.announce_refs.clone(),
     })?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let sealed = identity.seal_recovery_handoff(&bytes)?;
+    let paths = [
+        state_dir.join("recovery-restart-handoff.json"),
+        state_dir.join("recovery-restart-handoff.seal"),
+    ];
+    for path in &paths {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "handoff path is a symlink"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    let mut file = options.open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
+    for (path, contents) in paths.iter().zip([bytes.as_slice(), sealed.as_slice()]) {
+        // Random create-new names inherit the private directory ACL on Windows;
+        // tempfile creates mode 0600 files on Unix. Persist atomically replaces
+        // an earlier handoff on both platforms, including activation retries.
+        let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
+        temporary.write_all(contents)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path)?;
+    }
+    #[cfg(unix)]
+    fs::File::open(state_dir)?.sync_all()?;
     Ok(())
+}
+
+pub(crate) fn restart_metadata(
+    bytes: &[u8],
+    subject: [u8; 32],
+) -> Result<(
+    Vec<carapaced::ClaimantAddress>,
+    Vec<carapace_wire::AnnounceRef>,
+)> {
+    let handoff: RestartHandoff = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(
+        handoff.r#type == "carapace.recovery-restart-handoff" && handoff.version == 2,
+        "unsupported unsigned restart handoff"
+    );
+    let open = RecoveryOpen::decode_frame(&hex::decode(handoff.open_hex)?)?;
+    anyhow::ensure!(
+        open.subject == subject,
+        "restart handoff belongs to another account"
+    );
+    let key = |text: &str| -> Result<[u8; 32]> {
+        hex::decode(text)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid public key length"))
+    };
+    let roster = handoff
+        .roster
+        .iter()
+        .map(|user| key(user))
+        .collect::<Result<Vec<_>>>()?;
+    let trustees = handoff
+        .trustees
+        .into_iter()
+        .map(|t| Ok((key(&t.node)?, t.addrs, t.relay_url)))
+        .collect::<Result<Vec<_>>>()?;
+    let refs = handoff
+        .announce_refs
+        .into_iter()
+        .map(|r| {
+            Ok(carapace_wire::AnnounceRef {
+                vid: key(&r.vid)?,
+                epoch: r.epoch,
+                digest: key(&r.digest)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let signature = hex::decode(handoff.sponsor_sig)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid sponsor signature length"))?;
+    carapaced::verify_claimant_package(&open, &roster, &trustees, &refs, &signature)?;
+    Ok((trustees, refs))
 }
 
 fn decode_32(label: &str, value: &str) -> Result<[u8; 32], ClaimantError> {
@@ -386,7 +509,12 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(dir: PathBuf) -> ClaimantState {
-        ClaimantState::new(dir, Arc::from("test-token")).unwrap()
+        ClaimantState {
+            claimant: Arc::new(Mutex::new(Some(ClaimantDevice::new().unwrap()))),
+            state_dir: Arc::new(dir),
+            token: Arc::from("test-token"),
+            persist_session: false,
+        }
     }
 
     #[tokio::test]
@@ -432,11 +560,13 @@ mod tests {
         };
         open.sign(&sponsor);
         let request = CompleteRequest {
+            sponsor_sig: String::new(),
             open_hex: hex::encode(open.encode_frame()),
             confirmed_subject: hex::encode(open.subject),
             roster: vec![hex::encode(sponsor.verifying_key().to_bytes())],
             trustees: vec![TrusteeAddress {
                 node: hex::encode([6; 32]),
+                relay_url: None,
                 addrs: Vec::new(),
             }],
             announce_refs: Vec::new(),
@@ -475,11 +605,13 @@ mod tests {
             sig: [0; 64],
         };
         let request = CompleteRequest {
+            sponsor_sig: String::new(),
             open_hex: hex::encode(open.encode_frame()),
             confirmed_subject: hex::encode(open.subject),
             roster: vec![hex::encode(sponsor.verifying_key().to_bytes())],
             trustees: vec![TrusteeAddress {
                 node: hex::encode([6; 32]),
+                relay_url: None,
                 addrs: Vec::new(),
             }],
             announce_refs: Vec::new(),
@@ -530,11 +662,13 @@ mod tests {
         let error = complete(
             State(state.clone()),
             Json(CompleteRequest {
+                sponsor_sig: String::new(),
                 open_hex,
                 confirmed_subject: hex::encode([7; 32]),
                 roster: vec![hex::encode(sponsor.verifying_key().to_bytes())],
                 trustees: vec![TrusteeAddress {
                     node: hex::encode([6; 32]),
+                    relay_url: None,
                     addrs: Vec::new(),
                 }],
                 announce_refs: Vec::new(),
@@ -606,6 +740,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let trustees = vec![TrusteeAddress {
             node: hex::encode([3; 32]),
+            relay_url: None,
             addrs: vec!["127.0.0.1:9000".into()],
         }];
         let refs = vec![RecoveryAnnounceRef {
@@ -613,7 +748,20 @@ mod tests {
             epoch: 7,
             digest: hex::encode([5; 32]),
         }];
-        persist_restart_handoff(dir.path(), &trustees, &refs).unwrap();
+        let mut request = CompleteRequest {
+            open_hex: String::new(),
+            sponsor_sig: String::new(),
+            confirmed_subject: String::new(),
+            roster: vec![],
+            trustees,
+            announce_refs: refs,
+        };
+        persist_restart_handoff(
+            dir.path(),
+            &request,
+            &carapaced::State::from_seeds([1; 32], [2; 32]),
+        )
+        .unwrap();
         let path = dir.path().join("recovery-restart-handoff.json");
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("carapace.recovery-restart-handoff"));
@@ -621,6 +769,18 @@ mod tests {
         for secret in ["k_root", "node_seed", "share_json", "ceremony_private"] {
             assert!(!text.contains(secret));
         }
+        let seal_path = dir.path().join("recovery-restart-handoff.seal");
+        let first_seal = fs::read(&seal_path).unwrap();
+        request.announce_refs[0].epoch = 8;
+        persist_restart_handoff(
+            dir.path(),
+            &request,
+            &carapaced::State::from_seeds([1; 32], [2; 32]),
+        )
+        .unwrap();
+        let retried: RestartHandoff = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(retried.announce_refs[0].epoch, 8);
+        assert_ne!(fs::read(&seal_path).unwrap(), first_seal);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

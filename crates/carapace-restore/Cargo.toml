@@ -12,9 +12,10 @@ workspace = true
 getrandom = "0.2"
 unicode-normalization = "0.1"
 blake3 = "1"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
-[dev-dependencies]
-tempfile = "3"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { startStatusFeed, stopStatusFeed, live } from '$lib/statusStore';
+	import { startStatusFeed, stopStatusFeed, live, sessionExpired, status } from '$lib/statusStore';
 	import ErrorBanner from '$lib/components/ErrorBanner.svelte';
 	import OverviewView from '$lib/components/OverviewView.svelte';
 	import VaultsView from '$lib/components/VaultsView.svelte';
@@ -86,6 +86,8 @@
 	</header>
 
 	<main>
+		{#if !$live}<p role="status">{$sessionExpired ? 'This session expired. Reload to reconnect.' : 'Disconnected. Displaying the last known state while reconnecting.'}</p>{/if}
+		{#each $status?.sync_errors ?? [] as issue (issue.node)}<p role="alert">Sync: {issue.error}</p>{/each}
 		<ErrorBanner />
 		{#if route === 'vaults'}
 			<VaultsView />

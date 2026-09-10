@@ -183,7 +183,9 @@ async fn long_offline_owner_reboots_and_resyncs_latest_vault() -> Result<()> {
         .iter()
         .find(|result| result.vid == vid)
         .context("rebooted offline device did not resync the vault")?;
-    assert_eq!(latest.epoch, 3);
+    // Reconciliation can publish the adopted baseline and then a merged epoch.
+    // The content must be current and the receiver's line must remain monotonic.
+    assert!(latest.epoch >= 3);
     assert_eq!(
         std::fs::read(latest.out_dir.join("offline.txt"))?,
         b"epoch three latest"

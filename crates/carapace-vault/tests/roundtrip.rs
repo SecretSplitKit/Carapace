@@ -7,6 +7,22 @@ use carapace_vault::{
     chunk_keys_from_manifest, reconstruct, reconstruct_file, ChunkStore, FsStore, VaultError,
 };
 use carapace_vault::{ingest_dir, new_vid, open_envelope, MemoryStore, VaultKeys};
+
+#[test]
+fn ingest_rejects_file_larger_than_restore_limit_before_reading() {
+    let src = TempDir::new("oversized-ingest");
+    let oversized = std::fs::File::create(src.path().join("oversized.bin")).unwrap();
+    oversized
+        .set_len(carapace_restore::MAX_FILE_BYTES + 1)
+        .unwrap();
+
+    let node_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+    let (vid, _) = new_vid(&node_key.verifying_key().to_bytes());
+    let keys = VaultKeys::derive(&[7u8; 32], vid);
+    let mut store = MemoryStore::new();
+
+    assert!(ingest_dir(src.path(), &node_key, &keys, 1, None, &mut store).is_err());
+}
 use ed25519_dalek::SigningKey;
 use std::fs;
 use std::path::PathBuf;

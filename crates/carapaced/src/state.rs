@@ -20,6 +20,8 @@ const CREDENTIAL_ID_FILE: &str = "credential.id";
 /// Magic prefix marking a key file as an at-rest-sealed blob (vs. a raw seed).
 const ATREST_MAGIC: &[u8; 8] = b"CRPCSEAL";
 
+type ClaimantSeeds = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+
 /// Loaded (or freshly generated) daemon state.
 pub struct State {
     /// This device's node signing key.
@@ -173,6 +175,81 @@ impl State {
         })
     }
 
+    /// Apply the platform's private directory permissions before writing secrets.
+    pub fn secure_directory(dir: &Path) -> Result<()> {
+        ensure_private_directory(dir)
+    }
+
+    /// Bind public restart metadata to the recovered account's protected root.
+    pub fn seal_recovery_handoff(&self, metadata: &[u8]) -> Result<Vec<u8>> {
+        Ok(carapace_crypto::state_seal::seal(
+            &self.k_root,
+            b"claimant-handoff",
+            b"version-2",
+            blake3::hash(metadata).as_bytes(),
+        )?)
+    }
+
+    pub(crate) fn prepare_account_import(dir: &Path, package: &[u8]) -> Result<()> {
+        let marker = dir.join("account-transfer.id");
+        let digest = blake3::hash(package);
+        if marker.exists() {
+            ensure!(
+                !std::fs::symlink_metadata(&marker)?.file_type().is_symlink(),
+                "transfer marker is a symlink"
+            );
+            ensure!(
+                std::fs::read(&marker)? == digest.as_bytes(),
+                "destination belongs to another transfer package"
+            );
+            return Ok(());
+        }
+        if dir.exists() {
+            ensure!(
+                std::fs::read_dir(dir)?.next().is_none(),
+                "account import requires a fresh, empty state directory"
+            );
+        }
+        ensure_private_directory(dir)?;
+        write_secret(&marker, digest.as_bytes())
+    }
+
+    /// Persist a claimant's node seed and ceremony entropy without creating an account identity.
+    pub(crate) fn claimant_seeds(dir: &Path, reset: bool) -> Result<ClaimantSeeds> {
+        claimant_seeds_with(dir, &KeyringCredentialStore, reset)
+    }
+
+    pub(crate) fn seal_transfer(
+        root: &[u8; 32],
+        card: &[u8],
+        passphrase: &[u8],
+    ) -> Result<Vec<u8>> {
+        ensure!(!passphrase.is_empty(), "a transfer passphrase is required");
+        let mut payload = Zeroizing::new(root.to_vec());
+        payload.extend_from_slice(card);
+        let blob = atrest::seal_at_rest(passphrase, &payload)?;
+        let mut bytes = b"CRPCTRN1".to_vec();
+        encode_atrest(&blob, &mut bytes);
+        Ok(bytes)
+    }
+
+    pub(crate) fn open_transfer(bytes: &[u8], passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        ensure!(!passphrase.is_empty(), "a transfer passphrase is required");
+        ensure!(bytes.len() <= 1024 * 1024, "transfer package too large");
+        let blob = decode_atrest(
+            bytes
+                .strip_prefix(b"CRPCTRN1")
+                .context("invalid transfer package header")?,
+        )?;
+        ensure!(
+            blob.m_cost <= 262_144 && blob.t_cost <= 10 && blob.p_cost <= 16,
+            "transfer KDF costs exceed limits"
+        );
+        let payload = atrest::open_at_rest(passphrase, &blob)?;
+        ensure!(payload.len() > 32, "transfer package has no contact card");
+        Ok(payload)
+    }
+
     /// Move a complete legacy key pair into the operating-system credential store. The
     /// original files are removed only after the new source re-opens with identical seeds.
     pub fn migrate_legacy_keys(dir: &Path) -> Result<PathBuf> {
@@ -212,6 +289,78 @@ trait CredentialStore {
     fn write(&self, credential_id: &str, kind: &str, seed: &[u8; 32]) -> Result<()>;
     fn read(&self, credential_id: &str, kind: &str) -> Result<[u8; 32]>;
     fn delete(&self, credential_id: &str, kind: &str);
+}
+
+fn claimant_seeds_with(
+    dir: &Path,
+    store: &impl CredentialStore,
+    reset: bool,
+) -> Result<ClaimantSeeds> {
+    require_private_state_acl_support()?;
+    ensure_private_directory(dir)?;
+    let path = dir.join("claimant.credential.id");
+    let prior = if path.exists() {
+        ensure!(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "claimant credential identifier is a symlink"
+        );
+        let id = std::fs::read_to_string(&path)?;
+        ensure!(
+            id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid claimant credential identifier"
+        );
+        Some(id)
+    } else {
+        None
+    };
+    if !reset {
+        if let Some(id) = &prior {
+            return Ok((
+                Zeroizing::new(store.read(id, "node")?),
+                Zeroizing::new(store.read(id, "root")?),
+            ));
+        }
+    }
+    let id = new_credential_id()?;
+    let mut node = Zeroizing::new([0; 32]);
+    let mut ceremony = Zeroizing::new([0; 32]);
+    getrandom::getrandom(&mut *node)
+        .map_err(|error| anyhow::anyhow!("claimant node randomness: {error}"))?;
+    getrandom::getrandom(&mut *ceremony)
+        .map_err(|error| anyhow::anyhow!("claimant ceremony randomness: {error}"))?;
+    let temporary = dir.join(format!(".claimant-{id}.tmp"));
+    let mut published = false;
+    let result = (|| -> Result<()> {
+        store.write(&id, "node", &node)?;
+        store.write(&id, "root", &ceremony)?;
+        ensure!(
+            store.read(&id, "node")? == *node && store.read(&id, "root")? == *ceremony,
+            "claimant credential verification failed"
+        );
+        write_secret(&temporary, id.as_bytes())?;
+        if prior.is_some() {
+            std::fs::rename(&temporary, &path)?;
+        } else {
+            std::fs::hard_link(&temporary, &path)?;
+        }
+        published = true;
+        sync_parent(&path)?;
+        let _ = std::fs::remove_file(&temporary);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if !published {
+            store.delete(&id, "node");
+            store.delete(&id, "root");
+        }
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Some(prior) = prior {
+        store.delete(&prior, "node");
+        store.delete(&prior, "root");
+    }
+    Ok((node, ceremony))
 }
 
 struct KeyringCredentialStore;
@@ -259,6 +408,7 @@ fn migrate_legacy_keys_with(
     hooks: &mut dyn MigrationHooks,
 ) -> Result<PathBuf> {
     require_private_state_acl_support()?;
+    ensure_private_directory(dir)?;
     let credential_path = dir.join(CREDENTIAL_ID_FILE);
     if credential_path.exists() {
         bail!("{credential_path:?} already exists; key migration is not required");
@@ -286,6 +436,7 @@ fn migrate_legacy_keys_with(
     create_private_dir(&staged_backup)?;
     write_secret(&staged_backup.join("node.key"), &std::fs::read(&node_path)?)?;
     write_secret(&staged_backup.join("root.key"), &std::fs::read(&root_path)?)?;
+    #[cfg(unix)]
     std::fs::File::open(&staged_backup)?.sync_all()?;
     hooks.reach(MigrationPoint::BackupSynced)?;
     std::fs::rename(&staged_backup, &backup).context("activate legacy-key backup")?;
@@ -333,13 +484,6 @@ fn migrate_legacy_keys_with(
     Ok(backup)
 }
 
-#[cfg(windows)]
-fn require_private_state_acl_support() -> Result<()> {
-    bail!(
-        "secure production startup on Windows is disabled until Carapace enforces private ACLs on the state directory and files"
-    )
-}
-
 #[cfg(unix)]
 pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     use rustix::fs::{fchmod, fsync, openat, Mode, OFlags, CWD};
@@ -375,12 +519,46 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("sync directory {path:?}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path).with_context(|| format!("create directory {path:?}"))
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::process::CommandExt;
+    const REPARSE_POINT: u32 = 0x400;
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        ensure!(
+            metadata.is_dir() && metadata.file_attributes() & REPARSE_POINT == 0,
+            "private directory must not be a reparse point"
+        );
+    }
+    // The path is data in the child environment, never interpolated into script source.
+    // DirectoryInfo.Create(DirectorySecurity) installs the private ACL at creation.
+    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; $path=$env:CARAPACE_PRIVATE_DIRECTORY; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule); $dir=New-Object System.IO.DirectoryInfo($path); if($dir.Exists){if(($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){throw 'reparse directory refused'}; $dir.SetAccessControl($acl)}else{$dir.Create($acl)}; function Protect-Tree([System.IO.DirectoryInfo]$current){foreach($item in $current.EnumerateFileSystemInfos()){if(($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){throw 'reparse child refused'}; if($item -is [System.IO.DirectoryInfo]){$item.SetAccessControl($acl); Protect-Tree $item}else{$fileAcl=New-Object System.Security.AccessControl.FileSecurity; $fileAcl.SetOwner($sid); $fileAcl.SetAccessRuleProtection($true,$false); $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow'))); $item.SetAccessControl($fileAcl)}}}; Protect-Tree $dir; $actual=$dir.GetAccessControl(); if(-not $actual.AreAccessRulesProtected){throw 'directory ACL inheritance remains enabled'}; foreach($ace in $actual.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])){if($ace.IdentityReference.Value -ne $sid.Value){throw 'unexpected directory ACL principal'}}"#;
+    let windows = std::env::var_os("SystemRoot").context("SystemRoot is unavailable")?;
+    let program = Path::new(&windows).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let output = std::process::Command::new(program)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .env("CARAPACE_PRIVATE_DIRECTORY", path)
+        .creation_flags(0x08000000)
+        .output()
+        .context("apply private Windows state-directory ACL")?;
+    ensure!(
+        output.status.success(),
+        "Windows private state-directory ACL setup failed"
+    );
+    Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn ensure_private_directory(_path: &Path) -> Result<()> {
+    bail!("private state directory permissions are unsupported on this platform")
+}
+
 fn require_private_state_acl_support() -> Result<()> {
     Ok(())
 }
@@ -451,7 +629,8 @@ fn create_private_dir(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn create_private_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir(path).with_context(|| format!("create backup directory {path:?}"))
+    ensure_private_directory(path)
+        .with_context(|| format!("create private backup directory {path:?}"))
 }
 
 fn ensure_keyring_seed(entry: &Entry, expected: &[u8; 32], kind: &str) -> Result<()> {
@@ -491,7 +670,7 @@ fn load_or_generate_seed(path: &Path, passphrase: Option<&[u8]>) -> Result<[u8; 
             return seed32(&secret, path);
         }
         if passphrase.is_some() {
-            bail!("{path:?} is a plaintext seed but {PASSPHRASE_ENV} is set; remove it or unset the passphrase");
+            bail!("{path:?} is a plaintext seed but {PASSPHRASE_ENV} is set; use confirmed key migration or explicit insecure-development mode");
         }
         return seed32(&bytes, path);
     }
@@ -607,12 +786,12 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::collections::HashMap;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::sync::Mutex;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[derive(Default)]
     struct FakeCredentialStore {
         values: Mutex<HashMap<(String, String), [u8; 32]>>,
@@ -621,7 +800,7 @@ mod tests {
         writes: Mutex<usize>,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl CredentialStore for FakeCredentialStore {
         fn write(&self, id: &str, kind: &str, seed: &[u8; 32]) -> Result<()> {
             let mut writes = self.writes.lock().unwrap();
@@ -668,7 +847,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn legacy_pair(dir: &Path) {
         write_secret(&dir.join("node.key"), &[0x31; 32]).unwrap();
         write_secret(&dir.join("root.key"), &[0x52; 32]).unwrap();
@@ -837,13 +1016,48 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn production_startup_fails_closed_without_private_acls() {
+    fn native_legacy_migration_keeps_a_private_backup() {
         let dir = tempfile::tempdir().unwrap();
-        let error = State::load_or_generate(dir.path())
-            .err()
-            .expect("Windows startup must fail closed");
-        assert!(error.to_string().contains("private ACLs"));
-        assert!(!dir.path().join(CREDENTIAL_ID_FILE).exists());
+        legacy_pair(dir.path());
+        let store = FakeCredentialStore::default();
+        let backup = migrate_legacy_keys_with(dir.path(), &store, &mut NoMigrationHooks).unwrap();
+        assert_eq!(std::fs::read(backup.join("node.key")).unwrap(), [0x31; 32]);
+        assert_eq!(std::fs::read(backup.join("root.key")).unwrap(), [0x52; 32]);
+        let id = std::fs::read_to_string(dir.path().join(CREDENTIAL_ID_FILE)).unwrap();
+        assert_eq!(store.read(&id, "node").unwrap(), [0x31; 32]);
+        assert_eq!(store.read(&id, "root").unwrap(), [0x52; 32]);
+        assert!(!dir.path().join("node.key").exists());
+        assert!(!dir.path().join("root.key").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_production_credentials_survive_reload_and_are_cleaned_up() {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                delete_keyring_identity(&self.0);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = State::load_or_generate(dir.path()).unwrap();
+        let credential_id = std::fs::read_to_string(dir.path().join(CREDENTIAL_ID_FILE)).unwrap();
+        let cleanup = Cleanup(credential_id.clone());
+        let reloaded = State::load_or_generate(dir.path()).unwrap();
+        assert!(first.keys_freshly_generated);
+        assert!(!reloaded.keys_freshly_generated);
+        assert_eq!(first.node_key.to_bytes(), reloaded.node_key.to_bytes());
+        assert_eq!(&*first.k_root, &*reloaded.k_root);
+        assert!(!dir.path().join("root.key").exists());
+        assert!(!dir.path().join("node.key").exists());
+        drop(cleanup);
+        for kind in ["root", "node"] {
+            assert!(matches!(
+                keyring_entry(&credential_id, kind).unwrap().get_secret(),
+                Err(KeyringError::NoEntry)
+            ));
+        }
     }
 
     #[test]
@@ -883,5 +1097,62 @@ mod tests {
         let linked = parent.path().join("linked");
         symlink(&target, &linked).unwrap();
         assert!(ensure_private_directory(&linked).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn claimant_credentials_survive_reload_and_cancel_rotates_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FakeCredentialStore::default();
+        let (node, ceremony) = claimant_seeds_with(directory.path(), &store, false).unwrap();
+        let original_id = std::fs::read(directory.path().join("claimant.credential.id")).unwrap();
+        assert!(!directory.path().join("credential.id").exists());
+        assert!(!directory.path().join("root.key").exists());
+        let (reloaded_node, reloaded_ceremony) =
+            claimant_seeds_with(directory.path(), &store, false).unwrap();
+        assert_eq!(*node, *reloaded_node);
+        assert_eq!(*ceremony, *reloaded_ceremony);
+        let (fresh_node, fresh_ceremony) =
+            claimant_seeds_with(directory.path(), &store, true).unwrap();
+        assert_ne!(*node, *fresh_node);
+        assert_ne!(*ceremony, *fresh_ceremony);
+        assert_ne!(
+            original_id,
+            std::fs::read(directory.path().join("claimant.credential.id")).unwrap()
+        );
+        assert_eq!(store.values.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn encrypted_account_transfer_authenticates_and_limits_untrusted_kdf() {
+        let package = State::seal_transfer(&[17; 32], b"public card", b"phrase").unwrap();
+        assert!(!package.windows(32).any(|window| window == [17; 32]));
+        let opened = State::open_transfer(&package, b"phrase").unwrap();
+        assert_eq!(&opened[..32], &[17; 32]);
+        assert_eq!(&opened[32..], b"public card");
+        assert!(State::open_transfer(&package, b"wrong").is_err());
+        let mut tampered = package.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(State::open_transfer(&tampered, b"phrase").is_err());
+        let mut expensive = package;
+        expensive[48..52].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(State::open_transfer(&expensive, b"phrase")
+            .unwrap_err()
+            .to_string()
+            .contains("costs"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_state_directory_acl_is_private_and_rejects_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        ensure_private_directory(&state).unwrap();
+        std::fs::write(state.join("existing-data"), b"keep").unwrap();
+        ensure_private_directory(&state).unwrap();
+        assert_eq!(std::fs::read(state.join("existing-data")).unwrap(), b"keep");
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(ensure_private_directory(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
     }
 }

@@ -33,23 +33,25 @@ function lines(id) {
 
 function trusteeRows() {
   return lines('trustees').map((line) => {
-    const [node, rawAddresses = ''] = line.split('|', 2);
-    return { node: node.trim(), addrs: rawAddresses.split(',').map((value) => value.trim()).filter(Boolean) };
+    const [node, rawAddresses = '', relay = ''] = line.split('|', 3);
+    return { node: node.trim(), addrs: rawAddresses.split(',').map((value) => value.trim()).filter(Boolean), relay_url: relay.trim() || null };
   });
 }
 
 let announceRefs = [];
+let sponsorSignature = '';
 
 function importSponsorPackage() {
   const value = JSON.parse(document.querySelector('#sponsor-package').value);
   if (value.type !== 'carapace.sponsor-ceremony' || value.version !== 1 ||
-      typeof value.open_hex !== 'string' || !Array.isArray(value.roster) || !Array.isArray(value.trustees)) {
+      typeof value.sponsor_sig !== 'string' || typeof value.open_hex !== 'string' || !Array.isArray(value.roster) || !Array.isArray(value.trustees)) {
     throw new Error('The sponsor ceremony package type, version, or fields are invalid.');
   }
+  sponsorSignature = value.sponsor_sig;
   document.querySelector('#open-hex').value = value.open_hex;
   document.querySelector('#roster').value = value.roster.join('\n');
   document.querySelector('#trustees').value = value.trustees.map((trustee) =>
-    `${trustee.node}|${Array.isArray(trustee.addrs) ? trustee.addrs.join(',') : ''}`).join('\n');
+    `${trustee.node}|${Array.isArray(trustee.addrs) ? trustee.addrs.join(',') : ''}|${trustee.relay_url || ''}`).join('\n');
   announceRefs = Array.isArray(value.announce_refs) ? value.announce_refs : [];
 }
 
@@ -121,7 +123,7 @@ document.querySelector('#complete-form').addEventListener('submit', async (event
   try {
     const result = await request('/api/claimant/complete', {
       method: 'POST',
-      body: JSON.stringify({ open_hex: document.querySelector('#open-hex').value.trim(), confirmed_subject: confirmedSubject, roster: lines('roster'), trustees: trusteeRows(), announce_refs: announceRefs })
+      body: JSON.stringify({ open_hex: document.querySelector('#open-hex').value.trim(), confirmed_subject: confirmedSubject, sponsor_sig: sponsorSignature, roster: lines('roster'), trustees: trusteeRows(), announce_refs: announceRefs })
     });
     if (!result.restart_required) throw new Error('Activation did not request a safe restart.');
     progress.textContent = 'Recovered identity activation is complete.';

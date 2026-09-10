@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { api } from '$lib/api';
 	import { status } from '$lib/statusStore';
+	import FolderPicker from './FolderPicker.svelte';
 	import CopyHex from './CopyHex.svelte';
 	import type { PublishedVault } from '$lib/types';
 
@@ -27,12 +28,14 @@
 
 	async function refresh() {
 		loading = true;
-		const res = await api.listVaults().catch(() => ({ published: [] }));
-		vaults = res.published;
-		const entries = await Promise.all(
-			vaults.map(async (v) => [v.vid, (await api.listReplicas(v.vid).catch(() => ({ members: [] }))).members] as const)
-		);
-		replicas = Object.fromEntries(entries);
+		try {
+			vaults = (await api.listVaults()).published;
+			const entries = await Promise.all(vaults.map(async (v) => {
+				try { return [v.vid, (await api.listReplicas(v.vid)).members] as const; }
+				catch { return [v.vid, replicas[v.vid] ?? []] as const; }
+			}));
+			replicas = Object.fromEntries(entries);
+		} catch { /* Preserve the last known folders while the daemon is unavailable. */ }
 		loading = false;
 	}
 
@@ -132,7 +135,7 @@
 		<p class="dependency">Local operation</p>
 		<label for="vault-dir">Directory to publish</label>
 		<div class="row">
-			<input id="vault-dir" bind:value={dir} placeholder="/path/to/directory" />
+			<FolderPicker id="vault-dir" bind:value={dir} />
 			<button class="primary" type="submit" disabled={publishing || !dir.trim()}>
 				{publishing ? 'Publishing…' : 'Publish vault'}
 			</button>
@@ -181,7 +184,12 @@
 			{#each vaults as v (v.vid)}
 				<div class="card vault-row">
 					<div>
-						<strong>{v.name}</strong><br /><CopyHex value={v.vid} />
+						<strong>{v.name}</strong><br />
+						{#if v.dir}<p>{v.dir}</p>{/if}
+						<p>{v.syncing ? 'Syncing…' : v.watching ? 'Watching for changes' : 'Not currently watching'}</p>
+						{#if v.last_error}<p role="alert">{v.last_error}</p>{/if}
+						{#if v.recovery_backup}<p>Files saved before retrying an interrupted restore: <span class="mono">{v.recovery_backup}</span>. Check this folder for edits to keep.</p>{/if}
+						<CopyHex value={v.vid} />
 						<div class="muted" style="font-size: var(--step--1)">epoch {v.epoch}</div>
 					</div>
 					<div>

@@ -223,3 +223,33 @@ async fn ceremony_then_reconstruct_recovers_file_content() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn recovery_reports_empty_identity_missing_vault_and_tampered_handoff() -> Result<()> {
+    let state = State::from_seeds([81; 32], [82; 32]);
+    let sealed = state.seal_recovery_handoff(b"authentic package")?;
+    let daemon = Daemon::start(state).await?;
+    daemon.verify_recovery_handoff(b"authentic package", &sealed)?;
+    assert!(daemon
+        .verify_recovery_handoff(b"edited package", &sealed)
+        .is_err());
+    let output = tempfile::tempdir()?;
+    let empty = daemon
+        .recover_retained_at_with_relays(&[], &[], output.path())
+        .await?;
+    assert!(empty.restored.is_empty());
+    assert!(empty.errors.is_empty());
+    let reference = carapace_wire::AnnounceRef {
+        vid: [83; 32],
+        epoch: 1,
+        digest: [84; 32],
+    };
+    let missing = daemon
+        .recover_retained_at_with_relays(&[], std::slice::from_ref(&reference), output.path())
+        .await?;
+    assert!(missing.restored.is_empty());
+    assert_eq!(missing.errors.len(), 1);
+    assert_eq!(missing.errors[0].0, reference.vid);
+    daemon.shutdown().await;
+    Ok(())
+}

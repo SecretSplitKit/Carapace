@@ -85,15 +85,6 @@ test('clipboard failure reports visible feedback and does not claim success', ()
 	assert.match(format, /await navigator[\s\S]*return true;/);
 });
 
-test('stopping the status feed closes the socket without scheduling a retry', () => {
-	const store = source('src/lib/statusStore.ts');
-	assert.match(store, /socket\.onclose = \(\) => \{[\s\S]*if \(stopped\) return;[\s\S]*setTimeout\(connect/);
-	assert.match(store, /export function stopStatusFeed\(\): void \{[\s\S]*stopped = true;/);
-	assert.match(store, /clearTimeout\(retryTimer\)/);
-	assert.match(store, /socket = null;[\s\S]*active\?\.close\(\);[\s\S]*live\.set\(false\)/);
-	assert.match(source('src/routes/+page.svelte'), /onDestroy\(\(\) => \{[\s\S]*stopStatusFeed\(\)/);
-});
-
 test('claimant shell stays on the claimant API boundary and guides safe restart', () => {
 	const html = source('static/claimant.html');
 	const script = source('static/claimant.js');

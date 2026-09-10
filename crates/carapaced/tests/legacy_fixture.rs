@@ -58,6 +58,7 @@ async fn frozen_unversioned_fixture_opens_and_binds_identity() -> Result<()> {
     assert_eq!(grants.len(), 1);
     assert!(!daemon.paper_cards(grants[0].rsid)?.is_empty());
     daemon.shutdown().await;
+    drop(daemon); // Release the database lock before offline inspection.
 
     let matching = State::from_seeds_in(dir.path(), [7; 32], [3; 32]);
     let migrated = inspect_state_database(&matching, &db_path)?;

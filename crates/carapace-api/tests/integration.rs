@@ -1,5 +1,3 @@
-#![cfg(not(windows))]
-
 //! Trust-boundary integration tests for the loopback control API.
 //!
 //! These start a REAL daemon + API on `127.0.0.1:0` and drive it over raw TCP so we
@@ -547,4 +545,40 @@ async fn owned_device_sync_restores_a_published_vault_over_the_api() {
     api.shutdown();
     source.shutdown().await;
     target.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_browsing_and_device_cards_require_authentication() {
+    let (api, daemon, _dir) = boot().await;
+    let auth = format!("Authorization: Bearer {}\r\n", api.token);
+    for path in ["/api/directories", "/api/devices/self"] {
+        assert_eq!(get(api.local_addr, path, "").0, 401);
+        let (code, response) = get(api.local_addr, path, &auth);
+        assert_eq!(code, 200, "{path}: {response}");
+    }
+    let (_, response) = get(api.local_addr, "/api/devices/self", &auth);
+    let (_, body) = split_response(&response);
+    let card: serde_json::Value = serde_json::from_str(body).unwrap();
+    let bytes = hex::decode(card["card_hex"].as_str().unwrap()).unwrap();
+    use carapace_wire::{messages::Message, Signed};
+    let card = carapace_wire::ContactCard::decode_frame(&bytes).unwrap();
+    card.verify().unwrap();
+    assert_eq!(card.user, daemon.user_id());
+    api.shutdown();
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_api_server_stops_accepting_connections() {
+    let (api, daemon, _dir) = boot().await;
+    let addr = api.local_addr;
+    drop(api);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tokio::net::TcpStream::connect(addr).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropped API must release its listener");
+    daemon.shutdown().await;
 }

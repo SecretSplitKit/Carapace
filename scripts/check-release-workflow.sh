@@ -51,7 +51,9 @@ for gate in \
 done
 grep -Fq 'EmbarkStudios/cargo-deny-action@' "$release_workflow"
 grep -Fq 'needs: [quality, native-tests]' "$release_workflow"
-grep -Fq 'os: [ubuntu-latest, macos-latest]' "$release_workflow"
+for workflow in "$release_workflow" "$ci_workflow"; do
+  grep -Fq 'os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15, windows-2025, windows-11-arm]' "$workflow"
+done
 test "$(grep -Fc 'cargo test --workspace --locked' "$release_workflow")" -ge 2
 grep -Fq 'scripts/check-operational-logs.sh' "$release_workflow"
 grep -Fq 'scripts/state-fixtures.sh check' "$release_workflow"

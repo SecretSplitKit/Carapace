@@ -18,9 +18,16 @@
 //! third party with no `K_content` gets explicit per-chunk keys, never
 //! `K_manifest`.
 
+mod live_sync;
+pub use live_sync::{LiveSyncConfig, LiveSyncHandle, LiveVaultStatus};
+
+mod account_transfer;
+mod claimant_package;
 mod ops;
 mod persist;
 mod state;
+pub use account_transfer::AccountImportReport;
+pub use claimant_package::{verify_claimant_package, ClaimantAddress, ClaimantPackage};
 
 pub use state::State;
 
@@ -254,7 +261,7 @@ use carapace_share::{
 };
 use carapace_vault::{
     chunk_keys_from_manifest, ingest_dir, merge_manifests, new_vid, open_envelope, reconstruct,
-    seal_manifest, vv_equal, ChunkKeys, MemoryStore, VaultKeys,
+    seal_manifest, vv_equal, ChunkKeys, FsStore, VaultKeys,
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
@@ -559,6 +566,12 @@ pub struct ClaimantTrusteeHint {
     pub user: [u8; 32],
     pub node: [u8; 32],
     pub addrs: Vec<String>,
+    pub relay_url: Option<String>,
+}
+
+pub struct RecoveryRestoreReport {
+    pub restored: Vec<Reconstructed>,
+    pub errors: Vec<([u8; 32], String)>,
 }
 
 /// The §10.2 share-health surface for one owned recovery set, for the status API.
@@ -1282,6 +1295,16 @@ impl ControlHandler {
             match classify_dialer(&s, &self.self_user, card, remote, now, newest_self.as_ref()) {
                 Some(auth) => {
                     if s.blob_auth.contains_key(remote) || s.blob_auth.len() < MAX_PEER_RECORDS {
+                        if card.user == self.self_user {
+                            live_sync::remember_own_nodes(
+                                &mut s,
+                                card,
+                                &self.node_key,
+                                &self.user_key,
+                                Some(remote),
+                            )?;
+                            self.persist_locked(&s);
+                        }
                         s.blob_auth.insert(*remote, auth);
                         Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
                     } else {
@@ -2109,9 +2132,11 @@ pub struct Daemon {
     /// `publish_merged` never interleave on the same vid. The outer `Mutex` only guards the
     /// get-or-insert of the per-vid lock and is never held across an `.await`.
     publish_locks: Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
-    /// Serializes §9.3 re-split stand-up + drive so `unfriend` and the maintenance loop never
-    /// advance the same re-split concurrently; without it two runs could `begin_resplit` the
-    /// same `old_rsid` into two independent fresh splits, burning an rsid + a Shamir split.
+    /// Ephemeral watcher/sync observations; authoritative paths remain in Shared.
+    live_state: Mutex<HashMap<[u8; 32], live_sync::LiveState>>,
+    peer_sync_errors: Mutex<HashMap<[u8; 32], String>>,
+    ingest_limit: Arc<tokio::sync::Semaphore>,
+    /// Serializes unfriend and maintenance re-split progress.
     resplit_lock: tokio::sync::Mutex<()>,
     /// Bounded, identity-free operational history. It never contains error text.
     operational_history: Mutex<OperationalHistory>,
@@ -2361,7 +2386,7 @@ impl Daemon {
 
         // Default bind: loopback for a plain in-process node, but all-interfaces
         // once relays are in play so the portmapper can open our port.
-        let bind = cfg.bind.unwrap_or_else(|| {
+        let mut bind = cfg.bind.unwrap_or_else(|| {
             if relay.is_some() || !relays.is_empty() {
                 std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
             } else {
@@ -2369,7 +2394,33 @@ impl Daemon {
             }
         });
 
-        let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await?;
+        // MemoryLookup has no external discovery: both peers must retain their
+        // advertised port when they restart. Port zero chooses once per state dir.
+        let peer_port_path = state_dir.join("peer-port");
+        let mut save_peer_port = false;
+        if bind.port() == 0 {
+            match std::fs::read_to_string(&peer_port_path) {
+                Ok(port) => {
+                    let port: std::num::NonZeroU16 = port.trim().parse().with_context(|| {
+                        format!("invalid peer port in {}", peer_port_path.display())
+                    })?;
+                    bind.set_port(port.get());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => save_peer_port = true,
+                Err(e) => return Err(e).context("read persisted peer port"),
+            }
+        }
+        let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await
+            .with_context(|| format!("bind peer address {bind}; if the port is occupied, free it or choose an explicit --bind address and update peer cards"))?;
+        if save_peer_port {
+            let port = ep
+                .direct_addr()?
+                .ip_addrs()
+                .next()
+                .context("endpoint has no bound socket")?
+                .port();
+            live_sync::write_peer_port(&peer_port_path, port.to_string().as_bytes())?;
+        }
         // Durable served blob store: FsStore at `<state_dir>/blobs`. Blobs are already
         // ciphertext, so no extra sealing.
         let blob_directory = state_dir.join("blobs");
@@ -2427,6 +2478,28 @@ impl Daemon {
         // minted at `max(unix_now(), persisted + 1)` so it strictly exceeds every version the
         // prior run reached and a friend's DocStore never rejects it as a rollback.
         card.version = unix_now().max(card_version_floor.saturating_add(1));
+        card.nodes[0].addrs = ep
+            .direct_addr()?
+            .ip_addrs()
+            .filter(|addr| !addr.ip().is_unspecified())
+            .map(ToString::to_string)
+            .collect();
+        {
+            let s = shared.read().expect("shared lock");
+            if let Some(previous) = s.cards.iter().find(|card| card.user == self_user) {
+                card.nodes.extend(
+                    previous
+                        .nodes
+                        .iter()
+                        .filter(|node| {
+                            node.node_id != self_node
+                                && card_delegates_node(previous, &node.node_id, unix_now())
+                        })
+                        .take(63)
+                        .cloned(),
+                );
+            }
+        }
         card.sign(&user_key);
         {
             let mut s = shared.write().expect("shared lock");
@@ -2501,6 +2574,9 @@ impl Daemon {
             k_root,
             docs,
             publish_locks: Mutex::new(HashMap::new()),
+            live_state: Mutex::new(HashMap::new()),
+            peer_sync_errors: Mutex::new(HashMap::new()),
+            ingest_limit: Arc::new(tokio::sync::Semaphore::new(1)),
             resplit_lock: tokio::sync::Mutex::new(()),
             operational_history: Mutex::new(OperationalHistory::default()),
             relay,
@@ -2631,37 +2707,105 @@ impl Daemon {
     pub async fn publish_vault(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
         let lock = self.publish_lock(vid);
         let _publish = lock.lock().await;
+        let result = self.publish_vault_locked(src, vid).await;
+        self.note_publish_result(vid, &result);
+        result
+    }
 
+    async fn refresh_vault(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
+        let lock = self.publish_lock(vid);
+        let _publish = lock.lock().await;
+        let result = async {
+            ensure!(
+                !self
+                    .shared
+                    .read()
+                    .expect("shared lock")
+                    .needs_refetch
+                    .contains_key(&vid),
+                "vault baseline needs repair before disk changes can be reconciled"
+            );
+            self.publish_vault_locked(src, vid).await
+        }
+        .await;
+        self.note_publish_result(vid, &result);
+        result
+    }
+
+    async fn publish_vault_locked(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
+        let permit = Arc::clone(&self.ingest_limit).acquire_owned().await?;
+        let src = std::fs::canonicalize(src).context("open vault working directory")?;
+        ensure!(src.is_dir(), "vault working directory is unavailable");
+        self.ensure_disjoint_working_dir(vid, &src)?;
+        let state_dir = std::fs::canonicalize(&self.state_dir)?;
+        let managed = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .working_dirs
+            .get(&vid)
+            .is_some_and(|dir| {
+                std::fs::canonicalize(dir).ok().as_ref() == Some(&src)
+                    && src == state_dir.join("vaults").join(hex32(&vid))
+            });
+        ensure!(
+            managed || (!src.starts_with(&state_dir) && !state_dir.starts_with(&src)),
+            "vault folder must not overlap the daemon state directory"
+        );
         let vkeys = VaultKeys::derive(&*self.k_root, vid);
         let (cur_epoch, prev) = {
-            let mut s = self.shared.write().expect("shared lock");
-            // §11: this source IS the vault's authoritative working directory; a publish
-            // declares it, overwriting any prior (e.g. a first-sync fallback).
-            s.working_dirs.insert(vid, src.to_path_buf());
+            let s = self.shared.read().expect("shared lock");
+            // §11: this source IS the vault's authoritative working directory
+            // (watched + sync target). A publish declares it, so overwrite any prior
+            // (e.g. a first-sync fallback) - a later sync reconstructs merges here.
             let cur = *s.epochs.get(&vid).unwrap_or(&0);
-            // §11: carry the previous manifest so a re-ingest bumps this device's per-file
-            // version-vector component on real changes, making a concurrent edit on another
-            // owner device detectable at merge time.
+            // §11: carry the previously-published manifest so a re-ingest bumps
+            // this device's per-file version-vector component on real changes
+            // (and tombstones local deletions), making a concurrent edit on
+            // another owner device detectable at merge time.
             let prev = s.vault_blobs.get(&vid).map(|vb| vb.manifest.clone());
             (cur, prev)
         };
         let epoch = cur_epoch + 1;
 
-        // Ingest into a plain in-memory store, then mirror blobs into iroh.
-        let mut mem = MemoryStore::new();
-        let ingest = ingest_dir(src, &self.node_key, &vkeys, epoch, prev.as_ref(), &mut mem)?;
+        // Ingest ciphertext into temporary disk storage, then mirror it into iroh.
+        let node_key = self.node_key.clone();
+        let source = src.clone();
+        let previous = prev.clone();
+        let (ingest, mem, _scratch_dir, _permit) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let scratch_dir = EphemeralDir(ephemeral_state_dir()?);
+                let mut store = FsStore::open(&scratch_dir.0)?;
+                let ingest = ingest_dir(
+                    &source,
+                    &node_key,
+                    &vkeys,
+                    epoch,
+                    previous.as_ref(),
+                    &mut store,
+                )?;
+                Ok((ingest, store, scratch_dir, permit))
+            })
+            .await
+            .context("vault ingest task")??;
 
-        // No-op guard: if the re-ingested file set is identical to what we last published,
-        // do NOT bump the epoch or republish (the watcher re-observing our own just-written
-        // tree would otherwise spuriously advance the announce line).
+        // No-op guard: if the re-ingested file set is byte-for-byte identical to
+        // what we last published (same paths, hashes, mtimes, per-file VVs), there
+        // is nothing to propagate. Do NOT bump the epoch or republish - this is the
+        // watcher re-observing the daemon's own just-written merged/reconstructed
+        // tree, and republishing it would spuriously advance the announce line.
         if let Some(prevm) = &prev {
-            if ingest.manifest.files == prevm.files {
+            if ingest.manifest.files == prevm.files && self.own_announce_digest(&vid).is_some() {
+                let mut s = self.shared.write().expect("shared lock");
+                if s.working_dirs.get(&vid) != Some(&src) {
+                    s.working_dirs.insert(vid, src);
+                    self.persist_locked(&s);
+                }
                 return Ok(cur_epoch);
             }
         }
 
-        // Hold through the epoch/state transaction. The collector cannot remove a new blob's
-        // write-time tag while the hash is not yet in the durable root set.
+        // Keep newly added blobs rooted through the durable state commit against GC.
         let blob_mutation = self.blobs.begin_durable_mutation().await;
         let env_digest = self.blobs.add(&ingest.envelope.to_bytes()).await?;
         ensure!(
@@ -2707,6 +2851,7 @@ impl Daemon {
         let push_targets = {
             let mut s = self.shared.write().expect("shared lock");
             // Commit the bumped epoch (read-prev..commit is atomic under the vid lock).
+            s.working_dirs.insert(vid, src);
             s.epochs.insert(vid, epoch);
             // W2: retain every published ChunkID in the owner-gated set across epoch
             // bumps, so superseded chunks keep the §7.4 owner gate (see `owned_chunks`).
@@ -2741,16 +2886,19 @@ impl Daemon {
             s.announces.push(ann);
             s.grants.retain(|g| g.vid != vid);
             s.grants.push(grant);
-            // Commit the whole publish (epoch bump, owned_chunks, vault_blobs, announce,
-            // grant) as ONE txn BEFORE pushing to replicas, so a crash can never leave
-            // replicas ahead of our committed epoch line, and the default-deny fetch gate is
-            // armed durably for the new chunks (F1). vault_keys is EPH, so its RAM-only insert
-            // here (not in the funnel) is fine.
+            // §3.2.2-3: commit the whole publish (epoch bump, owned_chunks, vault_blobs,
+            // announce, grant) as ONE txn BEFORE pushing the new epoch to replicas, so a
+            // crash can never leave replicas ahead of our own committed epoch line, and
+            // the default-deny fetch gate is armed durably for the new chunks (F1).
+            // vault_keys is EPH (never persisted; re-derived on demand), so it is fine
+            // that it is inserted here but not in the funnel.
             self.persist_locked(&s);
 
-            // §11: the new epoch must reach the CURRENT enrolled replica set or those replicas
-            // keep serving the stale placement-time epoch. Snapshot the members (excluding own
-            // devices) to dialable addresses under the lock, then push after releasing it.
+            // §11: the new epoch must reach the CURRENT enrolled replica set, or those
+            // replicas keep serving the stale placement-time epoch and §10.1 read
+            // redundancy collapses to just this owner. Snapshot the members (excluding
+            // our own devices - they sync via the owner-device path) to their dialable
+            // addresses now, while we hold the lock, then push after releasing it.
             let now = unix_now();
             let self_user = self.user_id();
             s.members
@@ -2769,27 +2917,49 @@ impl Daemon {
                 })
                 .unwrap_or_default()
         };
-        // The durable state now names each new blob. Release GC before optional network work.
-        drop(blob_mutation);
 
-        // Push the new epoch to enrolled replicas OUTSIDE the shared lock. Best-effort: an
-        // offline replica is caught by the PoR/repair path, so a failed push must not fail
-        // the publish.
+        drop(blob_mutation);
+        drop(mem);
+        drop(_scratch_dir);
+        drop(_permit);
+
+        // Push the new epoch to enrolled replicas OUTSIDE the shared lock. Best-effort:
+        // iroh blobs are content-addressed so a replica only pulls the chunks it lacks
+        // (dedup), and an offline replica is caught by the existing PoR/repair path, so
+        // a failed push MUST NOT fail the publish (mirror the other best-effort sends).
         if !push_targets.is_empty() {
-            match self.gather_blob_bytes(&vb).await {
-                Ok(blobs) => {
-                    let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+            match self.blob_total_bytes(&vb).await {
+                Ok(total) => {
                     for peer in &push_targets {
-                        if self
-                            .invite_and_push(peer, vid, epoch, total, &blobs)
-                            .await
-                            .is_err()
-                        {
-                            ops::log("replica.epoch_push_failed", None);
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            self.invite_and_push(peer, vid, epoch, total, &vb),
+                        )
+                        .await
+                        .context("replica epoch push timed out")
+                        .and_then(|r| r);
+                        let mut errors = self.peer_sync_errors.lock().expect("peer sync errors");
+                        match result {
+                            Ok(Some(_)) => {
+                                errors.remove(peer.id.as_bytes());
+                            }
+                            Ok(None) => {
+                                errors.insert(
+                                    *peer.id.as_bytes(),
+                                    "replica declined latest epoch".into(),
+                                );
+                            }
+                            Err(e) => {
+                                ops::log("replica.epoch_push_failed", None);
+                                errors.insert(
+                                    *peer.id.as_bytes(),
+                                    format!("replica epoch push: {e:#}"),
+                                );
+                            }
                         }
                     }
                 }
-                Err(_) => ops::log("replica.blob_gather_failed", None),
+                Err(e) => self.note_live_result(vid, &Err::<(), _>(e)),
             }
         }
         Ok(epoch)
@@ -2802,13 +2972,27 @@ impl Daemon {
     pub fn watch_vault(self: Arc<Self>, vid: [u8; 32], src: PathBuf) -> Result<VaultWatcher> {
         use notify::{event::EventKind, recommended_watcher, RecursiveMode, Watcher};
 
-        // Unbounded but each item is zero-sized; the debounce loop collapses the backlog.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // One pending notification is enough: each pass reads the whole tree.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        let event_daemon = Arc::downgrade(&self);
         let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                // Skip pure access/open events; only content changes trigger a re-ingest.
+            let ev = match res {
+                Ok(event) => event,
+                Err(error) => {
+                    if let Some(daemon) = event_daemon.upgrade() {
+                        daemon.note_live_result(
+                            vid,
+                            &Err::<(), _>(anyhow::anyhow!("filesystem watcher: {error}")),
+                        );
+                    }
+                    return;
+                }
+            };
+            {
+                // Skip pure access/open events: only content-affecting changes
+                // (create/modify/remove/rename) should trigger a re-ingest.
                 if !matches!(ev.kind, EventKind::Access(_)) {
-                    let _ = tx.send(());
+                    let _ = tx.try_send(());
                 }
             }
         })
@@ -2835,13 +3019,14 @@ impl Daemon {
                         Err(_) => break,          // quiet period elapsed
                     }
                 }
-                // Re-ingest once, sequentially. Upgrade the Weak only for the publish so
-                // shutdown can still reclaim the sole Arc.
+                // Re-ingest once, sequentially — no unbounded fan-out. Upgrade the
+                // Weak only for the duration of the publish so shutdown can still
+                // reclaim the sole Arc.
                 let Some(daemon) = weak.upgrade() else {
                     break; // daemon gone
                 };
-                if daemon.publish_vault(&src, vid).await.is_err() {
-                    ops::log("vault.watch_reingest_failed", None);
+                if daemon.refresh_vault(&src, vid).await.is_err() {
+                    ops::log("vault.watch_publish_failed", None);
                 }
             }
         });
@@ -2892,7 +3077,8 @@ impl Daemon {
         peer: EndpointAddr,
         out_root: &Path,
     ) -> Result<Vec<Reconstructed>> {
-        self.sync_impl(peer.clone(), peer, out_root).await
+        self.sync_impl(peer.clone(), peer, out_root, false, Duration::from_secs(30))
+            .await
     }
 
     /// Like [`Daemon::sync_from`], but pull documents (announce + grant) from
@@ -2905,7 +3091,14 @@ impl Daemon {
         blob_peer: EndpointAddr,
         out_root: &Path,
     ) -> Result<Vec<Reconstructed>> {
-        self.sync_impl(doc_peer, blob_peer, out_root).await
+        self.sync_impl(
+            doc_peer,
+            blob_peer,
+            out_root,
+            false,
+            Duration::from_secs(30),
+        )
+        .await
     }
 
     /// Recover vaults after claimant activation. Pull verified documents from every
@@ -2917,56 +3110,136 @@ impl Daemon {
         refs: &[AnnounceRef],
         out_root: &Path,
     ) -> Result<Vec<Reconstructed>> {
-        let wanted: HashMap<([u8; 32], u64, [u8; 32]), ()> = max_epoch_refs(refs)
-            .into_iter()
-            .map(|reference| ((reference.vid, reference.epoch, reference.digest), ()))
+        let trustees: Vec<_> = trustees
+            .iter()
+            .map(|(node, addrs)| (*node, addrs.clone(), None))
             .collect();
+        let report = self
+            .recover_retained_at_with_relays(&trustees, refs, out_root)
+            .await?;
+        ensure!(
+            report.errors.is_empty(),
+            "one or more referenced vaults could not be recovered"
+        );
+        Ok(report.restored)
+    }
+
+    pub async fn recover_retained_at_with_relays(
+        &self,
+        trustees: &[ClaimantAddress],
+        refs: &[AnnounceRef],
+        out_root: &Path,
+    ) -> Result<RecoveryRestoreReport> {
+        ensure!(
+            trustees.len() <= 64 && refs.len() <= 4096,
+            "recovery input exceeds limits"
+        );
+        let wanted: HashMap<_, _> = max_epoch_refs(refs)
+            .into_iter()
+            .map(|reference| (reference.vid, reference))
+            .collect();
+        let mut report = RecoveryRestoreReport {
+            restored: Vec::new(),
+            errors: Vec::new(),
+        };
+        if wanted.is_empty() {
+            return Ok(report);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
         let mut accepted: HashMap<[u8; 32], (EndpointAddr, VaultAnnounce)> = HashMap::new();
-        for (node, addrs) in trustees {
-            let doc_peer = endpoint_addr(*node, addrs)?;
-            let targets = match self.pull_verified_targets(&doc_peer).await {
-                Ok(targets) => targets,
-                Err(_) => continue,
+        for (node, addrs, relay) in trustees {
+            let mut doc_peer = endpoint_addr(*node, addrs)?;
+            if let Some(relay) = relay {
+                let url: RelayUrl = relay.parse()?;
+                doc_peer = doc_peer.with_relay_url(url.clone());
+                self.ep.add_relay(url).await;
+            }
+            self.ep.add_peer(doc_peer.clone());
+            self.shared
+                .write()
+                .expect("shared lock")
+                .peer_addrs
+                .insert(*node, doc_peer.clone());
+            let targets = match tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(15)),
+                self.pull_verified_targets(&doc_peer),
+            )
+            .await
+            {
+                Ok(Ok(targets)) => targets,
+                _ => continue,
             };
             for (vid, announce) in targets {
-                if wanted.contains_key(&(vid, announce.epoch, announce.digest)) {
-                    match accepted.get(&vid) {
-                        Some((_, current)) if current.epoch >= announce.epoch => {}
-                        _ => {
-                            accepted.insert(vid, (doc_peer.clone(), announce));
-                        }
+                if let Some(reference) = wanted.get(&vid) {
+                    if announce.epoch >= reference.epoch
+                        && (announce.epoch != reference.epoch
+                            || announce.digest == reference.digest)
+                        && accepted
+                            .get(&vid)
+                            .is_none_or(|(_, current)| current.epoch < announce.epoch)
+                    {
+                        accepted.insert(vid, (doc_peer.clone(), announce));
                     }
                 }
             }
         }
-
-        ensure!(
-            !accepted.is_empty(),
-            "no rollback-checked trustee announce matched the recovery references"
-        );
-
-        let mut out = Vec::new();
-        for (vid, (doc_peer, announce)) in accepted {
+        for vid in wanted.keys() {
+            let Some((doc_peer, announce)) = accepted.remove(vid) else {
+                report.errors.push((
+                    *vid,
+                    "no authenticated replica meets the recorded vault epoch".into(),
+                ));
+                continue;
+            };
+            let mut restored = None;
+            let mut error = "no available replica".to_string();
             for replica in &announce.replicas {
-                let blob_peer = {
-                    let s = self.shared.read().expect("shared lock");
-                    resolve_peer(&s.peer_addrs, replica)
-                };
-                let Some(blob_peer) = blob_peer else { continue };
-                if blob_peer.id != doc_peer.id && self.authenticate_to(&blob_peer).await.is_err() {
-                    continue;
-                }
-                if let Ok(restored) = self
-                    .reconstruct_one(&blob_peer, &vid, &announce, out_root)
-                    .await
-                {
-                    out.push(restored);
+                if tokio::time::Instant::now() >= deadline {
+                    error = "recovery network budget exhausted; retry".into();
                     break;
                 }
+                let blob_peer = if *replica == *doc_peer.id.as_bytes() {
+                    Some(doc_peer.clone())
+                } else {
+                    resolve_peer(
+                        &self.shared.read().expect("shared lock").peer_addrs,
+                        replica,
+                    )
+                };
+                let Some(blob_peer) = blob_peer else { continue };
+                if blob_peer.id != doc_peer.id
+                    && !matches!(
+                        tokio::time::timeout_at(
+                            deadline.min(tokio::time::Instant::now() + Duration::from_secs(15)),
+                            self.authenticate_to(&blob_peer)
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    )
+                {
+                    continue;
+                }
+                // Network calls inside reconstruction are bounded. Do not cancel its local writes.
+                match self
+                    .reconstruct_one(&blob_peer, vid, &announce, out_root)
+                    .await
+                {
+                    Ok(vault) => {
+                        restored = Some(vault);
+                        break;
+                    }
+                    Err(failure) => error = format!("{failure:#}"),
+                }
+            }
+            if let Some(vault) = restored {
+                report.restored.push(vault);
+            } else {
+                report.errors.push((*vid, error));
             }
         }
-        out.sort_by_key(|vault| vault.vid);
-        Ok(out)
+        report.restored.sort_by_key(|vault| vault.vid);
+        report.errors.sort_by_key(|(vid, _)| *vid);
+        Ok(report)
     }
 
     async fn pull_verified_targets(
@@ -2992,14 +3265,8 @@ impl Daemon {
         send.finish()?;
         let now = unix_now();
         let self_user = self.user_id();
-        let targets = {
-            let mut docs = self.docs.lock().expect("docs lock");
-            for card in &cards {
-                let _ = docs.offer_card(card);
-            }
-            select_targets(&mut docs, &self_user, &cards, &announces, now)
-        };
-        self.persist_snapshot();
+        let mut docs = DocStore::new();
+        let targets = select_targets(&mut docs, &self_user, &cards, &announces, now);
         Ok(targets)
     }
 
@@ -3008,34 +3275,50 @@ impl Daemon {
         doc_peer: EndpointAddr,
         blob_peer: EndpointAddr,
         out_root: &Path,
+        retry_seen: bool,
+        peer_timeout: Duration,
     ) -> Result<Vec<Reconstructed>> {
         // ---- anti-entropy pull over the control stream ----
-        // Drain the whole stream first; the verification pass runs synchronously so we never
-        // hold the doc lock across an `.await`.
-        let conn = self.ep.connect(doc_peer.clone(), ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        // Present our own card so the peer can authorize this pull (W5).
-        let own_card = {
-            let s = self.shared.read().expect("shared lock");
-            s.cards.first().cloned().context("no own card")?
-        };
-        write_msg(&mut send, &own_card).await?;
+        // Drain the whole stream into buffers first; the verification pass below
+        // runs synchronously so we never hold the doc lock across an `.await`.
+        let (recv_cards, recv_announces) = tokio::time::timeout(peer_timeout, async {
+            let conn = self.ep.connect(doc_peer.clone(), ALPN).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            // Present our own card so the peer can authorize this pull (W5). The peer
+            // serves documents only if our card's user is itself or a friend and the
+            // card delegates our (TLS-authenticated) node id.
+            let own_card = {
+                let s = self.shared.read().expect("shared lock");
+                s.cards.first().cloned().context("no own card")?
+            };
+            write_msg(&mut send, &own_card).await?;
 
-        let mut recv_cards: Vec<ContactCard> = Vec::new();
-        let mut recv_announces: Vec<VaultAnnounce> = Vec::new();
-        // Option B (§4): reconstruction targets come from announces alone; per-chunk keys are
-        // re-derived from the manifest `pt_hash`, so no FileGrant is pulled here.
-        while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
-            match ty {
-                ContactCard::TYPE => recv_cards.push(ContactCard::from_map(body)?),
-                VaultAnnounce::TYPE => recv_announces.push(VaultAnnounce::from_map(body)?),
-                _ => {}
+            let mut recv_cards: Vec<ContactCard> = Vec::new();
+            let mut recv_announces: Vec<VaultAnnounce> = Vec::new();
+            // Option B (§4): reconstruction targets come from announces alone; per-chunk
+            // keys are re-derived from the manifest `pt_hash`, so no FileGrant is pulled
+            // here. A friend peer may still forward its own self-grants (disclosure-only);
+            // they are ignored by this sync path.
+            let mut frames = 0usize;
+            while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
+                frames += 1;
+                ensure!(frames <= 100_000, "peer document batch is too large");
+                match ty {
+                    ContactCard::TYPE => recv_cards.push(ContactCard::from_map(body)?),
+                    VaultAnnounce::TYPE => recv_announces.push(VaultAnnounce::from_map(body)?),
+                    _ => {}
+                }
             }
-        }
-        send.finish()?;
+            send.finish()?;
 
-        // §9.3.4 liveness: a completed doc pull is a real reachability signal (unlike a cached
-        // address); the re-split status surface reads `peer_last_seen` for "who is online now".
+            Ok::<_, anyhow::Error>((recv_cards, recv_announces))
+        })
+        .await
+        .context("device document pull timed out")??;
+
+        // §9.3.4 liveness: a completed doc pull is a real live-reachability signal for the
+        // peer(s) we just synced with (unlike a cached address). The re-split status surface
+        // reads `peer_last_seen` to show "who is online now".
         {
             let seen = unix_now();
             let mut s = self.shared.write().expect("shared lock");
@@ -3048,20 +3331,40 @@ impl Daemon {
         let self_user = self.user_key.verifying_key().to_bytes();
         let (targets, newer_cards) = {
             let mut docs = self.docs.lock().expect("docs lock");
-            // Admit cards with their version-rollback rule (a stale/duplicate card is ignored);
-            // collect the genuinely newer ones to refresh the friend address book (W2).
+            // Admit cards with their own version-rollback rule; a stale/duplicate
+            // card is ignored, not fatal. Collect the ones that were genuinely
+            // newer so the friend address book can be refreshed (W2).
             let mut newer_cards = Vec::new();
             for card in &recv_cards {
                 if matches!(docs.offer_card(card), Ok(true)) {
                     newer_cards.push(card.clone());
                 }
             }
-            let targets = select_targets(&mut docs, &self_user, &recv_cards, &recv_announces, now);
+            let mut targets =
+                select_targets(&mut docs, &self_user, &recv_cards, &recv_announces, now);
+            // Receiving an announce and applying its data are separate operations.
+            // Retry the exact verified high-water document after a failed download
+            // or restart; never accept an older or equivocated signed document.
+            if retry_seen {
+                for ann in &recv_announces {
+                    if targets.iter().any(|(_, target)| target == ann) {
+                        continue;
+                    }
+                    let delegated = recv_cards.iter().chain(docs.cards()).any(|card| {
+                        card.user == self_user && card_delegates_node(card, &ann.by, now)
+                    });
+                    if delegated && docs.announces().any(|known| known == ann) {
+                        targets.push((ann.vid, ann.clone()));
+                    }
+                }
+            }
             (targets, newer_cards)
         };
 
-        // W2: refresh `s.friends` with rollback-guarded newer cards so a friend dropping a
-        // device actually revokes it. Monotonic on the friend's stored version.
+        // W2: refresh `s.friends` with rollback-guarded newer cards so a friend
+        // that publishes a card dropping a device actually revokes it. The update
+        // is monotonic on the friend's own stored version, so a first-seen older
+        // card (accepted by the empty DocStore) cannot roll the address book back.
         if !newer_cards.is_empty() {
             let mut updated: Vec<ContactCard> = Vec::new();
             {
@@ -3075,32 +3378,64 @@ impl Daemon {
                     }
                 }
             }
-            // §6: refresh addressing hints from the newer cards so a friend that moves stays
-            // reachable.
+            // §6: refresh addressing hints (relay + direct addrs) from the newer
+            // cards, so a friend that moves or changes relay stays reachable.
             let hints = self.ep.hints();
             for card in &updated {
                 learn_card_hints(&hints, card).await;
             }
         }
-        // §6: persist the DocStore rollback high-water marks (+ friend-card refresh) so a
-        // replayed old card is still rejected after a reboot.
+        // §6: persist the DocStore rollback high-water marks (and any friend-card
+        // refresh) so a replayed old card is still rejected after a reboot. A whole-state
+        // snapshot; the docs + friends updates above are already applied in RAM.
         self.persist_snapshot();
 
-        // W8/§7.4 a: when the blobs live on a different peer (a replica), authenticate to its
-        // control stream first so it can classify us as a delegated device of the owner; else
-        // its fetch gate refuses every replica-held chunk. Same-node doc pull already did this.
+        // W8/§7.4 a: when the blobs live on a different peer (a replica), first
+        // authenticate to that peer's control stream so it can classify us as a
+        // delegated device of the vault owner. Without it the replica's fetch gate
+        // has no identity for our node id and refuses every replica-held chunk. When
+        // blob and doc peer are the same node the doc pull above already did this.
         if blob_peer.id != doc_peer.id {
-            self.authenticate_to(&blob_peer).await?;
+            tokio::time::timeout(peer_timeout, self.authenticate_to(&blob_peer))
+                .await
+                .context("device authentication timed out")??;
         }
 
         // ---- per-vault: fetch, open, reconstruct ----
-        // W3: one poisoned/unfetchable vault must not abort the others.
+        // W3: one poisoned/unfetchable vault must not abort the others; collect
+        // the error and move on.
         let mut out = Vec::new();
+        let mut failed = false;
         for (vid, ann) in &targets {
-            match self.reconstruct_one(&blob_peer, vid, ann, out_root).await {
-                Ok(r) => out.push(r),
-                Err(_) => ops::log("vault.reconstruct_failed", None),
+            match self
+                .reconstruct_one_timed(&blob_peer, vid, ann, out_root, peer_timeout)
+                .await
+            {
+                Ok(r) => {
+                    self.note_live_result(*vid, &Ok::<(), anyhow::Error>(()));
+                    out.push(r);
+                }
+                Err(e) => {
+                    ops::log("vault.reconstruct_failed", None);
+                    failed = true;
+                    // A failed first download has no working-directory row yet.
+                    // Retain its error on the peer so the API can still display it.
+                    self.peer_sync_errors
+                        .lock()
+                        .expect("peer sync errors")
+                        .insert(
+                            *blob_peer.id.as_bytes(),
+                            format!("vault {}: {e:#}", hex32(vid)),
+                        );
+                    self.note_live_result(*vid, &Err::<(), _>(e));
+                }
             }
+        }
+        if !failed {
+            self.peer_sync_errors
+                .lock()
+                .expect("peer sync errors")
+                .remove(blob_peer.id.as_bytes());
         }
         Ok(out)
     }
@@ -3115,15 +3450,33 @@ impl Daemon {
         ann: &VaultAnnounce,
         out_root: &Path,
     ) -> Result<Reconstructed> {
+        self.reconstruct_one_timed(blob_peer, vid, ann, out_root, Duration::from_secs(30))
+            .await
+    }
+
+    async fn reconstruct_one_timed(
+        &self,
+        blob_peer: &EndpointAddr,
+        vid: &[u8; 32],
+        ann: &VaultAnnounce,
+        out_root: &Path,
+        peer_timeout: Duration,
+    ) -> Result<Reconstructed> {
         let vkeys = VaultKeys::derive(&*self.k_root, *vid);
 
-        // W8: fetch into a throwaway store, NOT `self.blobs` (which the router serves over
-        // `iroh_blobs::ALPN`): fetching the ciphertext into the served store would re-serve it
-        // ungated, voiding the replica fetch gate. We only need the bytes to open the manifest.
+        // Download outside the served store until the authenticated baseline can
+        // be committed with its fetch authorization and GC roots.
         let scratch = IrohBlobStore::new();
         // Manifest envelope by digest.
-        let bconn = self.ep.connect(blob_peer.clone(), iroh_blobs::ALPN).await?;
-        scratch.fetch(&bconn, ann.digest).await?;
+        let bconn = tokio::time::timeout(
+            peer_timeout,
+            self.ep.connect(blob_peer.clone(), iroh_blobs::ALPN),
+        )
+        .await
+        .context("device blob connection timed out")??;
+        tokio::time::timeout(peer_timeout, scratch.fetch(&bconn, ann.digest))
+            .await
+            .context("manifest download timed out")??;
         let env_bytes = scratch.get_bytes(ann.digest).await?;
         let envelope = ManifestEnvelope::from_bytes(&env_bytes)?;
         let incoming = open_envelope(&envelope, &vkeys.k_manifest)?;
@@ -3136,21 +3489,88 @@ impl Daemon {
             "manifest epoch != announce epoch"
         );
 
-        // Option B (§4.2): we hold `K_root`, so re-derive every per-chunk key from the
-        // manifest's `pt_hash` + `K_content`; the BLAKE3(plaintext)==pt_hash check is inside
-        // `reconstruct`.
+        // Option B (§4.2): we hold `K_root` for this vault (the envelope opened with
+        // our derived `K_manifest`), so re-derive every per-chunk key from the
+        // manifest's `pt_hash` + `K_content`. No FileGrant, no owner liveness; the
+        // BLAKE3(plaintext)==pt_hash check happens inside `reconstruct`.
         let incoming_keys = chunk_keys_from_manifest(&incoming, &*vkeys.k_content);
 
-        // §11: take the vid's publish lock BEFORE reading our local baseline and hold it
-        // through reconstruct + commit, so a concurrent `publish_vault` cannot read-prev/commit
-        // in between (which would lose an update or ingest a half-written merged tree).
+        // §11 / MAJOR 5: take the vid's publish lock BEFORE reading our local
+        // baseline and hold it through the reconstruct + commit below, so a
+        // concurrent `publish_vault` (e.g. the watcher firing on this same tree)
+        // cannot read-prev/commit in between - that would lose an update or ingest a
+        // half-written merged tree. The whole apply is serialized on the vid.
         let publish_lock = self.publish_lock(*vid);
-        let _apply = publish_lock.lock().await;
+        let _apply = publish_lock.lock_owned().await;
+        let source = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .working_dirs
+            .get(vid)
+            .cloned();
+        let pending_restore = match source.as_ref() {
+            Some(source) => carapace_vault::has_pending_restore(source)?,
+            None => false,
+        };
+        // Rebuild an unavailable local baseline from its durable, identity-bound
+        // digest before deciding which disk changes are local edits. A newer remote
+        // manifest alone cannot tell us whether an absent local file was deleted.
+        let retained = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .needs_refetch
+            .get(vid)
+            .cloned();
+        if let Some((digest, chunk_ids)) = retained {
+            let baseline = async {
+                let bytes = if digest == ann.digest {
+                    env_bytes.clone()
+                } else {
+                    let retained_store = IrohBlobStore::new();
+                    tokio::time::timeout(peer_timeout, retained_store.fetch(&bconn, digest))
+                        .await.context("retained baseline download timed out")??;
+                    retained_store.get_bytes(digest).await?
+                };
+                let baseline = open_envelope(&ManifestEnvelope::from_bytes(&bytes)?, &vkeys.k_manifest)?;
+                let epoch = self.shared.read().expect("shared lock").epochs.get(vid).copied();
+                ensure!(baseline.vid == *vid && Some(baseline.epoch) == epoch,
+                    "retained baseline identity or epoch mismatch");
+                Ok::<_, anyhow::Error>(baseline)
+            }.await.context("cannot authenticate retained baseline; local changes remain unresolved and were not overwritten")?;
+            let keys = chunk_keys_from_manifest(&baseline, &*vkeys.k_content);
+            let mut s = self.shared.write().expect("shared lock");
+            s.vault_keys.insert(*vid, keys);
+            s.vault_blobs.insert(
+                *vid,
+                VaultBlobs {
+                    digest,
+                    chunk_ids,
+                    manifest: baseline,
+                },
+            );
+            // Keep needs_refetch until repaired blobs and metadata commit together.
+        }
+        if let Some(source) = source.as_ref() {
+            if !pending_restore {
+                // Reconcile only a complete disk tree under the same vault lock.
+                self.publish_vault_locked(source, *vid).await?;
+            }
+        }
+        let repairing_baseline = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .needs_refetch
+            .contains_key(vid);
+        let _work = Arc::clone(&self.ingest_limit).acquire_owned().await?;
 
-        // §11: if THIS device already has a manifest for this vault, MERGE rather than
-        // blindly reconstructing the received one (else the reconstruct clobbers an earlier
-        // edit and drops its tombstones - the silent-data-loss hole). First sync reconstructs
-        // as-is and records a baseline.
+        // §11: if THIS device already published (or synced) a manifest for this
+        // vault, MERGE the two rather than blindly reconstructing the received one -
+        // otherwise the later reconstruct silently clobbers an earlier edit and
+        // drops its tombstones (W1/W12, the silent-data-loss hole). A first sync (no
+        // local manifest for this vid) reconstructs as-is and records a baseline.
         let local = {
             let s = self.shared.read().expect("shared lock");
             s.vault_blobs.get(vid).map(|vb| {
@@ -3168,9 +3588,11 @@ impl Daemon {
             // Concurrent-owner sync: reconcile per §11.
             Some((local_manifest, local_keys)) => {
                 let merged = merge_manifests(&local_manifest, &incoming);
-                // Only re-publish when the merge produced new state; a converged (no-op) merge
-                // must not bump the epoch or the two devices ping-pong announces forever.
-                let changed = merged.files != local_manifest.files
+                // Only re-publish when the merge produced state we did not already
+                // hold; a converged (no-op) merge must not bump the epoch, or the two
+                // devices would ping-pong announces forever.
+                let changed = repairing_baseline
+                    || merged.files != local_manifest.files
                     || !vv_equal(&merged.vv, &local_manifest.vv);
                 let epoch = if changed {
                     local_manifest.epoch.max(incoming.epoch) + 1
@@ -3196,9 +3618,19 @@ impl Daemon {
             }
         };
 
-        // Materialize every referenced chunk: chunks we own come from our served store, the
-        // peer's from the blob peer. On a first sync all come from the peer.
-        let mut store = MemoryStore::new();
+        if !republish && !first_sync && !pending_restore {
+            return Ok(Reconstructed {
+                vid: *vid,
+                epoch: manifest.epoch,
+                out_dir: self.shared.read().expect("shared lock").working_dirs[vid].clone(),
+            });
+        }
+
+        // Materialize every referenced chunk: chunks we already own come from our
+        // served store, the peer's (conflict-loser or dominant-remote) come from the
+        // blob peer. On a first sync all of them come from the peer.
+        let _scratch_dir = EphemeralDir(ephemeral_state_dir()?);
+        let mut store = FsStore::open(&_scratch_dir.0)?;
         for f in &manifest.files {
             if f.deleted {
                 continue;
@@ -3210,52 +3642,104 @@ impl Daemon {
                 let ct = match self.blobs.get_bytes(*id).await {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        scratch.fetch(&bconn, *id).await?;
-                        scratch.get_bytes(*id).await?
+                        // Drop each download store after one chunk so ciphertext
+                        // memory is bounded by a chunk, not the whole vault.
+                        let chunk_scratch = IrohBlobStore::new();
+                        tokio::time::timeout(peer_timeout, chunk_scratch.fetch(&bconn, *id))
+                            .await
+                            .context("chunk download timed out")??;
+                        chunk_scratch.get_bytes(*id).await?
                     }
                 };
                 carapace_vault::ChunkStore::put(&mut store, *id, ct)?;
             }
         }
 
-        // §11: reconstruct into the vault's ONE authoritative working directory (the tree
-        // published + watched) so the merged set lands where the watcher re-observes it,
-        // keeping "absent => tombstone" sound. A pure receiver's first sync (no working dir)
-        // falls back to `out_root/<vid>` and adopts it.
+        // §11 (BLOCKER 1): reconstruct into the vault's ONE authoritative working
+        // directory - the same tree that is published and watched - so the merged
+        // set (winner at path, losers at sync-conflict names, tombstone deletions)
+        // lands where the watcher will re-observe it, keeping "absent => tombstone"
+        // sound. If this device has no working dir yet (a pure receiver's first
+        // sync), fall back to `out_root/<vid>` and adopt it as the working dir.
         let out_dir = {
-            let mut s = self.shared.write().expect("shared lock");
-            let adopting = !s.working_dirs.contains_key(vid);
-            let dir = s
-                .working_dirs
-                .entry(*vid)
-                .or_insert_with(|| out_root.join(hex32(vid)))
-                .clone();
-            // `working_dirs` is persisted: commit an adopted working dir now, since a later
-            // `publish_merged`/`persist_sync_baseline` may not run (a no-op re-sync) and a
-            // lost working dir strands this vault's future edits.
-            if adopting {
-                self.persist_locked(&s);
+            let s = self.shared.read().expect("shared lock");
+            if let Some(dir) = s.working_dirs.get(vid) {
+                dir.clone()
+            } else {
+                let candidate = out_root.join(hex32(vid));
+                if candidate.exists() {
+                    ensure!(
+                        std::fs::read_dir(&candidate)?.next().is_none(),
+                        "sync destination contains unmanaged files: {}",
+                        candidate.display()
+                    );
+                }
+                candidate
             }
-            dir
         };
-        reconstruct(&manifest, &store, &keys, &out_dir)?;
-        // §11: apply tombstone deletions so a propagated delete removes a file a
-        // prior reconstruct may have written into this working dir.
-        for f in &manifest.files {
-            if f.deleted && manifest_rel_is_safe(&f.path) {
-                let _ = std::fs::remove_file(out_dir.join(&f.path));
-            }
-        }
+        self.ensure_disjoint_working_dir(*vid, &live_sync::registered_path(&out_dir)?)?;
+        let backup_root = self.state_dir.join("restore-backups").join(hex32(vid));
+        // The apply guard travels with blocking writes: stopping the runtime
+        // cannot release the vault lock while a filesystem write is still running.
+        let (manifest, keys, store, out_dir, _apply, _work, _scratch_dir) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                if pending_restore {
+                    // ponytail: a full private copy per rare retry preserves edits made
+                    // during interruption without guessing which mixed files are new.
+                    state::ensure_private_directory(
+                        backup_root.parent().context("backup parent")?,
+                    )?;
+                    state::ensure_private_directory(&backup_root)?;
+                    let attempt = tempfile::Builder::new()
+                        .prefix("attempt-")
+                        .tempdir_in(&backup_root)?
+                        .keep();
+                    carapace_vault::backup_interrupted_tree(&out_dir, &attempt).context(
+                        "partial restore backup failed; working files were not overwritten",
+                    )?;
+                    // Publish the backup hierarchy before overwriting source files.
+                    #[cfg(unix)]
+                    for directory in backup_root.ancestors().take(3) {
+                        std::fs::File::open(directory)?.sync_all()?;
+                    }
+                }
+                reconstruct(&manifest, &store, &keys, &out_dir)?;
+                // §11: apply tombstone deletions so a propagated delete removes a file a
+                // prior reconstruct may have written into this working dir.
+                for f in &manifest.files {
+                    if f.deleted {
+                        carapace_vault::remove_restored_file(&out_dir, &f.path)?;
+                    }
+                }
+
+                Ok((manifest, keys, store, out_dir, _apply, _work, _scratch_dir))
+            })
+            .await
+            .context("vault reconstruction task")??;
 
         if republish {
-            // Re-publish the merged state so the other device(s) converge (§7.3). Skipped on
-            // a no-op merge (see `changed`) to guarantee termination.
+            // Re-publish the merged state so the other device(s) converge on it
+            // (eventual consistency, §7.3): this device now serves both versions and
+            // announces the reconciled manifest at a bumped epoch. Skipped on a no-op
+            // merge (see `changed`) to guarantee termination.
             self.publish_merged(vid, &manifest, &keys, &store).await?;
         } else if first_sync {
-            // Record the reconstructed manifest + keys + epoch as this device's baseline
-            // WITHOUT announcing, so a later local edit diffs against the incoming state
-            // instead of re-minting every file as new.
-            self.persist_sync_baseline(vid, &manifest, &keys, ann.digest);
+            // MAJOR 4: record the reconstructed manifest + keys + epoch as this
+            // device's baseline WITHOUT announcing/serving, so a later local edit
+            // (or watcher re-ingest) diffs against the incoming state instead of
+            // re-minting every file as new and spawning a spurious conflict copy.
+            // A baseline must survive restart with its envelope and chunks.
+            let _blob_mutation = self.blobs.begin_durable_mutation().await;
+            self.blobs.add(&env_bytes).await?;
+            for file in &manifest.files {
+                for (id, _, _) in &file.chunks {
+                    if let Some(bytes) = carapace_vault::ChunkStore::get(&store, id)? {
+                        self.blobs.add(&bytes).await?;
+                    }
+                }
+            }
+            self.blobs.sync().await?;
+            self.persist_sync_baseline(vid, &manifest, &keys, ann.digest, &out_dir);
         }
 
         Ok(Reconstructed {
@@ -3265,15 +3749,15 @@ impl Daemon {
         })
     }
 
-    /// Persist a first-sync reconstruction as this device's baseline for `vid` (manifest +
-    /// per-chunk secrets + epoch) WITHOUT touching announces/grants/owned_chunks, so
-    /// `publish_vault`'s prev-diff works against the incoming state instead of re-minting.
+    /// Persist the complete first-sync baseline, authoritative directory and blob
+    /// authorization together. Its own announce is created on the next publish.
     fn persist_sync_baseline(
         &self,
         vid: &[u8; 32],
         manifest: &Manifest,
         keys: &ChunkKeys,
         digest: [u8; 32],
+        out_dir: &Path,
     ) {
         let mut seen = HashSet::new();
         let mut chunk_ids = Vec::new();
@@ -3285,8 +3769,13 @@ impl Daemon {
             }
         }
         let mut s = self.shared.write().expect("shared lock");
+        s.working_dirs.insert(*vid, out_dir.to_path_buf());
         s.epochs.insert(*vid, manifest.epoch);
         s.vault_keys.insert(*vid, keys.clone());
+        for id in &chunk_ids {
+            s.owned_chunks.insert(*id, *vid);
+        }
+        s.owned_chunks.insert(digest, *vid);
         s.vault_blobs.insert(
             *vid,
             VaultBlobs {
@@ -3295,10 +3784,11 @@ impl Daemon {
                 manifest: manifest.clone(),
             },
         );
-        // An adopted sync baseline repairs a needs-refetch vault.
+        // An adopted sync baseline repairs a needs-refetch vault (§3.5).
         s.needs_refetch.remove(vid);
-        // Commit the baseline (epochs + vault_blobs are persisted; vault_keys is EPH) so a
-        // post-reboot local edit still diffs against the incoming state.
+        // MAJOR 4 (audit #4): epochs + vault_blobs are persisted categories (vault_keys is
+        // EPH, re-derived at load). Commit the baseline so a post-reboot local edit still
+        // diffs against the incoming state instead of re-minting every file as new.
         self.persist_locked(&s);
     }
 
@@ -3311,7 +3801,7 @@ impl Daemon {
         vid: &[u8; 32],
         manifest: &Manifest,
         keys: &ChunkKeys,
-        store: &MemoryStore,
+        store: &FsStore,
     ) -> Result<()> {
         // Serialize all served-store writes through their state commit against GC.
         let _blob_mutation = self.blobs.begin_durable_mutation().await;
@@ -4027,6 +4517,18 @@ impl Daemon {
         peers: &[EndpointAddr],
         r: usize,
     ) -> Result<Vec<[u8; 32]>> {
+        if self.own_announce_digest(&vid).is_none() {
+            let source = self
+                .shared
+                .read()
+                .expect("shared lock")
+                .working_dirs
+                .get(&vid)
+                .cloned()
+                .context("vault has no working directory")?;
+            self.publish_vault(&source, vid).await?;
+        }
+
         let (vb, epoch) = {
             let s = self.shared.read().expect("shared lock");
             let vb = s
@@ -4037,8 +4539,7 @@ impl Daemon {
             let epoch = *s.epochs.get(&vid).context("vault has no epoch")?;
             (vb, epoch)
         };
-        let blobs = self.gather_blob_bytes(&vb).await?;
-        let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+        let total = self.blob_total_bytes(&vb).await?;
 
         let now = unix_now();
         let self_user = self.user_id();
@@ -4050,10 +4551,7 @@ impl Daemon {
             if !self.replica_candidate_ok(&node, &self_user, now) {
                 continue;
             }
-            if let Some(node) = self
-                .invite_and_push(peer, vid, epoch, total, &blobs)
-                .await?
-            {
+            if let Some(node) = self.invite_and_push(peer, vid, epoch, total, &vb).await? {
                 placed.push(node);
             }
         }
@@ -4106,8 +4604,7 @@ impl Daemon {
         });
 
         if members.len() < r {
-            let blobs = self.gather_blob_bytes(&vb).await?;
-            let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+            let total = self.blob_total_bytes(&vb).await?;
             let self_user = self.user_id();
             for peer in candidates {
                 if members.len() >= r {
@@ -4121,10 +4618,7 @@ impl Daemon {
                 if !self.replica_candidate_ok(&node, &self_user, now) {
                     continue;
                 }
-                if let Some(n) = self
-                    .invite_and_push(peer, vid, epoch, total, &blobs)
-                    .await?
-                {
+                if let Some(n) = self.invite_and_push(peer, vid, epoch, total, &vb).await? {
                     members.push(n);
                 }
             }
@@ -4158,13 +4652,14 @@ impl Daemon {
 
     /// Fetch the envelope (index 0) plus every unique chunk from this daemon's
     /// blob store, in the order a replica expects them pushed.
-    async fn gather_blob_bytes(&self, vb: &VaultBlobs) -> Result<Vec<Vec<u8>>> {
-        let mut out = Vec::with_capacity(1 + vb.chunk_ids.len());
-        out.push(self.blobs.get_bytes(vb.digest).await?);
-        for id in &vb.chunk_ids {
-            out.push(self.blobs.get_bytes(*id).await?);
+    async fn blob_total_bytes(&self, vb: &VaultBlobs) -> Result<u64> {
+        let mut total = 0u64;
+        for id in std::iter::once(&vb.digest).chain(&vb.chunk_ids) {
+            total = total
+                .checked_add(self.blobs.get_bytes(*id).await?.len() as u64)
+                .context("vault byte count overflow")?;
         }
-        Ok(out)
+        Ok(total)
     }
 
     /// Dial `peer`'s control stream, send a `ReplicaInvite`, and on a valid
@@ -4176,7 +4671,7 @@ impl Daemon {
         vid: [u8; 32],
         epoch: u64,
         total: u64,
-        blobs: &[Vec<u8>],
+        vb: &VaultBlobs,
     ) -> Result<Option<[u8; 32]>> {
         let node = *peer.id.as_bytes();
         let conn = self.ep.connect(peer.clone(), ALPN).await?;
@@ -4220,17 +4715,18 @@ impl Daemon {
         };
         write_msg(&mut send, &announce).await?;
 
-        write_u64(&mut send, blobs.len() as u64).await?;
-        for b in blobs {
-            write_blob(&mut send, b).await?;
+        let blob_count = 1 + vb.chunk_ids.len() as u64;
+        write_u64(&mut send, blob_count).await?;
+        for id in std::iter::once(&vb.digest).chain(&vb.chunk_ids) {
+            let bytes = self.blobs.get_bytes(*id).await?;
+            write_blob(&mut send, &bytes).await?;
         }
         send.finish()?;
         // Wait for the replica's ack so membership only records durable storage.
         let acked = read_u64(&mut recv).await?;
         ensure!(
-            acked == blobs.len() as u64,
-            "replica acked {acked} of {} blobs",
-            blobs.len()
+            acked == blob_count,
+            "replica acked {acked} of {blob_count} blobs"
         );
         // §6: remember where this replica lives (PoR re-audit by node id) and mark it seen
         // (§9.3.4 reachability signal).
@@ -5680,26 +6176,32 @@ impl Daemon {
             .context("no verified recovery grant for claimant subject")?;
         verify_share_grant(&grant)
             .map_err(|error| anyhow::anyhow!("held grant failed verification: {error:?}"))?;
+        let own_card = self.own_device_card();
+        let own = own_card
+            .nodes
+            .iter()
+            .find(|node| node.node_id == self.node_id())
+            .context("own contact card has no local node")?;
         let s = self.shared.read().expect("shared lock");
-        let mut rows = Vec::with_capacity(grant.cotrustees.len() + 1);
-        let own_node = self.node_id();
-        let own_addrs = self
-            .addr()
-            .map(|address| address.ip_addrs().map(ToString::to_string).collect())
-            .unwrap_or_default();
-        rows.push(ClaimantTrusteeHint {
+        let mut rows = vec![ClaimantTrusteeHint {
             user: self.user_id(),
-            node: own_node,
-            addrs: own_addrs,
-        });
+            node: self.node_id(),
+            addrs: own.addrs.clone(),
+            relay_url: own.relay_url.clone(),
+        }];
         for trustee in &grant.cotrustees {
-            let addrs = resolve_peer(&s.peer_addrs, &trustee.node)
-                .map(|address| address.ip_addrs().map(ToString::to_string).collect())
-                .unwrap_or_default();
+            let address = resolve_peer(&s.peer_addrs, &trustee.node);
             rows.push(ClaimantTrusteeHint {
                 user: trustee.user,
                 node: trustee.node,
-                addrs,
+                addrs: address
+                    .as_ref()
+                    .map(|a| a.ip_addrs().map(ToString::to_string).collect())
+                    .unwrap_or_default(),
+                relay_url: address
+                    .as_ref()
+                    .and_then(|a| a.relay_urls().next().map(ToString::to_string))
+                    .or_else(|| trustee.relay_url.clone()),
             });
         }
         rows.sort_by_key(|row| row.user);
@@ -6329,16 +6831,6 @@ fn recovery_claimant_device(s: &Shared, card: &ContactCard, remote: &[u8; 32], n
                 && !ceremony_is_expired(ceremony, now)
                 && s.ceremony_released.get(id) == Some(remote)
         })
-}
-
-/// Whether a manifest-supplied relative path is safe to delete under an out dir (no absolute
-/// root, no `..` escape, no backslash). Mirrors `carapace_vault`'s `safe_join` guard for the
-/// tombstone-deletion path, since a manifest may be hostile.
-fn manifest_rel_is_safe(rel: &str) -> bool {
-    if rel.is_empty() {
-        return false;
-    }
-    rel.split('/').all(|p| p != ".." && !p.contains('\\'))
 }
 
 /// Choose which vaults to reconstruct from a pulled document batch, applying the two §6 MUSTs:
@@ -7284,6 +7776,29 @@ pub struct Recovered {
 }
 
 impl ClaimantDevice {
+    /// Resume the claimant's OS-credential-backed keys across process restarts.
+    pub fn load_or_create(dir: &Path) -> Result<Self> {
+        Self::persisted(dir, false)
+    }
+
+    /// Explicit cancellation rotates the persisted claimant keys.
+    pub fn reset_persisted(dir: &Path) -> Result<Self> {
+        Self::persisted(dir, true)
+    }
+
+    fn persisted(dir: &Path, reset: bool) -> Result<Self> {
+        let (node_seed, ikm) = State::claimant_seeds(dir, reset)?;
+        let (sk, pk) = seal::derive_keypair(&*ikm);
+        Ok(Self {
+            node_key: SigningKey::from_bytes(&node_seed),
+            ceremony_sk: sk,
+            ceremony_pub: pk
+                .to_bytes()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("ceremony public key has invalid length"))?,
+        })
+    }
+
     /// Generate a fresh claimant device: a new node key plus a fresh ceremony HPKE
     /// keypair (the key the trustees seal their shares to).
     pub fn new() -> Result<Self> {
@@ -7332,13 +7847,27 @@ impl ClaimantDevice {
         open: &RecoveryOpen,
         trustees: &[EndpointAddr],
     ) -> Result<Vec<CeremonyShare>> {
-        let ep = CarapaceEndpoint::bind(&self.node_key)
-            .await
-            .context("bind claimant endpoint")?;
+        ensure!(trustees.len() <= 64, "too many claimant trustee endpoints");
+        let relays: Vec<_> = trustees
+            .iter()
+            .flat_map(|peer| peer.relay_urls().cloned())
+            .collect();
+        let ep = CarapaceEndpoint::bind_on(
+            &self.node_key,
+            std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+            &relays,
+        )
+        .await
+        .context("bind claimant endpoint")?;
         let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         for addr in trustees {
-            match self.request_share(&ep, addr, open).await {
-                Ok(Some(cs)) => out.push(cs),
+            let request_deadline =
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(15));
+            match tokio::time::timeout_at(request_deadline, self.request_share(&ep, addr, open))
+                .await
+            {
+                Ok(Ok(Some(cs))) => out.push(cs),
                 _ => continue,
             }
         }
@@ -7390,8 +7919,35 @@ impl ClaimantDevice {
         roster: &[[u8; 32]],
         trustees: &[EndpointAddr],
     ) -> Result<Recovered> {
+        carapace_recovery::verify_recovery_open(open, roster)
+            .map_err(|error| anyhow::anyhow!("invalid recovery open: {error:?}"))?;
+        ensure!(
+            open.new_node == self.new_node() && open.ceremony_enc == self.ceremony_enc(),
+            "recovery open belongs to another claimant"
+        );
         let shares = self.collect_raw(open, trustees).await?;
-        self.recover_from(&shares, roster)
+        for share in &shares {
+            ensure!(
+                share.ceremony_id == open.ceremony_id,
+                "share belongs to another ceremony"
+            );
+            let json = Zeroizing::new(
+                open_ceremony_share(&self.ceremony_sk, share, roster)
+                    .map_err(|error| anyhow::anyhow!("invalid ceremony share: {error:?}"))?,
+            );
+            let parsed = share_from_json(&json)
+                .map_err(|error| anyhow::anyhow!("invalid share: {error:?}"))?;
+            ensure!(
+                u64::from(parsed.recovery_set_id) == open.rsid,
+                "share belongs to another recovery set"
+            );
+        }
+        let recovered = self.recover_from(&shares, roster)?;
+        ensure!(
+            recovered.user_id == open.subject,
+            "recovered root does not match the intended subject"
+        );
+        Ok(recovered)
     }
 
     /// Collect and recover from trustee addresses supplied by a local control client.
@@ -7408,6 +7964,26 @@ impl ClaimantDevice {
         let addresses = trustees
             .iter()
             .map(|(node, addrs)| endpoint_addr(*node, addrs))
+            .collect::<Result<Vec<_>>>()?;
+        self.recover(open, roster, &addresses).await
+    }
+
+    /// Direct and relay hints from the public claimant package.
+    pub async fn recover_at_with_relays(
+        &self,
+        open: &RecoveryOpen,
+        roster: &[[u8; 32]],
+        trustees: &[([u8; 32], Vec<String>, Option<String>)],
+    ) -> Result<Recovered> {
+        let addresses = trustees
+            .iter()
+            .map(|(node, addrs, relay)| {
+                let mut address = endpoint_addr(*node, addrs)?;
+                if let Some(relay) = relay {
+                    address = address.with_relay_url(relay.parse()?);
+                }
+                Ok(address)
+            })
             .collect::<Result<Vec<_>>>()?;
         self.recover(open, roster, &addresses).await
     }

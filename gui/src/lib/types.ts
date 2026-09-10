@@ -2,6 +2,9 @@
 // Kept as plain interfaces mirroring the JSON exactly - no client-side renaming.
 
 export interface StatusSnapshot {
+	user_id?: string;
+	identity_storage?: string;
+	sync_errors?: {node:string;error:string}[];
 	node_id: string;
 	addr: string[];
 	friends: { count: number; list: string[]; grants: FriendGrant[] };
@@ -126,6 +129,12 @@ export interface UnfriendResult {
 }
 
 export interface PublishedVault {
+	dir?: string;
+	watching?: boolean;
+	syncing?: boolean;
+	last_error?: string | null;
+	last_success?: number | null;
+	recovery_backup?: string | null;
 	vid: string;
 	epoch: number;
 	name: string;

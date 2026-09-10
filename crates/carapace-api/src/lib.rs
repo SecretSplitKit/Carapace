@@ -13,6 +13,7 @@
 //! served `index.html` gets the session token injected as `window.__CARAPACE_TOKEN__`
 //! under a strict per-response CSP nonce; see [`handlers::static_asset`].
 
+mod account_transfer;
 mod auth;
 mod claimant;
 mod handlers;
@@ -50,6 +51,7 @@ pub struct ApiServer {
     handle: tokio::task::JoinHandle<()>,
     /// The daemon's background maintenance loop (§10.1/§10.2), torn down with the API.
     _maintenance: MaintenanceHandle,
+    _live_sync: carapaced::LiveSyncHandle,
 }
 
 /// A running claimant-only API. It never owns a normal daemon.
@@ -87,12 +89,29 @@ impl ApiServer {
     }
 }
 
+impl Drop for ClaimantApiServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for ApiServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Assemble the router: token-gated `/api` action routes, the public health check
 /// and WebSocket events feed, and the embedded GUI fallback, all wrapped in the
 /// global Host/Origin guard.
 pub fn app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/status", get(handlers::status))
+        .route("/api/directories", get(handlers::directories))
+        .route("/api/account/export", post(account_transfer::export))
+        .route("/api/account/import", post(account_transfer::import))
+        .route("/api/devices/self", get(handlers::device_card))
+        .route("/api/devices", post(handlers::enroll_device))
         .route("/api/metrics", get(handlers::metrics))
         .route("/api/sync", post(handlers::sync_owned))
         .route(
@@ -223,10 +242,28 @@ fn write_token_file(path: &Path, token: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn write_token_file(_path: &Path, _token: &str) -> Result<()> {
-    anyhow::bail!(
-        "control API startup on Windows is disabled until Carapace enforces a private ACL on API token files"
-    )
+fn write_token_file(path: &Path, token: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::MetadataExt;
+    carapaced::State::secure_directory(path.parent().context("token file has no parent")?)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file() && metadata.file_attributes() & 0x400 == 0,
+                "token file is a reparse point or non-file"
+            );
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -270,6 +307,7 @@ pub async fn serve(daemon: Arc<Daemon>, state_dir: &Path, port: u16) -> Result<A
     // the production entry point that already holds an `Arc<Daemon>`; the loop holds
     // only a `Weak` and is torn down when this `ApiServer` drops.
     let maintenance = Arc::clone(&daemon).run_maintenance(MaintenanceConfig::default());
+    let live_sync = Arc::clone(&daemon).run_live_sync(Default::default());
 
     let state = AppState {
         daemon,
@@ -290,6 +328,7 @@ pub async fn serve(daemon: Arc<Daemon>, state_dir: &Path, port: u16) -> Result<A
         local_addr,
         handle,
         _maintenance: maintenance,
+        _live_sync: live_sync,
     })
 }
 
@@ -384,11 +423,11 @@ mod windows_tests {
     use super::write_token_file;
 
     #[test]
-    fn token_creation_fails_closed_without_private_acls() {
+    fn token_creation_enforces_private_acls_and_preserves_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api-token");
-        let error = write_token_file(&path, "secret").unwrap_err();
-        assert!(error.to_string().contains("private ACL"));
-        assert!(!path.exists());
+        write_token_file(&path, "secret").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
+        carapaced::State::secure_directory(dir.path()).unwrap();
     }
 }

@@ -123,6 +123,10 @@ const post = <T>(path: string, body?: unknown) =>
 	request<T>(path, { method: 'POST', body: body !== undefined ? JSON.stringify(body) : undefined });
 
 export const api = {
+	exportAccount: (passphrase:string) => post<{package_hex:string;user_id:string;card_hex:string}>('/api/account/export',{passphrase}),
+	importAccount: (data:{package_hex:string;passphrase:string;destination:string}) => post<{user_id:string;state_dir:string;card_hex:string;source_card_hex:string;restart_required:boolean}>('/api/account/import',data),
+	enrollDevice: (card_hex:string) => post<{enrolled:boolean}>('/api/devices',{card_hex}),
+	directories: (path?:string) => get<{path:string;parent:string|null;directories:{name:string;path:string}[]}>(`/api/directories${path ? `?path=${encodeURIComponent(path)}` : ''}`),
 	health: () => get<{ ok: boolean }>('/api/health'),
 	status: () => get<StatusSnapshot>('/api/status'),
 	syncOwned: (peer: { node: string; addrs: string[] }, out_dir: string) =>

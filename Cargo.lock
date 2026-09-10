@@ -738,6 +738,7 @@ dependencies = [
  "rustix",
  "tempfile",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -786,6 +787,7 @@ dependencies = [
  "carapace-net",
  "carapace-recovery",
  "carapace-replica",
+ "carapace-restore",
  "carapace-share",
  "carapace-vault",
  "carapace-wire",

@@ -60,6 +60,7 @@ async fn publish_survives_immediate_kill() -> Result<()> {
     let state_b = tempfile::tempdir()?;
     copy_tree(state_a.path(), state_b.path())?;
     d.shutdown().await;
+    drop(d); // A killed process releases every endpoint clone and its stable UDP port.
 
     // The kill image's FsStore must already hold every published blob.
     let probe = IrohBlobStore::load(&state_b.path().join("blobs")).await?;

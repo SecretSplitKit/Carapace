@@ -1,8 +1,6 @@
 //! Shared validation and atomic output for restored files.
 
 use std::collections::HashSet;
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +14,27 @@ pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_COMPONENTS: usize = 256;
 const JOURNAL_NAME: &str = ".carapace-restore-journal";
+
+/// Refuse to ingest a tree while a prior restore is recorded as incomplete.
+pub fn refuse_pending_journal(root: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(root.join(JOURNAL_NAME)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Error::InvalidLayout(
+            "incomplete restore journal".to_owned(),
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Reports whether a prior restore journal is present without interpreting I/O
+/// failures as journal absence.
+pub fn has_pending_journal(root: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(root.join(JOURNAL_NAME)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -382,6 +401,85 @@ pub fn write_atomic(
     }
 }
 
+/// Remove a validated restored file without following a link in its parent chain.
+pub fn remove_file(root: &Path, relative: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{self as unix, AtFlags, FileType, Mode, OFlags, CWD};
+
+        let mut parent = unix::openat(
+            CWD,
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file_name = relative
+            .file_name()
+            .ok_or_else(|| Error::UnsafePath(relative.display().to_string()))?;
+        if let Some(components) = relative.parent() {
+            for component in components.components() {
+                match unix::openat(
+                    &parent,
+                    component.as_os_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(next) => parent = next,
+                    Err(rustix::io::Errno::NOENT) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        match unix::statat(&parent, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_file() => {
+                unix::unlinkat(&parent, file_name, AtFlags::empty())?;
+                unix::fsync(&parent)?;
+            }
+            Ok(_) => return Err(Error::UnsafePath(relative.display().to_string())),
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        let secured = portable_destination(root, relative)?;
+        #[cfg(windows)]
+        let destination = secured.destination.clone();
+        #[cfg(not(windows))]
+        let destination = {
+            refuse_link(root)?;
+            let mut destination = root.to_path_buf();
+            for component in relative.components() {
+                destination.push(component);
+                if destination != root.join(relative) {
+                    match fs::symlink_metadata(&destination) {
+                        Ok(metadata)
+                            if metadata.file_type().is_dir()
+                                && !metadata.file_type().is_symlink() => {}
+                        Ok(_) => return Err(Error::UnsafePath(relative.display().to_string())),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            destination
+        };
+        if let Ok(metadata) = fs::symlink_metadata(&destination) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(Error::UnsafePath(relative.display().to_string()));
+            }
+        }
+        match fs::remove_file(destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 /// Write bounded plaintext chunks to a private temporary file, verify the final length and
 /// BLAKE3 hash, then atomically activate it. A source error or verification failure leaves
 /// the old destination unchanged.
@@ -500,33 +598,75 @@ where
 
 #[cfg(not(unix))]
 pub fn write_atomic_chunks<I, E>(
-    _root: &Path,
+    root: &Path,
     relative: &Path,
-    _chunks: I,
-    _expected_size: u64,
-    _expected_hash: &[u8; 32],
+    chunks: I,
+    expected_size: u64,
+    expected_hash: &[u8; 32],
     _mode: u64,
-    _mtime: u64,
+    mtime: u64,
 ) -> Result<PathBuf, StreamError<E>>
 where
     I: IntoIterator<Item = Result<Vec<u8>, E>>,
 {
-    Err(Error::InvalidLayout(format!(
-        "streaming restore is unavailable on this build-only platform: {}",
-        relative.display()
-    ))
-    .into())
+    if expected_size > MAX_FILE_BYTES {
+        return Err(Error::Limit("file bytes").into());
+    }
+    let secured = portable_destination(root, relative)?;
+    let (parent, destination) = (&secured.parent, &secured.destination);
+    let mut temporary = tempfile::NamedTempFile::new_in(&parent).map_err(Error::from)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut written = 0u64;
+    let mut count = 0usize;
+    for chunk in chunks {
+        count += 1;
+        if count > MAX_CHUNKS_PER_FILE {
+            return Err(Error::Limit("chunks per file").into());
+        }
+        let chunk = chunk.map_err(StreamError::Source)?;
+        if chunk.len() as u64 > MAX_CHUNK_BYTES {
+            return Err(Error::Limit("chunk bytes").into());
+        }
+        written = written
+            .checked_add(chunk.len() as u64)
+            .ok_or(Error::Limit("file bytes"))?;
+        if written > expected_size {
+            return Err(Error::InvalidLayout(relative.display().to_string()).into());
+        }
+        temporary.write_all(&chunk).map_err(Error::from)?;
+        hasher.update(&chunk);
+    }
+    if written != expected_size || hasher.finalize().as_bytes() != expected_hash {
+        return Err(Error::InvalidLayout(relative.display().to_string()).into());
+    }
+    let modified = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(mtime))
+        .ok_or_else(|| Error::InvalidLayout(relative.display().to_string()))?;
+    temporary
+        .as_file()
+        .set_modified(modified)
+        .map_err(Error::from)?;
+    temporary.as_file().sync_all().map_err(Error::from)?;
+    persist_replace(temporary.into_temp_path(), &destination)?;
+    Ok(destination.clone())
 }
 
 #[cfg(not(unix))]
-fn write_atomic_portable(
-    root: &Path,
-    relative: &Path,
-    bytes: &[u8],
-    _mode: u64,
-    mtime: u64,
-) -> Result<PathBuf, Error> {
+struct PortableDestination {
+    parent: PathBuf,
+    destination: PathBuf,
+    #[cfg(windows)]
+    _directory_handles: Vec<File>,
+}
+
+#[cfg(not(unix))]
+fn portable_destination(root: &Path, relative: &Path) -> Result<PortableDestination, Error> {
     fs::create_dir_all(root)?;
+    #[cfg(windows)]
+    let mut handles = Vec::new();
+    #[cfg(windows)]
+    handles.push(open_locked_directory(root)?);
+    #[cfg(not(windows))]
     refuse_link(root)?;
     let mut parent = root.to_path_buf();
     let file_name = relative
@@ -541,6 +681,8 @@ fn write_atomic_portable(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&parent)?,
                 Err(error) => return Err(Error::Io(error)),
             }
+            #[cfg(windows)]
+            handles.push(open_locked_directory(&parent)?);
         }
     }
     let destination = parent.join(file_name);
@@ -549,19 +691,27 @@ fn write_atomic_portable(
             return Err(Error::UnsafePath(relative.display().to_string()));
         }
     }
-    let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce)
-        .map_err(|_| Error::Io(io::Error::other("random source failed")))?;
-    let temporary = parent.join(format!(
-        ".carapace-restore-{}-{:016x}.tmp",
-        std::process::id(),
-        u64::from_le_bytes(nonce)
-    ));
+    Ok(PortableDestination {
+        parent,
+        destination,
+        #[cfg(windows)]
+        _directory_handles: handles,
+    })
+}
+
+#[cfg(not(unix))]
+fn write_atomic_portable(
+    root: &Path,
+    relative: &Path,
+    bytes: &[u8],
+    _mode: u64,
+    mtime: u64,
+) -> Result<PathBuf, Error> {
+    let secured = portable_destination(root, relative)?;
+    let destination = &secured.destination;
+    let mut temporary = tempfile::NamedTempFile::new_in(&secured.parent)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let file = temporary.as_file_mut();
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
@@ -569,14 +719,35 @@ fn write_atomic_portable(
             .checked_add(std::time::Duration::from_secs(mtime))
             .ok_or_else(|| Error::InvalidLayout(relative.display().to_string()))?;
         file.set_modified(modified)?;
-        drop(file);
-        replace_file(&temporary, &destination)?;
+        persist_replace(temporary.into_temp_path(), &destination)?;
         Ok(destination.clone())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
     result
+}
+
+/// Opens a directory itself (rather than its reparse target) and retains an
+/// exclusive-delete handle. Holding every ancestor this way prevents another
+/// process from renaming an inspected directory and substituting a junction
+/// before the temporary file is activated.
+#[cfg(windows)]
+fn open_locked_directory(path: &Path) -> Result<File, Error> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 1;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::UnsafePath(path.display().to_string()));
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -682,19 +853,73 @@ fn write_atomic_unix_with_hook(
     result
 }
 
-#[cfg(not(unix))]
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    // A Windows rename can replace an existing destination. Create a second
-    // name for the temporary file so activation fails if the destination exists.
-    fs::hard_link(temporary, destination)?;
-    if let Err(error) = fs::remove_file(temporary) {
-        let _ = fs::remove_file(destination);
-        return Err(error);
+#[cfg(all(not(unix), not(windows)))]
+fn persist_replace(temporary: tempfile::TempPath, destination: &Path) -> Result<(), Error> {
+    let old_permissions = match fs::symlink_metadata(destination) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.permissions().readonly() => {
+            let permissions = metadata.permissions();
+            let mut writable = permissions.clone();
+            writable.set_readonly(false);
+            fs::set_permissions(destination, writable)?;
+            Some(permissions)
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = temporary.persist(destination) {
+        if let Some(permissions) = old_permissions {
+            fs::set_permissions(destination, permissions)?;
+        }
+        return Err(Error::Io(error.error));
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn persist_replace(temporary: tempfile::TempPath, destination: &Path) -> Result<(), Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let opened = fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(destination);
+    let old_permissions = match opened {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(Error::UnsafePath(destination.display().to_string()));
+            }
+            if metadata.permissions().readonly() {
+                let permissions = metadata.permissions();
+                let mut writable = permissions.clone();
+                writable.set_readonly(false);
+                file.set_permissions(writable)?;
+                Some((file, permissions))
+            } else {
+                None
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = temporary.persist(destination) {
+        if let Some((file, permissions)) = old_permissions {
+            file.set_permissions(permissions)?;
+        }
+        return Err(Error::Io(error.error));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn refuse_link(path: &Path) -> Result<(), Error> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
@@ -732,6 +957,11 @@ mod tests {
             );
         }
         assert!(validate_path("nested/.carapace-restore-journal").is_ok());
+
+        let root = tempfile::tempdir().unwrap();
+        assert!(refuse_pending_journal(root.path()).is_ok());
+        std::fs::write(root.path().join(JOURNAL_NAME), b"pending").unwrap();
+        assert!(refuse_pending_journal(root.path()).is_err());
     }
 
     #[test]
@@ -843,6 +1073,36 @@ mod tests {
         symlink_dir(outside.path(), temp.path().join("link")).unwrap();
         assert!(write_atomic(temp.path(), Path::new("link/x"), b"x", 0, 0).is_err());
         assert!(!outside.path().join("x").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_directory_handles_block_parent_substitution() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const FILE_SHARE_DELETE: u32 = 4;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let secured = portable_destination(temp.path(), Path::new("parent/file")).unwrap();
+
+        let mutation_capable_open = || {
+            fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&parent)
+        };
+        assert!(mutation_capable_open().is_err());
+        assert!(std::fs::rename(&parent, temp.path().join("moved")).is_err());
+        drop(secured);
+        assert!(mutation_capable_open().is_ok());
     }
 
     #[cfg(unix)]
@@ -1051,12 +1311,16 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn atomic_replacement_fails_closed_when_destination_exists() {
+    fn atomic_replacement_preserves_then_replaces_existing_file() {
         let temp = tempfile::tempdir().unwrap();
         let path = Path::new("result.txt");
         write_atomic(temp.path(), path, b"first", 0, 0).unwrap();
-        assert!(write_atomic(temp.path(), path, b"second", 0, 0).is_err());
-        assert_eq!(std::fs::read(temp.path().join(path)).unwrap(), b"first");
+        let destination = temp.path().join(path);
+        let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&destination, permissions).unwrap();
+        write_atomic(temp.path(), path, b"second", 0, 0).unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"second");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 }

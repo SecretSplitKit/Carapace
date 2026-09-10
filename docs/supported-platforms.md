@@ -9,6 +9,8 @@ client. The release matrix must build all targets before publication.
 | Linux | ARM64 | `aarch64-unknown-linux-gnu` | `.tar.gz` |
 | macOS | x86-64 | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS | ARM64 | `aarch64-apple-darwin` | `.tar.gz` |
+| Windows | x86-64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows | ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
 The Linux archives use dynamic glibc linkage. They do not support musl systems. Each
 archive records the highest required `GLIBC_*` symbol version for both executables as
@@ -26,11 +28,16 @@ workflow sets and checks this value for both executables and records
 `carapaced_macos_minimum=11.0` and `carapace_macos_minimum=11.0` in each macOS archive.
 This is a measured command-line binary minimum, not a notarization claim.
 
-Windows is build-only. CI compiles and tests the workspace on Windows, but the production
-daemon and both control API modes fail closed because Carapace does not yet enforce
-owner-only ACLs on state and token files. The release workflow does not publish Windows
-archives. Windows can enter the supported release matrix only after native ACL tests pass
-for normal startup, claimant recovery, token creation, state persistence, and migration.
+All six targets use native runners. Release acceptance includes workspace tests,
+private state/token creation, and starting the packaged daemon and CLI. A target
+is not verified merely because it appears in the matrix: its native checks must
+pass before publication. Windows state directories use owner-only ACLs; restore
+must reject reparse-point traversal and preserve existing files on failed writes.
+
+These targets cover current Windows, macOS and glibc-based Linux desktops and
+laptops on x86-64 and ARM64. They do not promise support for every older OS,
+32-bit computer, musl distribution, or network/removable filesystem. Check the
+archive's measured requirements and test a restore on the actual destination.
 
 Each release includes `SHA256SUMS` and `SHA256SUMS.asc`. Each target archive contains a
 CycloneDX JSON SBOM. GitHub records artifact provenance for each archive. Publication

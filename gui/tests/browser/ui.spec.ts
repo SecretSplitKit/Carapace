@@ -84,7 +84,7 @@ test('claimant workflow verifies the subject and moves focus after activation', 
 	});
 	await page.goto('/claimant.html');
 	await page.locator('#sponsor-package').fill(JSON.stringify({
-		type: 'carapace.sponsor-ceremony', version: 1, open_hex: '00', roster: [user],
+		type: 'carapace.sponsor-ceremony', version: 1, open_hex: '00', sponsor_sig: 'd'.repeat(128), roster: [user],
 		trustees: [{ node: 'b'.repeat(64), addrs: ['127.0.0.1:1'] }]
 	}));
 	await page.getByRole('button', { name: 'Import package and show subject' }).click();
@@ -106,14 +106,33 @@ test('claimant cancellation clears inputs and starts a fresh retry session', asy
 	await expect(page.locator('#progress')).toContainText('fresh retry session is ready');
 });
 
-test('claimant clipboard success and failure give truthful feedback', async ({ page, context }, testInfo) => {
+test('claimant clipboard success and failure give truthful feedback', async ({ page, context, browserName }, testInfo) => {
 	test.skip(testInfo.project.name === 'mobile-chromium', 'Clipboard permission emulation runs in desktop Chromium.');
 	await page.route('**/api/claimant/status', (route) => route.fulfill({ json: { phase: 'ready', ceremony_enc: 'enc', new_node: 'node', handoff: 'handoff' } }));
-	await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+	if (browserName === 'chromium') await context.grantPermissions(['clipboard-read', 'clipboard-write']);
 	await page.goto('/claimant.html');
 	await page.getByRole('button', { name: 'Copy handoff package' }).click();
 	await expect(page.locator('#notice')).toHaveText('Copied.');
 	await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.reject(new Error('denied')) } }));
 	await page.getByRole('button', { name: 'Copy handoff package' }).click();
 	await expect(page.getByRole('alert')).toContainText('Select and copy');
+});
+
+test('folder browsing publishes the selected path without editing an identifier', async ({ page }) => {
+	const folder = '/home/alex/My documents';
+	await page.route('**/api/directories*', (route) => route.fulfill({ json: {path:folder,parent:'/home/alex',directories:[]} }));
+	let published: unknown;
+	await page.route('**/api/vaults', async (route) => {
+		if (route.request().method() === 'POST') {
+			published = route.request().postDataJSON();
+			return route.fulfill({json:{vid:'c'.repeat(64),epoch:1}});
+		}
+		return route.fulfill({json:{published:[]}});
+	});
+	await page.goto('/#/vaults');
+	await page.getByRole('button',{name:'Choose folder…'}).click();
+	await page.getByRole('button',{name:'Use this folder'}).click();
+	await expect(page.locator('#vault-dir')).toHaveValue(folder);
+	await page.getByRole('button',{name:'Publish vault',exact:true}).click();
+	await expect.poll(() => published).toEqual({dir:folder});
 });

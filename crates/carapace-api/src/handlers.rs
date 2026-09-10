@@ -8,14 +8,14 @@ use std::time::Duration;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
 use carapace_wire::messages::Message as _;
-use carapace_wire::{AnnounceRef, FileGrant, InviteTicket};
+use carapace_wire::{FileGrant, InviteTicket};
 use carapaced::{Daemon, PendingResplitStatus, RecoveryScope, ResplitStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -268,6 +268,12 @@ pub struct PublishedVaultResponse {
     vid: String,
     epoch: u64,
     name: String,
+    dir: String,
+    watching: bool,
+    syncing: bool,
+    last_error: Option<String>,
+    last_success: Option<u64>,
+    recovery_backup: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -390,6 +396,9 @@ struct PendingResplitResponse {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StatusSnapshot {
+    user_id: String,
+    identity_storage: String,
+    sync_errors: Vec<Value>,
     node_id: String,
     addr: Vec<String>,
     relay_url: Option<String>,
@@ -418,15 +427,7 @@ fn status_snapshot(d: &Daemon) -> StatusSnapshot {
             grant_bytes: report.grant_bytes,
         })
         .collect();
-    let vaults: Vec<PublishedVaultResponse> = d
-        .vault_options()
-        .iter()
-        .map(|vault| PublishedVaultResponse {
-            vid: hexs(&vault.vid),
-            epoch: vault.epoch,
-            name: vault.name.clone(),
-        })
-        .collect();
+    let vaults = vault_rows(d);
     let peers = d
         .peer_options()
         .iter()
@@ -515,6 +516,13 @@ fn status_snapshot(d: &Daemon) -> StatusSnapshot {
     let relay_networks = d.relay_network_count();
     StatusSnapshot {
         node_id: hexs(&d.node_id()),
+        user_id: hexs(&d.user_id()),
+        identity_storage: d.identity_storage_label().to_string(),
+        sync_errors: d
+            .live_peer_errors()
+            .iter()
+            .map(|(node, error)| json!({"node":hexs(node),"error":error}))
+            .collect(),
         addr: d.dialable_addr_strings(),
         relay_url: relay_url.clone(),
         friends: FriendsResponse {
@@ -787,13 +795,7 @@ pub async fn publish_vault(
 
 /// `GET /api/vaults`.
 pub async fn list_vaults(State(st): State<AppState>) -> Json<Value> {
-    let vaults: Vec<Value> = st
-        .daemon
-        .published_vaults()
-        .iter()
-        .map(|(v, e)| json!({ "vid": hexs(v), "epoch": e }))
-        .collect();
-    Json(json!({ "published": vaults }))
+    Json(json!({ "published": vault_rows(&st.daemon) }))
 }
 
 // ---- friends -----------------------------------------------------------
@@ -971,21 +973,6 @@ pub struct SyncReq {
 }
 
 #[derive(Deserialize)]
-struct RestartHandoff {
-    r#type: String,
-    version: u8,
-    trustees: Vec<PeerReq>,
-    announce_refs: Vec<RestartRef>,
-}
-
-#[derive(Deserialize)]
-struct RestartRef {
-    vid: String,
-    epoch: u64,
-    digest: String,
-}
-
-#[derive(Deserialize)]
 pub struct RestartRestoreReq {
     out_dir: String,
 }
@@ -1003,36 +990,27 @@ pub async fn restart_restore(
             "no claimant restart handoff is available",
         )
     })?;
-    let handoff: RestartHandoff =
-        serde_json::from_slice(&bytes).map_err(|_| bad("invalid claimant restart handoff"))?;
-    if handoff.r#type != "carapace.recovery-restart-handoff" || handoff.version != 1 {
-        return Err(bad("unsupported claimant restart handoff"));
-    }
-    let mut refs = Vec::new();
-    for reference in handoff.announce_refs {
-        let vid = parse_hex32(&reference.vid)?;
-        let digest = parse_hex32(&reference.digest)?;
-        refs.push(AnnounceRef {
-            vid,
-            epoch: reference.epoch,
-            digest,
-        });
-    }
-    let mut trustees = Vec::new();
-    for trustee in handoff.trustees {
-        trustees.push((parse_hex32(&trustee.node)?, trustee.addrs));
-    }
+    let seal = std::fs::read(st.state_dir.join("recovery-restart-handoff.seal"))
+        .map_err(|_| bad("authenticated recovery handoff is missing"))?;
+    st.daemon
+        .verify_recovery_handoff(&bytes, &seal)
+        .map_err(|_| bad("claimant restart handoff was replaced or modified"))?;
+    let (trustees, refs) = crate::claimant::restart_metadata(&bytes, st.daemon.user_id())
+        .map_err(|_| bad("claimant restart handoff authentication failed"))?;
     let maximum_refs = carapaced::max_epoch_refs(&refs).len();
-    let restored = st
+    let report = st
         .daemon
-        .recover_retained_at(&trustees, &refs, std::path::Path::new(&req.out_dir))
+        .recover_retained_at_with_relays(&trustees, &refs, std::path::Path::new(&req.out_dir))
         .await?;
+    let restored = &report.restored;
     Ok(Json(json!({
         "restored": restored.iter().map(|vault| json!({
             "vid": hexs(&vault.vid),
             "epoch": vault.epoch,
             "out_dir": vault.out_dir.display().to_string(),
         })).collect::<Vec<_>>(),
+        "complete": report.errors.is_empty(),
+        "errors": report.errors.iter().map(|(vid,error)|json!({"vid":hexs(vid),"error":error})).collect::<Vec<_>>(),
         "maximum_epoch_refs": maximum_refs,
     })))
 }
@@ -1321,8 +1299,9 @@ pub async fn ceremony_open(
         unix_now(),
     )?;
     let reached = st.daemon.ceremony_fanout(&open).await.unwrap_or(0);
-    let trustee_hints = st.daemon.claimant_trustee_hints(&subject)?;
-    let announce_refs = st.daemon.claimant_announce_refs(&subject)?;
+    let package = st.daemon.claimant_package(&open)?;
+    let trustee_hints = package.trustees;
+    let announce_refs = package.announce_refs;
     let roster: Vec<String> = trustee_hints
         .iter()
         .map(|trustee| hexs(&trustee.user))
@@ -1333,12 +1312,14 @@ pub async fn ceremony_open(
             json!({
                 "node": hexs(&trustee.node),
                 "addrs": trustee.addrs,
+                "relay_url": trustee.relay_url,
             })
         })
         .collect();
     let sponsor_package = json!({
         "type": "carapace.sponsor-ceremony",
         "version": 1,
+        "sponsor_sig": hexs(&package.sponsor_sig),
         "open_hex": hexs(&open.encode_frame()),
         "roster": roster,
         "trustees": trustees,
@@ -1473,6 +1454,9 @@ mod tests {
         .unwrap();
         let expected = serde_json::to_value(StatusSnapshot {
             node_id: String::new(),
+            user_id: String::new(),
+            identity_storage: String::new(),
+            sync_errors: Vec::new(),
             addr: Vec::new(),
             relay_url: None,
             friends: FriendsResponse {
@@ -1530,4 +1514,67 @@ mod tests {
         assert_eq!(error.client_message, "invalid recovery set");
         assert!(error.internal.is_none());
     }
+}
+
+#[derive(Deserialize)]
+pub struct DirectoryQuery {
+    path: Option<String>,
+}
+
+/// Browse local folders through the same authenticated boundary as publishing.
+pub async fn directories(Query(query): Query<DirectoryQuery>) -> Result<Json<Value>, ApiError> {
+    let dir = query
+        .path
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(Into::into)
+        })
+        .ok_or_else(|| bad("Choose a folder path"))?;
+    tokio::task::spawn_blocking(move || {
+        let dir = std::fs::canonicalize(dir)?;
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                children.push(json!({"name":entry.file_name().to_string_lossy(), "path":entry.path().to_string_lossy()}));
+            }
+        }
+        children.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok::<_, anyhow::Error>(Json(json!({"path":dir.to_string_lossy(),"parent":dir.parent().map(|p|p.to_string_lossy()),"directories":children})))
+    }).await.map_err(|e| bad(e.to_string()))?.map_err(Into::into)
+}
+
+fn vault_rows(d: &Daemon) -> Vec<PublishedVaultResponse> {
+    d.live_vault_statuses()
+        .into_iter()
+        .map(|v| PublishedVaultResponse {
+            vid: hexs(&v.vid),
+            epoch: v.epoch,
+            name: v.name,
+            dir: v.dir.to_string_lossy().into_owned(),
+            watching: v.watching,
+            syncing: v.syncing,
+            last_error: v.last_error,
+            last_success: v.last_success,
+            recovery_backup: v.recovery_backup.map(|p| p.to_string_lossy().into_owned()),
+        })
+        .collect()
+}
+
+pub async fn device_card(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({"card_hex":hexs(&st.daemon.own_device_card().encode_frame())}))
+}
+#[derive(Deserialize)]
+pub struct DeviceReq {
+    card_hex: String,
+}
+pub async fn enroll_device(
+    State(st): State<AppState>,
+    Json(req): Json<DeviceReq>,
+) -> Result<Json<Value>, ApiError> {
+    let bytes = hex::decode(&req.card_hex).map_err(|_| bad("Invalid device card"))?;
+    let card =
+        carapace_wire::ContactCard::decode_frame(&bytes).map_err(|_| bad("Invalid device card"))?;
+    st.daemon.enroll_own_device(card).await?;
+    Ok(Json(json!({"enrolled":true})))
 }
