@@ -1,24 +1,14 @@
-//! Durability under NON-graceful loss (kill -9, power cut, OS reboot without the
-//! signal handler running): a published vault's blobs must be ON DISK by the time
-//! `publish_vault` returns, not "within ~1 s if the process survives".
+//! Durability under NON-graceful loss (kill -9, power cut): a published vault's blobs must
+//! be on disk by the time `publish_vault` returns. The FsStore acks each add from an open
+//! redb write batch that commits up to ~1 s later, so without the `sync()` barrier a prompt
+//! kill loses the envelope + chunks that state.redb already names.
 //!
-//! The iroh-blobs FsStore acks each add from inside an open redb write batch that
-//! commits up to ~1 s later, so without an explicit durability barrier a prompt
-//! kill loses the manifest envelope + chunks that state.redb already names — the
-//! vault is gone after the very reboot the durable store exists to survive.
+//! Kill simulation: copy the whole state dir while the daemon still runs (exactly the disk
+//! image an abrupt kill leaves), probe its FsStore, then boot a full daemon from it.
 //!
-//! Kill simulation: publish, then COPY the whole state dir while the daemon is
-//! still running. The copy is exactly the disk image an abrupt kill leaves (no
-//! Drop, no flush, no graceful actor drain — only what was already committed).
-//! The copy's FsStore is probed directly, then a full daemon boots from it.
-//!
-//! Unix-only: the technique copies redb's live `blobs.db`/`state.redb` out from
-//! under the running daemon. On Windows redb holds a mandatory byte-range lock, so
-//! copying a live database file fails with os error 33 — the simulation can't run
-//! there. The guarantee it proves (blobs committed to disk before `publish_vault`
-//! returns, via the FsStore `sync()` barrier) is redb-level and platform-independent,
-//! and the drop-then-reopen `reboot_survival` tests exercise the committed-state-
-//! survives-restart path on every platform, so nothing is left uncovered on Windows.
+//! Unix-only: copying redb's live db files needs no mandatory byte-range lock (Windows fails
+//! with os error 33). The guarantee is redb-level and platform-independent, and the
+//! `reboot_survival` tests cover the committed-state-survives-restart path everywhere.
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
@@ -46,8 +36,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 async fn publish_survives_immediate_kill() -> Result<()> {
     let state_a = tempfile::tempdir()?;
     let src = tempfile::tempdir()?;
-    // One tiny file (envelope + chunk inline in the store's redb) and one large
-    // file (file-backed blob data) so BOTH iroh-blobs storage paths are covered.
+    // One tiny file (inline in redb) + one large file (file-backed blob) to cover both
+    // iroh-blobs storage paths.
     std::fs::write(src.path().join("small.txt"), b"must survive kill -9")?;
     std::fs::create_dir_all(src.path().join("nested"))?;
     let big: Vec<u8> = (0..200_000u32)
@@ -66,12 +56,11 @@ async fn publish_survives_immediate_kill() -> Result<()> {
         .expect("published vault has a blob source");
     assert!(!chunks.is_empty(), "published vault has chunks");
 
-    // "Kill -9": snapshot the on-disk state RIGHT NOW, while the daemon is still
-    // running — nothing that only a graceful drop/flush would write makes it in.
+    // "Kill -9": snapshot the on-disk state now, while the daemon still runs.
     let state_b = tempfile::tempdir()?;
     copy_tree(state_a.path(), state_b.path())?;
-    // Only now let the original daemon go; its shutdown cannot affect the copy.
     d.shutdown().await;
+    drop(d); // A killed process releases every endpoint clone and its stable UDP port.
 
     // The kill image's FsStore must already hold every published blob.
     let probe = IrohBlobStore::load(&state_b.path().join("blobs")).await?;

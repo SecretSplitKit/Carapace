@@ -2,6 +2,7 @@
 name = "carapace-api"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lints]
@@ -19,7 +20,14 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 hex = "0.4"
 getrandom = "0.2"
 anyhow = "1"
+rpassword = "7"
+zeroize = "1"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
-tempfile = "3"
 hex = "0.4"
+ed25519-dalek = "2"
+tower = "0.5"

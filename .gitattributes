@@ -1,0 +1,3 @@
+fuzz/corpus/** binary
+crates/carapaced/tests/fixtures/*.b64 text eol=lf
+crates/carapaced/tests/fixtures/*.tsv text eol=lf

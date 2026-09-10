@@ -57,10 +57,13 @@ fixed and committed:
   was dropped, so a later open could release a share despite a valid abort. Fixed
   with a durable per-signer abort set consulted at open time.
 - **§8.4:** recovery stopped at `K_root` and never fetched the user's data. Now
-  replicas retain + serve the (HPKE-sealed) `FileGrant` to a recovering owner-device
-  (Option A), and recovery reconstructs actual file content — proven by the new
-  `recovery_reconstruct` ceremony→replica→reconstruct e2e. Option B (chunk keys in
-  the manifest) deferred as a spec-level wire-format decision.
+  implemented as Option B: the wire `FileEntry` chunk list carries `(ChunkID,
+  pt_hash, len)`, and a recovering claimant re-derives per-chunk keys from the
+  manifest's `pt_hash` + `K_content` (`chunk_keys_from_manifest`), needing no
+  `FileGrant` for owner sync or recovery — proven by
+  `crates/carapaced/tests/recovery_reconstruct.rs`. Supersedes the earlier Option-A
+  `FileGrant`-on-replica workaround; see "Note — §8.4 recovery data-fetch:
+  self-sufficient manifest (Option B)" in `spec-errata.md`.
 - **§11:** a routine edit did not push the new epoch to enrolled replicas (they
   served stale content); `publish_vault` now pushes the new manifest+chunks.
 - **§8.3:** the over-cap *extend* path dropped the mandated warning + re-split
@@ -68,5 +71,5 @@ fixed and committed:
 
 Defensible divergences, SHOULD-level items, physical advisories, and superseded
 wire messages (§4 node-key manifest authorship, §6/§10 SHOULDs, §9 fallbacks, §10.2
-drift surface-not-auto, §14 at-rest sealing + single-root, §12 Hello/ManifestOffer/
+drift surface-not-auto, §14 single-root split SHOULD, §12 Hello/ManifestOffer/
 AuditNotice) are documented in `spec-errata.md`, not code-changed.

@@ -1,24 +1,17 @@
 //! carapace-replica: consent-based replica placement and repair (protocol §10.1).
 //!
-//! Per vault the owner maintains invariant `r` (default 3) accepted storage
-//! peers, each holding the current [`carapace_wire::ManifestEnvelope`] plus every
-//! ciphertext chunk. Placement is consent-based **both directions**: the owner
-//! selects a friend and sends a [`carapace_wire::ReplicaInvite`]; the friend
-//! either signs a [`carapace_wire::ReplicaAccept`] or declines. Local private
-//! policies and deny-lists gate the decision on both sides ([`Policy`]).
+//! Per vault the owner maintains invariant `r` (default 3) accepted storage peers,
+//! each holding the current [`carapace_wire::ManifestEnvelope`] plus every ciphertext
+//! chunk. Placement needs consent both directions (invite/accept), gated by each
+//! side's local [`Policy`] (deny-lists + quota).
 //!
-//! - [`peer`]: [`ReplicaPeer`], a friend's storage node - its consent decision
-//!   ([`ReplicaPeer::consider`]) and blob intake ([`ReplicaPeer::receive`]).
-//! - [`owner`]: [`ReplicaSet`], the owner-side manager - place, track membership,
-//!   evaluate replica health against an injected clock, repair on confirmed loss
-//!   (unfriended, or unreachable past the grace window), and re-announce
-//!   ([`carapace_wire::VaultAnnounce`]).
-//! - [`policy`]: [`Policy`] (deny-lists + quota) and [`Health`] signals.
+//! - [`peer`]: [`ReplicaPeer`], a friend's storage node (consent + blob intake).
+//! - [`owner`]: [`ReplicaSet`], the owner-side manager (place, track, repair, announce).
+//! - [`policy`]: [`Policy`] and [`Health`] signals.
 //!
-//! Offline is not failure: a replica that is merely unreachable inside the grace
-//! window (default 24 h) is kept. Only confirmed loss triggers re-replication to
-//! a fresh accepting friend and a new announce reflecting the updated set. Reads
-//! succeed while at least one current replica or the owner device is reachable.
+//! Offline is not failure: a replica merely unreachable inside the grace window
+//! (default 24 h) is kept; only confirmed loss triggers re-replication and a fresh
+//! announce. Reads succeed while any current replica or the owner device is reachable.
 
 pub mod owner;
 pub mod peer;
@@ -33,9 +26,10 @@ pub use policy::{
 };
 pub use por::{
     build_audit, build_audit_n, build_wide_audit, run_audit, signed_audit_notice,
-    verify_audit_response, Audit, AuditAction, AuditFailure, AuditOutcome, AuditResponder,
-    AuditSample, AuditTracker, AUDIT_CODE_RETENTION_LOST, DEFAULT_POR_FAIL_LIMIT,
-    DEFAULT_POR_INTERVAL_SECS, DEFAULT_SAMPLES_PER_ROUND, DEFAULT_WIDE_EVERY,
+    verify_audit_response, verify_bao_range_responses, Audit, AuditAction, AuditFailure,
+    AuditOutcome, AuditResponder, AuditSample, AuditTracker, AUDIT_CODE_RETENTION_LOST,
+    DEFAULT_POR_FAIL_LIMIT, DEFAULT_POR_INTERVAL_SECS, DEFAULT_SAMPLES_PER_ROUND,
+    DEFAULT_WIDE_EVERY,
 };
 
 /// Default replica invariant `r` (§10.1).

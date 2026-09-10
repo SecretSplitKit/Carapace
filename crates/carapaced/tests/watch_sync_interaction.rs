@@ -1,19 +1,13 @@
-//! BLOCKER 1 regression: a filesystem watcher on a vault's working directory must
-//! not tombstone files that a sync merged INTO that directory.
-//!
-//! Two owner daemons share one `k_root`. Device A watches its working dir. The two
-//! reconcile a vault whose merge yields (a) a file that exists only on B (a pure
-//! union, synced INTO A's working dir) and (b) a `sync-conflict-*` copy from a
-//! concurrent edit. A watcher tick then fires (a genuine local change). The bug
-//! was: the watcher re-ingested a directory that the sync had written to a
-//! DIFFERENT location, saw the synced-in file "absent from disk", and minted a
-//! dominating tombstone that deleted it on every device (silent data loss).
-//!
-//! With the unified working-directory model the sync reconstructs into the watched
-//! tree, so the re-ingest sees the full merged set and mints NO tombstone. The test
-//! proves it by advancing past a watcher re-ingest and then confirming both the
-//! synced-in file AND the conflict copy still round-trip to a peer - i.e. neither
-//! was tombstoned. Every wait is hard-bounded, so a regression fails fast.
+#![cfg(unix)]
+
+//! Regression: a filesystem watcher on a vault's working dir must not tombstone files a sync
+//! merged INTO that dir. Two owner daemons share one `k_root`; A watches its working dir. They
+//! reconcile a vault whose merge yields a B-only file (synced into A's dir) and a
+//! `sync-conflict-*` copy. The bug: the watcher re-ingested a dir the sync had written
+//! elsewhere, saw the synced-in file "absent", and minted a tombstone that deleted it
+//! everywhere. With the unified working-dir model the re-ingest sees the full merged set and
+//! mints no tombstone; the test forces a watcher re-ingest and confirms both files survive.
+//! Hard-bounded waits.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -121,9 +115,8 @@ async fn watcher_does_not_tombstone_synced_in_files() -> Result<()> {
     daemon_a.publish_vault(src_a.path(), vid).await?;
     daemon_b.publish_vault(src_b.path(), vid).await?;
 
-    // Arm the watcher on A's working dir BEFORE reconciling, so the sync's writes
-    // into it (the synced-in b_only.txt and the conflict copy) actually fire the
-    // watcher - the exact condition that used to trigger the tombstone bug.
+    // Arm the watcher BEFORE reconciling, so the sync's writes into A's dir fire it - the
+    // condition that used to trigger the tombstone bug.
     let watcher = Arc::clone(&daemon_a).watch_vault(vid, src_a.path().to_path_buf())?;
 
     let out_a = tempfile::tempdir()?;
@@ -147,10 +140,8 @@ async fn watcher_does_not_tombstone_synced_in_files() -> Result<()> {
         "A's watched working dir must contain the synced-in file + conflict copy"
     );
 
-    // Force an observable watcher re-ingest with a genuine local change. If the bug
-    // were present, this re-ingest of A's working dir would tombstone b_only.txt and
-    // the conflict copy (seen as "absent" because the sync had written them
-    // elsewhere), and the tombstone would then propagate and delete them on B.
+    // Force an observable watcher re-ingest with a local change. With the bug, this re-ingest
+    // would tombstone b_only.txt + the conflict copy and propagate the deletion to B.
     let e0 = epoch_of(&daemon_a, vid);
     tokio::time::sleep(Duration::from_millis(100)).await; // let the watcher settle
     std::fs::write(src_a.path().join("trigger.txt"), b"local change")?;

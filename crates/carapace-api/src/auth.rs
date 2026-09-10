@@ -86,7 +86,7 @@ pub fn is_loopback_origin(origin: &str) -> bool {
 /// DNS-rebinding + CSRF guard applied to EVERY request (including the health check
 /// and the static GUI). Rejects a non-loopback `Host`, and a present-but-non-loopback
 /// `Origin`.
-pub async fn guard_host_origin(req: Request, next: Next) -> Result<Response, StatusCode> {
+pub async fn guard_host_origin(req: Request, next: Next) -> Result<Response, Response> {
     let headers = req.headers();
     let host_ok = headers
         .get(header::HOST)
@@ -94,11 +94,17 @@ pub async fn guard_host_origin(req: Request, next: Next) -> Result<Response, Sta
         .map(is_loopback_host)
         .unwrap_or(false);
     if !host_ok {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(crate::handlers::error_response(
+            StatusCode::FORBIDDEN,
+            "loopback host required",
+        ));
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !is_loopback_origin(origin) {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(crate::handlers::error_response(
+                StatusCode::FORBIDDEN,
+                "loopback origin required",
+            ));
         }
     }
     Ok(next.run(req).await)
@@ -110,11 +116,14 @@ pub async fn require_token(
     State(token): State<Arc<str>>,
     req: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, Response> {
     let presented = bearer(req.headers().get(header::AUTHORIZATION));
     match presented {
         Some(t) if ct_eq_str(t, &token) => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+        _ => Err(crate::handlers::error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid token",
+        )),
     }
 }
 

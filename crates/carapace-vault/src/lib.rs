@@ -1,16 +1,7 @@
 //! carapace-vault: vault identity, directory ingest into a sealed manifest plus
 //! a content-addressed chunk store, and reconstruction back to plaintext
-//! (protocol §5, §7, §11). Network-independent — no iroh here.
-//!
-//! - [`vid`] / [`new_vid`]: vault identity `BLAKE3-256(user_pubkey ‖ nonce)`.
-//! - [`ChunkStore`]: content-addressed ciphertext store ([`MemoryStore`],
-//!   [`FsStore`]).
-//! - [`ingest_dir`]: walk a tree, FastCDC-chunk + seal each file, populate the
-//!   store, and build a [`Manifest`] + sealed, node-signed [`ManifestEnvelope`].
-//! - [`open_envelope`] / [`reconstruct`]: verify + decrypt back to bytes/disk.
-//!
-//! Every cryptographic primitive routes through `carapace-crypto`; every wire
-//! encoding routes through `carapace-wire`. Nothing is re-implemented here.
+//! (protocol §5, §7, §11). Network-independent. Crypto routes through
+//! `carapace-crypto`, wire encoding through `carapace-wire`.
 
 pub mod merge;
 mod store;
@@ -21,7 +12,7 @@ pub use merge::{
 };
 pub use store::{ChunkStore, FsStore, MemoryStore, StoreError};
 
-use carapace_crypto::content::{self, chunk_ranges};
+use carapace_crypto::content;
 use carapace_crypto::kdf::{self, Key32};
 use carapace_wire::{FileEntry, Manifest, ManifestEnvelope, Vv};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -29,6 +20,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -52,18 +44,19 @@ pub enum VaultError {
     /// Recovered file bytes did not match the manifest's `file_hash`.
     FileHashMismatch(String),
     /// A decrypted chunk's `BLAKE3(plaintext)` did not match the manifest's stored
-    /// `pt_hash` for that chunk (Option B integrity check, §4.2).
+    /// `pt_hash` (Option B integrity check, §4.2).
     ChunkHashMismatch([u8; 32]),
     /// A manifest path was absolute or escaped the output root (`..`).
     UnsafePath(String),
-    /// A file's name was not valid UTF-8, so it cannot round-trip through the
-    /// manifest's `String` path without a lossy collapse that could alias it onto
-    /// a distinct file. Rejected rather than silently merged.
+    /// A non-UTF8 filename: a lossy collapse could alias it onto a distinct file,
+    /// so it is refused rather than silently merged.
     NonUtf8Path(String),
     /// System clock / metadata could not produce a valid mtime.
     BadMtime,
     /// The system CSPRNG failed.
     Rng,
+    /// Shared restore validation or output failed.
+    Restore(carapace_restore::Error),
 }
 
 impl std::fmt::Display for VaultError {
@@ -84,6 +77,7 @@ impl std::fmt::Display for VaultError {
             VaultError::NonUtf8Path(p) => write!(f, "non-UTF8 file path: {p}"),
             VaultError::BadMtime => write!(f, "invalid file mtime"),
             VaultError::Rng => write!(f, "system RNG failed"),
+            VaultError::Restore(e) => write!(f, "{e}"),
         }
     }
 }
@@ -110,6 +104,11 @@ impl From<StoreError> for VaultError {
         VaultError::Store(e)
     }
 }
+impl From<carapace_restore::Error> for VaultError {
+    fn from(e: carapace_restore::Error) -> Self {
+        VaultError::Restore(e)
+    }
+}
 
 // ---------------- vault identity (§7.1) ---------------------------------
 
@@ -125,10 +124,9 @@ pub fn vid(user_pubkey: &[u8; 32], creation_nonce: &[u8; 16]) -> [u8; 32] {
 /// `vid`. Returns `(vid, nonce)` so the caller can persist the nonce.
 pub fn new_vid(user_pubkey: &[u8; 32]) -> ([u8; 32], [u8; 16]) {
     let mut nonce = [0u8; 16];
-    // ponytail: OS-CSPRNG failure at vault-mint is unrecoverable and not
-    // attacker-reachable (S8); `expect` here keeps `new_vid` infallible for its
-    // callers. The RNG-failure path that a peer *can* reach (`seal_manifest`)
-    // propagates a `VaultError::Rng` instead.
+    // ponytail: CSPRNG failure at vault-mint is not attacker-reachable (S8), so
+    // `expect` keeps `new_vid` infallible; the peer-reachable path
+    // (`seal_manifest`) propagates `VaultError::Rng` instead.
     getrandom::getrandom(&mut nonce).expect("CSPRNG");
     (vid(user_pubkey, &nonce), nonce)
 }
@@ -160,11 +158,8 @@ impl VaultKeys {
 
 // ---------------- chunk key map -----------------------------------------
 
-/// A chunk's decryption secret. `chunk_key`/`nonce` derive one-way from
-/// `K_content` + plaintext hash (`pt_hash`). Since the manifest now stores
-/// `pt_hash` per chunk (Option B, §4), a `K_content` holder re-derives these with
-/// [`chunk_keys_from_manifest`]; the owner no longer needs to persist or grant them
-/// for its own recovery.
+/// A chunk's decryption secret, derived one-way from `K_content` + `pt_hash`. A
+/// `K_content` holder re-derives it via [`chunk_keys_from_manifest`] (Option B, §4).
 #[derive(Clone)]
 pub struct ChunkSecret {
     /// XChaCha20-Poly1305 key.
@@ -176,10 +171,9 @@ pub struct ChunkSecret {
 /// Map from ChunkID to the secret needed to open that blob.
 pub type ChunkKeys = HashMap<[u8; 32], ChunkSecret>;
 
-/// Option B (§4.2): re-derive the per-chunk `ChunkKeys` for a manifest from
-/// `K_content` alone, using each chunk's stored `pt_hash`. This is what lets an
-/// owner (or a `K_root`-holding recovery claimant) reconstruct from the sealed
-/// manifest with no `FileGrant`. Deleted files carry no chunks and are skipped.
+/// Option B (§4.2): re-derive the per-chunk `ChunkKeys` from `K_content` alone,
+/// using each chunk's stored `pt_hash`. Lets an owner or recovery claimant
+/// reconstruct from the sealed manifest with no `FileGrant`.
 pub fn chunk_keys_from_manifest(manifest: &Manifest, k_content: &[u8]) -> ChunkKeys {
     let mut keys = HashMap::new();
     for f in &manifest.files {
@@ -207,20 +201,14 @@ pub struct Ingest {
 
 // ---------------- ingest (§5, §7) ---------------------------------------
 
-/// Walk `dir`, seal every file's chunks into `store`, and build the manifest +
-/// sealed envelope for epoch `epoch`, node-signed by `node_key`.
+/// Walk `dir` (sorted path order, deterministic manifest), FastCDC-cut and seal
+/// each file's chunks (`aad = vid`) into `store`, and build the manifest + sealed
+/// envelope for `epoch`, node-signed by `node_key`.
 ///
-/// Files are visited in sorted path order for a deterministic manifest. Each
-/// file's chunks are FastCDC-cut, sealed with `aad = vid`, and stored under
-/// their ChunkID.
-///
-/// Per-file version vectors follow §11. Pass the device's previously-published
-/// [`Manifest`] as `prev` (or `None` for a first ingest): a file that *changed*
-/// (or is new, or resurrects a tombstone) bumps this node's component so a
-/// concurrent edit on another device is later detectable; an *unchanged* file
-/// carries its prior vector forward untouched; a file that *disappeared* from
-/// disk becomes a tombstone with this node's component bumped, so the delete
-/// propagates.
+/// Per-file version vectors follow §11 against `prev` (the device's previously-
+/// published manifest, or `None` for a first ingest): a changed/new/resurrected
+/// file bumps this node's component, an unchanged file carries its vector forward,
+/// and a disappeared file becomes a bumped tombstone so the delete propagates.
 pub fn ingest_dir<S: ChunkStore>(
     dir: &Path,
     node_key: &SigningKey,
@@ -229,6 +217,7 @@ pub fn ingest_dir<S: ChunkStore>(
     prev: Option<&Manifest>,
     store: &mut S,
 ) -> Result<Ingest, VaultError> {
+    carapace_restore::refuse_pending_journal(dir)?;
     let node_pub = node_key.verifying_key().to_bytes();
 
     // Prior per-path entries, for VV carry-forward / bump and tombstoning.
@@ -240,24 +229,40 @@ pub fn ingest_dir<S: ChunkStore>(
     collect_files(dir, dir, &mut rel_paths)?;
     rel_paths.sort();
 
+    // Reject vaults that the restore side cannot faithfully materialize before
+    // encrypting or storing any content.
+    let mut restore_layout = Vec::with_capacity(rel_paths.len());
+    for rel in &rel_paths {
+        let path = rel_to_slash(rel)
+            .ok_or_else(|| VaultError::NonUtf8Path(rel.to_string_lossy().into_owned()))?;
+        restore_layout.push((path, fs::metadata(dir.join(rel))?.len()));
+    }
+    carapace_restore::validate_operation(
+        restore_layout
+            .iter()
+            .map(|(path, size)| (path.as_str(), *size)),
+    )?;
+
     let mut files = Vec::with_capacity(rel_paths.len());
     let mut key_map: ChunkKeys = HashMap::new();
     let mut on_disk: HashSet<String> = HashSet::with_capacity(rel_paths.len());
 
     for rel in &rel_paths {
         let full = dir.join(rel);
-        let meta = fs::metadata(&full)?;
-        let data = fs::read(&full)?;
-        let file_hash = *blake3::hash(&data).as_bytes();
+        let file = fs::File::open(&full)?;
+        let meta = file.metadata()?;
+        let mut file_hasher = blake3::Hasher::new();
+        let mut size = 0u64;
 
         let mut chunk_refs: Vec<([u8; 32], [u8; 32], u64)> = Vec::new();
-        for (off, len) in chunk_ranges(&data) {
-            let plaintext = &data[off..off + len];
-            let sealed = content::seal_chunk(&*keys.k_content, &keys.vid, plaintext)?;
+        for chunk in content::chunks_from_reader(&file) {
+            let plaintext = chunk?;
+            let len = plaintext.len();
+            size += len as u64;
+            file_hasher.update(&plaintext);
+            let sealed = content::seal_chunk(&*keys.k_content, &keys.vid, &plaintext)?;
             store.put(sealed.chunk_id, sealed.ciphertext)?;
-            // Record pt_hash in the manifest (Option B, §4): a K_content holder
-            // re-derives this chunk's key/nonce from it, so owner sync and recovery
-            // never need a FileGrant.
+            // pt_hash in the manifest lets a K_content holder re-derive key/nonce (Option B, §4).
             chunk_refs.push((sealed.chunk_id, sealed.pt_hash, len as u64));
             key_map.entry(sealed.chunk_id).or_insert(ChunkSecret {
                 chunk_key: sealed.chunk_key,
@@ -265,6 +270,17 @@ pub fn ingest_dir<S: ChunkStore>(
             });
         }
 
+        let after = file.metadata()?;
+        if size != meta.len()
+            || after.len() != meta.len()
+            || after.modified()? != meta.modified()?
+        {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "file changed during ingest: {}",
+                full.display()
+            ))));
+        }
+        let file_hash = *file_hasher.finalize().as_bytes();
         let path = rel_to_slash(rel)
             .ok_or_else(|| VaultError::NonUtf8Path(rel.to_string_lossy().into_owned()))?;
         let version = match prev_by_path.get(path.as_str()) {
@@ -281,7 +297,7 @@ pub fn ingest_dir<S: ChunkStore>(
             path,
             mode: file_mode(&meta),
             mtime: file_mtime(&meta)?,
-            size: data.len() as u64,
+            size,
             chunks: chunk_refs,
             file_hash,
             version,
@@ -415,17 +431,22 @@ pub fn reconstruct_file<S: ChunkStore>(
     store: &S,
     keys: &ChunkKeys,
 ) -> Result<Vec<u8>, VaultError> {
-    let mut out = Vec::with_capacity(entry.size as usize);
-    for (id, pt_hash, _len) in &entry.chunks {
+    let lengths: Vec<u64> = entry.chunks.iter().map(|chunk| chunk.2).collect();
+    let capacity = carapace_restore::checked_file_layout(&entry.path, entry.size, &lengths)?;
+    let mut out = Vec::with_capacity(capacity);
+    for (id, pt_hash, len) in &entry.chunks {
         let ct = store.get(id)?.ok_or(VaultError::MissingChunk(*id))?;
         let secret = keys.get(id).ok_or(VaultError::MissingKey(*id))?;
         let pt = content::open_chunk(&secret.chunk_key, &secret.nonce, &ct, vid)?;
-        // Option B free integrity check (§4.2): the manifest's pt_hash must equal
-        // BLAKE3(plaintext). A key/nonce re-derived from a tampered manifest pt_hash
-        // already fails the AEAD open above; this also catches a store that returns
-        // the wrong (but validly-keyed) chunk for this id.
+        // Option B integrity check (§4.2): also catches a store returning the wrong
+        // (but validly-keyed) chunk for this id.
         if blake3::hash(&pt).as_bytes() != pt_hash {
             return Err(VaultError::ChunkHashMismatch(*id));
+        }
+        if u64::try_from(pt.len()).ok() != Some(*len) {
+            return Err(VaultError::Restore(carapace_restore::Error::InvalidLayout(
+                entry.path.clone(),
+            )));
         }
         out.extend_from_slice(&pt);
     }
@@ -443,58 +464,229 @@ pub fn reconstruct<S: ChunkStore>(
     keys: &ChunkKeys,
     out_dir: &Path,
 ) -> Result<(), VaultError> {
-    for entry in &manifest.files {
-        if entry.deleted {
-            continue;
-        }
-        let bytes = reconstruct_file(entry, &manifest.vid, store, keys)?;
-        let dest = safe_join(out_dir, &entry.path)?;
-        if let Some(parent) = dest.parent() {
+    carapace_restore::validate_operation(
+        manifest
+            .files
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.size)),
+    )?;
+    let live: Vec<_> = manifest
+        .files
+        .iter()
+        .filter(|entry| !entry.deleted)
+        .collect();
+    let paths = carapace_restore::validate_operation(
+        live.iter().map(|entry| (entry.path.as_str(), entry.size)),
+    )?;
+    carapace_restore::reject_existing_hard_link_aliases(out_dir, &paths)?;
+    let mut journal = carapace_restore::RestoreJournal::begin(out_dir, &paths)?;
+    for (index, (entry, relative)) in live.into_iter().zip(paths).enumerate() {
+        let lengths: Vec<u64> = entry.chunks.iter().map(|chunk| chunk.2).collect();
+        carapace_restore::checked_file_layout(&entry.path, entry.size, &lengths)?;
+        let chunks = entry.chunks.iter().map(|(id, pt_hash, len)| {
+            let ct = store.get(id)?.ok_or(VaultError::MissingChunk(*id))?;
+            let secret = keys.get(id).ok_or(VaultError::MissingKey(*id))?;
+            let plaintext =
+                content::open_chunk(&secret.chunk_key, &secret.nonce, &ct, &manifest.vid)?;
+            if blake3::hash(&plaintext).as_bytes() != pt_hash {
+                return Err(VaultError::ChunkHashMismatch(*id));
+            }
+            if plaintext.len() as u64 != *len {
+                return Err(VaultError::Restore(carapace_restore::Error::InvalidLayout(
+                    entry.path.clone(),
+                )));
+            }
+            Ok(plaintext)
+        });
+        carapace_restore::write_atomic_chunks(
+            out_dir,
+            &relative,
+            chunks,
+            entry.size,
+            &entry.file_hash,
+            entry.mode,
+            entry.mtime,
+        )
+        .map_err(|error| match error {
+            carapace_restore::StreamError::Source(error) => error,
+            carapace_restore::StreamError::Restore(error) => VaultError::Restore(error),
+        })?;
+        journal.mark_complete(index)?;
+    }
+    journal.finish()?;
+    Ok(())
+}
+
+/// Apply one validated manifest tombstone through the hardened restore layer.
+pub fn remove_restored_file(root: &Path, relative: &str) -> Result<(), VaultError> {
+    let mut paths = carapace_restore::validate_operation([(relative, 0)])?;
+    carapace_restore::remove_file(root, &paths.remove(0))?;
+    Ok(())
+}
+
+pub fn has_pending_restore(root: &Path) -> Result<bool, VaultError> {
+    Ok(carapace_restore::has_pending_journal(root)?)
+}
+
+/// Preserve an interrupted restore tree before retrying it. The destination
+/// must be a freshly-created private directory supplied by the daemon.
+pub fn backup_interrupted_tree(source: &Path, destination: &Path) -> Result<(), VaultError> {
+    let source_meta = fs::symlink_metadata(source)?;
+    if unsupported_link(&source_meta) || !source_meta.is_dir() {
+        return Err(VaultError::Io(std::io::Error::other(
+            "interrupted restore source is not a directory",
+        )));
+    }
+    let destination_meta = fs::symlink_metadata(destination)?;
+    if unsupported_link(&destination_meta) || !destination_meta.is_dir() {
+        return Err(VaultError::Io(std::io::Error::other(
+            "restore backup destination is not a directory",
+        )));
+    }
+
+    let mut files = Vec::new();
+    collect_backup_files(source, source, &mut files)?;
+    let mut layout = Vec::with_capacity(files.len());
+    for relative in &files {
+        let path = rel_to_slash(relative)
+            .ok_or_else(|| VaultError::NonUtf8Path(relative.to_string_lossy().into_owned()))?;
+        layout.push((path, fs::symlink_metadata(source.join(relative))?.len()));
+    }
+    carapace_restore::validate_operation(layout.iter().map(|(path, size)| (path.as_str(), *size)))?;
+
+    let mut backup_directories = HashSet::new();
+    for (relative, (_, expected_size)) in files.into_iter().zip(layout.iter()) {
+        let target = destination.join(&relative);
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
+            let mut directory = parent;
+            while let Ok(relative_parent) = directory.strip_prefix(destination) {
+                backup_directories.insert(relative_parent.to_path_buf());
+                if relative_parent.as_os_str().is_empty() {
+                    break;
+                }
+                directory = directory.parent().expect("backup parent has an ancestor");
+            }
         }
-        write_file_with_meta(&dest, &bytes, entry)?;
+        let mut input = open_backup_source(&source.join(&relative))?;
+        let before = input.metadata()?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        let copied = std::io::copy(&mut input.by_ref().take(*expected_size + 1), &mut output)?;
+        let after = input.metadata()?;
+        if copied != *expected_size
+            || before.len() != *expected_size
+            || after.len() != before.len()
+            || after.modified()? != before.modified()?
+        {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "file changed during interrupted restore backup: {}",
+                relative.display()
+            ))));
+        }
+        output.sync_all()?;
+    }
+    let mut backup_directories: Vec<_> = backup_directories.into_iter().collect();
+    backup_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for relative in backup_directories {
+        sync_backup_directory(&destination.join(relative))?;
     }
     Ok(())
 }
 
-/// Write `bytes` to `dest`, then restore the entry's `mtime` (and, on unix, its
-/// `mode`) so that a subsequent [`ingest_dir`] of this tree round-trips to the
-/// identical [`FileEntry`].
-///
-/// This is what makes reconstructing INTO a watched working directory stable
-/// (§11): the daemon's re-ingest of the just-written tree reads back the same
-/// mtime/mode and content, so it produces the same per-file version vectors and is
-/// a no-op instead of a spurious change - which otherwise ping-pongs metadata
-/// between devices (mtime/mode feed conflict resolution) and never converges. The
-/// existing file is removed first so a restored read-only mode from a prior round
-/// does not block the overwrite.
-///
-/// ponytail: writes in place (remove + create + write), NOT a temp-file + atomic
-/// rename, so a reader (or the working-dir watcher) that peeks mid-write can see a
-/// truncated/partial file; the daemon's per-vid publish lock + debounce cover its
-/// OWN re-ingest, but a concurrent external reader has no such guard. Upgrade path:
-/// write to `dest.tmp` then `fs::rename` for atomic replace (and fsync the dir) if
-/// external mid-write reads ever matter.
-fn write_file_with_meta(dest: &Path, bytes: &[u8], entry: &FileEntry) -> Result<(), VaultError> {
-    use std::io::Write;
-    let _ = fs::remove_file(dest);
-    let mut f = fs::File::create(dest)?;
-    f.write_all(bytes)?;
-    f.flush()?;
-    let mtime = std::time::UNIX_EPOCH
-        .checked_add(std::time::Duration::from_secs(entry.mtime))
-        .ok_or(VaultError::BadMtime)?;
-    // Restore mtime after the write (which would otherwise stamp "now").
-    f.set_modified(mtime)?;
-    drop(f);
+fn collect_backup_files(
+    root: &Path,
+    directory: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), VaultError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if directory == root
+            && matches!(
+                entry.file_name().to_str(),
+                Some(".carapace-restore-journal" | ".carapace-restore-lock")
+            )
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        let ty = metadata.file_type();
+        if unsupported_link(&metadata) {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "unsupported link in interrupted restore: {}",
+                path.display()
+            ))));
+        }
+        if ty.is_dir() {
+            collect_backup_files(root, &path, out)?;
+        } else if ty.is_file() {
+            out.push(
+                path.strip_prefix(root)
+                    .expect("path is under root")
+                    .to_path_buf(),
+            );
+        } else {
+            return Err(VaultError::Io(std::io::Error::other(format!(
+                "unsupported filesystem object in interrupted restore: {}",
+                path.display()
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn open_backup_source(path: &Path) -> Result<fs::File, VaultError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            dest,
-            fs::Permissions::from_mode((entry.mode & 0o7777) as u32),
-        )?;
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const O_NOFOLLOW: i32 = 0x20000;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const O_NOFOLLOW: i32 = 0x100;
+        options.custom_flags(O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if unsupported_link(&metadata) || !metadata.is_file() {
+        return Err(VaultError::Io(std::io::Error::other(format!(
+            "unsupported filesystem object in interrupted restore: {}",
+            path.display()
+        ))));
+    }
+    Ok(file)
+}
+
+fn unsupported_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(unix)]
+fn sync_backup_directory(path: &Path) -> Result<(), VaultError> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_backup_directory(_path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
@@ -519,10 +711,9 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
     Ok(())
 }
 
-/// Join a relative path's normal components with `/`, returning `None` if any
-/// component is not valid UTF-8. A lossy collapse (`to_string_lossy` -> U+FFFD)
-/// could map two distinct filenames onto one manifest path and silently merge
-/// their content, so a non-UTF8 name is refused at the source instead.
+/// Join a relative path's normal components with `/`, returning `None` on a
+/// non-UTF8 component. A lossy collapse could alias two distinct filenames onto
+/// one manifest path and merge their content, so it is refused at the source.
 fn rel_to_slash(rel: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for c in rel.components() {
@@ -549,31 +740,4 @@ fn file_mtime(meta: &fs::Metadata) -> Result<u64, VaultError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| VaultError::BadMtime)
-}
-
-/// Join a manifest-supplied relative path onto `base`, rejecting absolute paths
-/// and any `..` escape (a manifest may be hostile).
-///
-/// S9 (deferred to the foreign-manifest phase): two residual gaps remain for a
-/// *cross-user* hostile manifest — a Windows alternate-data-stream component
-/// (`foo:bar`) is not filtered (a blanket `:` reject would break legitimate unix
-/// filenames), and `reconstruct`'s `fs::write` follows a pre-existing symlink at
-/// the destination. Phase 1 manifests are same-user-trusted, so this is safe as
-/// is; tighten both before honoring a friend's manifest.
-fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, VaultError> {
-    let mut out = base.to_path_buf();
-    for part in rel.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        if part == ".." || part.contains('\\') {
-            return Err(VaultError::UnsafePath(rel.to_string()));
-        }
-        out.push(part);
-    }
-    // Reject a rel that resolved to nothing (e.g. "" or "/").
-    if out == base {
-        return Err(VaultError::UnsafePath(rel.to_string()));
-    }
-    Ok(out)
 }

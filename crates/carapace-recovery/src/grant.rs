@@ -1,7 +1,6 @@
 //! `ShareGrant` (wire type 12) and the attestation cycle (protocol §8, §10.2). A grant wraps the
-//! `chela.share` JSON carrier verbatim together with the co-trustee roster, recovery delay, and
-//! latest announce refs a quorum needs to act. Attestation proves a stored share is still live
-//! using label fields only - never the words.
+//! `chela.share` JSON carrier verbatim with the co-trustee roster, recovery delay, and announce
+//! refs a quorum needs to act. Attestation proves a stored share is live using label fields only.
 
 use carapace_wire::{
     AnnounceRef, CoTrustee, ShareAttestChallenge, ShareAttestation, ShareGrant, Signed,
@@ -13,12 +12,9 @@ use ed25519_dalek::SigningKey;
 use crate::RecoveryError;
 
 /// Build and sign a [`ShareGrant`] for `subject`. The share is serialized to its canonical
-/// `chela.share` JSON carrier (SPEC §6.2) and stored verbatim; the roster, recovery delay, and
-/// announce refs are what a quorum needs to run the ceremony when the owner is gone (§8).
-///
-/// `recovery_delay` is the owner's own abort window (§8.5, default 72 h). A very small value
-/// collapses that window to "M approvals"; owners SHOULD keep a floor (see spec-errata E5). It is
-/// accepted verbatim here because the spec makes it the owner's choice.
+/// `chela.share` JSON carrier (SPEC §6.2) and stored verbatim, with the roster, recovery delay,
+/// and announce refs a quorum needs to run the ceremony (§8). `recovery_delay` is the owner's
+/// abort window (§8.5, default 72 h), accepted verbatim as the spec makes it the owner's choice.
 pub fn build_share_grant(
     signer: &SigningKey,
     subject: [u8; 32],
@@ -93,13 +89,12 @@ pub fn build_attest_challenge(
 }
 
 /// Answer a challenge with a signed [`ShareAttestation`] (protocol §10.2). The share is first
-/// self-validated (a corrupt share is [`RecoveryError::Engine`]); the attestation echoes only the
-/// label fields (`card_number` = the share's `x`) and the challenge nonce - never the words.
+/// self-validated; the attestation echoes only the label fields (`card_number` = the share's `x`)
+/// and the challenge nonce - never the words.
 ///
-/// S6: the answered share MUST belong to the recovery set the challenge names
-/// (`share.recovery_set_id == challenge.rsid`). Without this pin a trustee could
-/// answer a new-set liveness challenge with a valid share from *any* set it holds,
-/// so the attested-live count would not bind the actual new-set share (§10.2).
+/// S6: the answered share MUST belong to the set the challenge names
+/// (`share.recovery_set_id == challenge.rsid`), else a trustee could answer with a valid share
+/// from any set it holds and the attested-live count would not bind the actual set's share.
 pub fn answer_attest_challenge(
     signer: &SigningKey,
     challenge: &ShareAttestChallenge,

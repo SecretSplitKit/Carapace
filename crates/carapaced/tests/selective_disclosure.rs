@@ -1,18 +1,13 @@
-//! §7.4 acceptance: selective disclosure + fetch authorization (adversarial D3).
-//!
-//! Topology: owner `A` publishes a vault of three files F1, F2, F3. Friends `B`
-//! (the audience) and `C` (a friend NOT in the audience) both befriend `A`.
-//!
-//! 1. A discloses exactly F1, F2 to B; B opens the grant, fetches, and
-//!    reconstructs byte-identical F1, F2 — and only those. F3's keys never appear
-//!    in B's grant, so B cannot derive them.
-//! 2. D3: C authenticates as a friend and holds a LEAKED copy of B's grant, yet is
-//!    refused the granted chunk — the blob gate enforces audience membership, so a
-//!    leaked grant document alone authorizes nothing. B (the real audience) fetches
-//!    the same chunk successfully.
-//! 3. Snapshot: A edits F1 and republishes (epoch 2); a fresh disclosure of F1
-//!    carries new chunk keys disjoint from the epoch-1 grant, proving a grant never
-//!    extends to future content.
+#![cfg(unix)]
+
+//! §7.4 acceptance: selective disclosure + fetch authorization (adversarial D3). Owner `A`
+//! publishes F1/F2/F3; `B` is the audience, `C` a friend NOT in it.
+//! 1. A discloses F1, F2 to B; B reconstructs exactly those byte-identical (F3's keys are
+//!    absent from the grant).
+//! 2. D3: C, authenticated as a friend and holding a LEAKED grant, is still refused the chunk
+//!    (the gate enforces audience membership); B fetches it fine.
+//! 3. Snapshot: A edits F1, republishes (epoch 2); a fresh grant's keys are disjoint from the
+//!    epoch-1 grant, so a grant never extends to future content.
 
 use std::collections::HashSet;
 
@@ -93,9 +88,8 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     // cannot derive them.
     let b_ids: HashSet<[u8; 32]> = b.granted_chunk_ids(&grant)?.into_iter().collect();
     assert!(!b_ids.is_empty(), "B's grant discloses F1, F2 chunk ids");
-    // F1 and F2 are distinct single-chunk files, so the grant discloses two ids: one
-    // drives the fetch-gate probes below, the other the W8 re-serve regression (it must
-    // stay untouched by `try_fetch_chunk`, which would otherwise populate B's store).
+    // F1, F2 are distinct single-chunk files, so the grant discloses two ids: one drives the
+    // fetch-gate probes, the other the W8 re-serve regression (kept untouched by try_fetch_chunk).
     let mut b_id_list: Vec<[u8; 32]> = b_ids.iter().copied().collect();
     b_id_list.sort_unstable();
     assert_eq!(
@@ -112,8 +106,7 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     );
     // C authenticates as a friend of A (populates A's blob-read allow-set for C).
     let _ = c.pull_doc_counts(a.addr()?).await?;
-    // Even authenticated AND knowing a granted ChunkID (leaked out of band here via
-    // the test), C is refused the chunk: the gate enforces audience membership.
+    // Even authenticated AND knowing a granted ChunkID, C is refused: the gate enforces audience.
     let a_granted = b_id_list[0];
     assert!(
         c.try_fetch_chunk(a.addr()?, a_granted).await.is_err(),
@@ -126,12 +119,9 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     );
 
     // ---- W8 regression: B must NOT re-serve the disclosed ciphertext ----
-    // B fetched F1/F2's ciphertext during fetch_disclosed above. That ciphertext must
-    // land in a throwaway store, never B's router-served blob store: otherwise any
-    // dialer knowing the ChunkID could pull the ciphertext straight off B, voiding the
-    // disclosure gate and revocation. Probe a granted chunk B fetched ONLY via
-    // fetch_disclosed (b_id_list[1] - not the one the try_fetch_chunk probe above pulled
-    // into B's store). C dials B raw and must be refused.
+    // B's fetch_disclosed ciphertext must land in a throwaway store, not B's served store, else
+    // any dialer knowing the ChunkID could pull it off B. Probe a chunk B fetched ONLY via
+    // fetch_disclosed (b_id_list[1], not the one try_fetch_chunk pulled into B's store).
     let disclosed_only = b_id_list[1];
     assert!(
         c.try_fetch_chunk(b.addr()?, disclosed_only).await.is_err(),
@@ -153,10 +143,8 @@ async fn selective_disclosure_and_fetch_authorization() -> Result<()> {
     assert_eq!(grant2.epoch, 2);
     let ids2: HashSet<[u8; 32]> = b.granted_chunk_ids(&grant2)?.into_iter().collect();
 
-    // The epoch-2 F1 chunk ids (`ids2`) share nothing with the epoch-1 grant's ids
-    // (`b_ids`, which are epoch-1 F1 + F2): the edit gave F1 new plaintext, hence new
-    // convergent keys and new ChunkIDs, and F2's stable ids are for a different file.
-    // A grant thus never extends to future content (snapshot by construction).
+    // The epoch-2 F1 ids share nothing with the epoch-1 grant's ids: the edit gave F1 new
+    // plaintext, hence new convergent keys. A grant never extends to future content.
     assert!(
         ids2.is_disjoint(&b_ids),
         "epoch-2 F1 chunks are disjoint from the epoch-1 grant (snapshot)"

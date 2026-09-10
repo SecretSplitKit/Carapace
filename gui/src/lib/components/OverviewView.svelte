@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { status } from '$lib/statusStore';
-	import { notes } from '$lib/notes';
+	import { status, live } from '$lib/statusStore';
+	import { recoveryPlate } from '$lib/protection';
 	import { api } from '$lib/api';
 	import ShellHero from './ShellHero.svelte';
+	import AccountDevices from './AccountDevices.svelte';
 	import CopyHex from './CopyHex.svelte';
 	import type { Plate } from '$lib/types';
 
@@ -40,27 +41,14 @@
 			achieved: vaultCount === 0 ? 0 : Math.min(replicaAchieved, REPLICA_TARGET),
 			target: REPLICA_TARGET,
 			valueLabel: vaultCount === 0 ? '—' : `${replicaAchieved}/${REPLICA_TARGET}`,
-			state: vaultCount === 0 ? 'empty' : replicaAchieved >= REPLICA_TARGET ? 'healthy' : 'at-risk',
+			state: !$live ? 'at-risk' : 'empty',
 			note:
 				vaultCount === 0
 					? 'No vaults published yet'
-					: `Weakest vault held by ${replicaAchieved} friend${replicaAchieved === 1 ? '' : 's'}`
+					: `Weakest vault has ${replicaAchieved} enrolled replica${replicaAchieved === 1 ? '' : 's'}. Current file availability is not yet verified.`
 		};
 
-		const setsOwned = s.share_health.recovery_sets_owned;
-		const rootSet = Object.values($notes.recoverySets).find((n) => n.scope.kind === 'root');
-		const sharesPlate: Plate = {
-			key: 'shares',
-			label: 'Recovery shares',
-			achieved: setsOwned > 0 ? 1 : 0,
-			target: 1,
-			valueLabel: rootSet ? `${rootSet.m}-of-${rootSet.n}` : setsOwned > 0 ? 'split' : '—',
-			state: setsOwned > 0 ? 'healthy' : 'empty',
-			note:
-				setsOwned > 0
-					? `${s.share_health.shares_held} share${s.share_health.shares_held === 1 ? '' : 's'} held here in trust for others`
-					: 'Your key has no trustees yet - nobody could rebuild it'
-		};
+		const sharesPlate = recoveryPlate(s.share_health.sets, s.share_health.recovery, $live);
 
 		const addrs = s.addr.length;
 		const relayNetworks = s.relay_networks;
@@ -71,7 +59,7 @@
 			achieved: Math.min(relayNetworks, RELAY_TARGET),
 			target: RELAY_TARGET,
 			valueLabel: `${relayNetworks}`,
-			state: addrs === 0 ? 'empty' : atRisk ? 'at-risk' : 'healthy',
+			state: !$live ? 'at-risk' : addrs === 0 ? 'empty' : atRisk ? 'at-risk' : 'healthy',
 			note: atRisk
 				? `Only ${relayNetworks} relay network${relayNetworks === 1 ? '' : 's'} - add a friend's relay so you can still be reached if one drops`
 				: `${s.reachability} · ${relayNetworks} relay networks, ${addrs} dialable address${addrs === 1 ? '' : 'es'}`
@@ -82,7 +70,7 @@
 </script>
 
 <section>
-	<h1>Shell integrity</h1>
+	<h1>Your protection</h1>
 	{#if $status}
 		<ShellHero {plates} />
 
@@ -92,7 +80,7 @@
 				<CopyHex value={$status.node_id} head={12} tail={8} />
 			</div>
 			<div>
-				<div class="label muted">Friends storing your vaults</div>
+				<div class="label muted">Connected friends</div>
 				<div class="mono">{$status.friends.count}</div>
 			</div>
 			<div>
@@ -106,6 +94,7 @@
 			<a class="button-link" href="#/friends">Add a friend</a>
 			<a class="button-link" href="#/recovery">Split your key</a>
 		</div>
+		<AccountDevices />
 	{:else}
 		<p class="muted">Waiting for the daemon…</p>
 	{/if}

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { startStatusFeed, stopStatusFeed, live } from '$lib/statusStore';
+	import { startStatusFeed, stopStatusFeed, live, sessionExpired, status } from '$lib/statusStore';
 	import ErrorBanner from '$lib/components/ErrorBanner.svelte';
 	import OverviewView from '$lib/components/OverviewView.svelte';
 	import VaultsView from '$lib/components/VaultsView.svelte';
@@ -78,6 +78,7 @@
 		<div class="status-and-theme">
 			<span class="live-dot" class:live={$live} title={$live ? 'Live updates connected' : 'Reconnecting…'}
 			></span>
+			<span class="connection-text">{$live ? 'Live' : 'Reconnecting…'}</span>
 			<button type="button" onclick={toggleTheme} aria-label="Toggle color theme">
 				{theme === 'light' ? 'Molt (light)' : 'Dark'}
 			</button>
@@ -85,6 +86,8 @@
 	</header>
 
 	<main>
+		{#if !$live}<p role="status">{$sessionExpired ? 'This session expired. Reload to reconnect.' : 'Disconnected. Displaying the last known state while reconnecting.'}</p>{/if}
+		{#each $status?.sync_errors ?? [] as issue (issue.node)}<p role="alert">Sync: {issue.error}</p>{/each}
 		<ErrorBanner />
 		{#if route === 'vaults'}
 			<VaultsView />
@@ -172,7 +175,35 @@
 		display: inline-block;
 	}
 
-	.live-dot.live {
+		.live-dot.live {
 		background: var(--verdigris);
-	}
-</style>
+		}
+
+		.connection-text {
+			font-size: var(--step--1);
+			color: var(--muted);
+		}
+
+		@media (max-width: 640px) {
+			.app {
+				padding: 1rem;
+			}
+
+			header {
+				gap: 0.75rem;
+			}
+
+			nav {
+				order: 3;
+				flex-basis: 100%;
+			}
+
+			nav a {
+				padding: 0.55em 0.65em;
+			}
+
+			.status-and-theme {
+				margin-left: auto;
+			}
+		}
+	</style>

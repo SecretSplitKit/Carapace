@@ -18,10 +18,211 @@
 //! third party with no `K_content` gets explicit per-chunk keys, never
 //! `K_manifest`.
 
+mod live_sync;
+pub use live_sync::{LiveSyncConfig, LiveSyncHandle, LiveVaultStatus};
+
+mod account_transfer;
+mod claimant_package;
+mod ops;
 mod persist;
 mod state;
+pub use account_transfer::AccountImportReport;
+pub use claimant_package::{verify_claimant_package, ClaimantAddress, ClaimantPackage};
 
 pub use state::State;
+
+/// A read-only validation summary for an existing daemon state directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateInspection {
+    /// Number of owned vault records that name durable encrypted blobs.
+    pub owned_vaults: usize,
+    /// Number of replica vaults held for friends.
+    pub held_replicas: usize,
+    /// Number of recovery shares held for other users.
+    pub held_shares: usize,
+    /// Number of owned recovery sets.
+    pub recovery_sets: usize,
+    /// Number of active or retained recovery ceremonies.
+    pub ceremonies: usize,
+}
+
+/// Result of one durable encrypted-blob garbage-collection run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GarbageCollectionReport {
+    /// Blob ids protected as current vault, replica, or permanent disclosure data.
+    pub retained_blobs: usize,
+    /// Superseded owned-chunk authorization rows removed before the blob sweep.
+    pub removed_authorizations: usize,
+}
+
+/// Validate an existing state database without starting networking or changing state.
+///
+/// This opens every durable category, authenticates each sealed row with `K_root`, and
+/// checks that the sealed database identity matches the supplied root and node keys.
+pub fn inspect_existing_state(state: &State) -> Result<StateInspection> {
+    let state_dir = state
+        .dir
+        .as_ref()
+        .context("state inspection requires a durable state directory")?;
+    inspect_state_database(state, &state_dir.join("state.redb"))
+}
+
+/// Validate one candidate state database against the supplied identity without mutation.
+pub fn inspect_state_database(state: &State, db_path: &Path) -> Result<StateInspection> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static INSPECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+    ensure!(
+        db_path.is_file(),
+        "state database {db_path:?} does not exist"
+    );
+    let parent = db_path.parent().context("state database has no parent")?;
+    let copy_path = parent.join(format!(
+        ".carapace-inspect-{}-{}",
+        std::process::id(),
+        INSPECTION_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    copy_private_database(db_path, &copy_path)
+        .with_context(|| format!("create read-only inspection copy of {db_path:?}"))?;
+    struct RemoveCopy(PathBuf);
+    impl Drop for RemoveCopy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = RemoveCopy(copy_path.clone());
+    let db = persist::open_existing_db(&copy_path)?;
+    let identity = persist::StateIdentity {
+        user: state.user_key().verifying_key().to_bytes(),
+        node: state.node_key.verifying_key().to_bytes(),
+    };
+    let loaded = persist::load_all_read_only(&db, &state.k_root, &identity)?;
+    Ok(StateInspection {
+        owned_vaults: loaded.vault_blob_sources.len(),
+        held_replicas: loaded.shared.held.len(),
+        held_shares: loaded.shared.held_shares.len(),
+        recovery_sets: loaded.shared.split_states.len(),
+        ceremonies: loaded.shared.ceremonies.len(),
+    })
+}
+
+#[cfg(unix)]
+fn copy_private_database(source: &Path, destination: &Path) -> Result<()> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    let source = openat(
+        CWD,
+        source,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let destination = openat(
+        CWD,
+        destination,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(std::io::Error::from)?;
+    let mut source = std::fs::File::from(source);
+    let mut destination = std::fs::File::from(destination);
+    std::io::copy(&mut source, &mut destination)?;
+    destination.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_private_database(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::copy(source, destination)?;
+    Ok(())
+}
+
+/// Create a new, identity-bound empty database without starting networking.
+pub fn initialize_empty_state(state: &State) -> Result<()> {
+    let state_dir = state
+        .dir
+        .as_ref()
+        .context("state initialization requires a durable state directory")?;
+    state::ensure_private_directory(state_dir)?;
+    let db_path = state_dir.join("state.redb");
+    ensure!(
+        !db_path.exists(),
+        "state database {db_path:?} already exists"
+    );
+    let blobs = state_dir.join("blobs");
+    if blobs.exists() {
+        ensure!(
+            blobs.read_dir()?.next().is_none(),
+            "blob data exists in {blobs:?}; inspect or restore state instead"
+        );
+    }
+
+    let db = persist::open_db(&db_path)?;
+    let shared = Shared::default();
+    let docs = DocStore::default();
+    let identity = persist::StateIdentity {
+        user: state.user_key().verifying_key().to_bytes(),
+        node: state.node_key.verifying_key().to_bytes(),
+    };
+    let initialized = persist::try_commit_all(&db, &shared, &docs, &state.k_root, &identity);
+    drop(db);
+    if let Err(error) = initialized {
+        let _ = std::fs::remove_file(&db_path);
+        return Err(error).context("initialize empty state database");
+    }
+    if let Err(error) = inspect_state_database(state, &db_path) {
+        let _ = std::fs::remove_file(&db_path);
+        return Err(error).context("verify empty state database");
+    }
+    Ok(())
+}
+
+/// Explicitly migrate a validated legacy database to complete identity-bound schema 2.
+///
+/// The caller must obtain operator confirmation before this function. It creates and
+/// synchronizes a protected backup before the one-transaction migration.
+pub fn migrate_legacy_state(state: &State) -> Result<PathBuf> {
+    let state_dir = state
+        .dir
+        .as_ref()
+        .context("legacy migration requires a durable state directory")?;
+    let db_path = state_dir.join("state.redb");
+    inspect_state_database(state, &db_path).context("validate legacy state before migration")?;
+    let backup = state_dir.join("state.redb.before-schema-2");
+    ensure!(!backup.exists(), "legacy migration backup already exists");
+    copy_private_database(&db_path, &backup).context("create protected migration backup")?;
+    #[cfg(unix)]
+    std::fs::File::open(state_dir)?.sync_all()?;
+
+    let db = persist::open_existing_db(&db_path)?;
+    let identity = persist::StateIdentity {
+        user: state.user_key().verifying_key().to_bytes(),
+        node: state.node_key.verifying_key().to_bytes(),
+    };
+    persist::migrate_legacy(&db, &state.k_root, &identity)?;
+    persist::load_all(&db, &state.k_root, &identity)
+        .context("verify migrated schema-2 database")?;
+    Ok(backup)
+}
+
+/// Activate a recovered identity without exposing either seed outside this process.
+///
+/// This stores both seeds in the operating-system credential store, creates an empty
+/// identity-bound state database, and verifies that database. It refuses to replace any
+/// existing identity or durable state. After this function succeeds, drop the returned
+/// state and start the normal daemon from `state_dir`.
+pub fn activate_recovered_identity(
+    state_dir: &Path,
+    node_seed: [u8; 32],
+    k_root: [u8; 32],
+) -> Result<State> {
+    let state = State::install_recovered(state_dir, node_seed, k_root)?;
+    if let Err(error) = initialize_empty_state(&state) {
+        state.remove_installed_recovery();
+        return Err(error).context("initialize recovered identity state");
+    }
+    Ok(state)
+}
 
 /// Re-export so callers without an `iroh` dependency (e.g. the CLI) can parse
 /// friends' relay URLs for [`Daemon::start_on`].
@@ -49,10 +250,10 @@ use carapace_recovery::{
     verify_share_grant, CeremonyPhase, CeremonyState, PolicyWarning, RecoveryRateLimiter,
 };
 use carapace_replica::{
-    build_audit, build_wide_audit, verify_audit_response, Audit, AuditAction, AuditTracker, Health,
-    Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_POR_FAIL_LIMIT, DEFAULT_POR_INTERVAL_SECS,
-    DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY, DEFAULT_RATE_REFILL_PER_SEC, DEFAULT_WIDE_EVERY,
-    MAX_REPLICA_BLOBS,
+    build_audit, build_wide_audit, verify_bao_range_responses, Audit, AuditAction, AuditTracker,
+    Health, Policy, RateLimiter, DEFAULT_GRACE_SECS, DEFAULT_POR_FAIL_LIMIT,
+    DEFAULT_POR_INTERVAL_SECS, DEFAULT_QUOTA_BYTES, DEFAULT_RATE_CAPACITY,
+    DEFAULT_RATE_REFILL_PER_SEC, DEFAULT_WIDE_EVERY, MAX_REPLICA_BLOBS,
 };
 use carapace_share::{
     answer_attest_challenge, build_attest_challenge, AttestTracker, Share, ShareAction,
@@ -60,7 +261,7 @@ use carapace_share::{
 };
 use carapace_vault::{
     chunk_keys_from_manifest, ingest_dir, merge_manifests, new_vid, open_envelope, reconstruct,
-    seal_manifest, vv_equal, ChunkKeys, MemoryStore, VaultKeys,
+    seal_manifest, vv_equal, ChunkKeys, FsStore, VaultKeys,
 };
 use carapace_wire::messages::Message;
 use carapace_wire::{
@@ -78,6 +279,7 @@ use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use iroh_blobs::BlobsProtocol;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -98,6 +300,43 @@ const POR_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// unreachable peer's QUIC connect can hang for ~30 s, stalling the whole round;
 /// bounding it makes an offline peer fail fast to the "unreachable" path (C1).
 const POR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum number of current, replica, and disclosed blobs protected in one GC run.
+const MAX_GC_LIVE_BLOBS: usize = 1_000_000;
+
+/// Maximum UTF-8 byte length for each user-controlled ceremony text field.
+const MAX_CEREMONY_TEXT_BYTES: usize = 1_024;
+
+/// Maximum number of active alarm or pre-open abort records held in memory.
+const MAX_CEREMONY_RECORDS: usize = 1_024;
+
+/// Maximum concurrent tracked ceremonies for one recovery subject.
+const MAX_ACTIVE_CEREMONIES_PER_SUBJECT: usize = 8;
+
+/// Maximum peers contacted by one recovery-open fan-out operation.
+const MAX_CEREMONY_FANOUT: usize = 128;
+
+/// Maximum failure count exposed for one maintenance round.
+const MAX_OPERATION_FAILURE_COUNT: usize = 4_096;
+
+/// Maximum number of distinct signer aborts retained for one ceremony.
+const MAX_ABORTS_PER_CEREMONY: usize = 64;
+
+/// Durable recovery-open history bounds and terminal replay protection.
+const RECOVERY_RATE_WINDOW_SECS: u64 = 24 * 60 * 60;
+const MAX_RECOVERY_OPENS_PER_WINDOW: usize = 5;
+const MAX_RECOVERY_RATE_KEYS: usize = 4_096;
+const MAX_CEREMONY_TOMBSTONES: usize = 4_096;
+const CEREMONY_COMPLETION_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Default minimum time for the owner to see and stop an account-recovery attempt.
+pub const MIN_RECOVERY_DELAY_SECS: u64 = 72 * 60 * 60;
+
+/// Maximum trustee roster size accepted by recovery orchestration.
+const MAX_RECOVERY_TRUSTEES: usize = 32;
+
+/// Maximum cached peer addresses and authenticated blob-reader identities.
+const MAX_PEER_RECORDS: usize = 4_096;
 
 /// §9.3.4 re-split liveness window: a remaining friend counts as "online now" on the
 /// re-split status surface only if it answered us within this window. Sized to a few
@@ -209,6 +448,48 @@ pub struct MaintenanceReport {
     pub errors: Vec<String>,
 }
 
+/// Identity-free, bounded-capacity inputs for local operational metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationalCapacity {
+    /// Total replica bytes this device grants to current friends.
+    pub replica_grant_bytes: u64,
+    /// Owner-side replica assignments across all current vaults.
+    pub replica_assignments: usize,
+    /// Owned vaults whose blob source needs a fresh fetch.
+    pub storage_refetch_needed: usize,
+    /// Active tracked recovery ceremonies.
+    pub ceremony_active: usize,
+    /// Durable terminal ceremony replay records.
+    pub ceremony_tombstones: usize,
+    /// Subjects with durable recovery-open rate history.
+    pub ceremony_subject_rate_keys: usize,
+    /// Sponsors with durable recovery-open rate history.
+    pub ceremony_sponsor_rate_keys: usize,
+    /// Global active-ceremony capacity.
+    pub ceremony_capacity: usize,
+    /// Per-subject active-ceremony capacity.
+    pub ceremony_per_subject_capacity: usize,
+    /// Terminal replay-record capacity.
+    pub ceremony_tombstone_capacity: usize,
+    /// Maximum peers contacted by one recovery-open fan-out.
+    pub ceremony_fanout_capacity: usize,
+}
+
+/// Bounded, identity-free maintenance history for the authenticated metrics API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationalHistory {
+    /// Wall-clock time of the last completed maintenance round, or zero before one runs.
+    pub last_maintenance_at: u64,
+    /// Wall-clock time of the last failed maintenance item, or zero when none is known.
+    pub last_failure_at: u64,
+    /// Number of failed items in the last maintenance round.
+    pub last_failure_count: usize,
+    /// Consecutive maintenance rounds that had at least one failed item.
+    pub consecutive_failed_rounds: u64,
+    /// True if blob garbage collection succeeded in the last completed round.
+    pub last_gc_succeeded: bool,
+}
+
 /// Outcome of an owner-side split-and-grant (§8, W3): which trustees were reached and
 /// hold a fresh grant, plus any §8.3 issuance policy warnings.
 #[derive(Clone, Debug, Default)]
@@ -237,6 +518,60 @@ pub struct RecoveryGrantReport {
     /// The announce refs currently carried in the trustees' grants: `(vid, epoch)`
     /// per referenced vault. Advances as the owner publishes new epochs (§10.2).
     pub refs: Vec<([u8; 32], u64)>,
+}
+
+/// Complete authoritative metadata for one durable owner recovery set.
+#[derive(Clone, Debug)]
+pub struct RecoverySetReport {
+    pub rsid: u64,
+    pub scope: RecoveryScope,
+    pub threshold: usize,
+    pub issued: usize,
+    pub trustees: Vec<([u8; 32], bool)>,
+    pub warnings: Vec<PolicyWarning>,
+}
+
+/// One established friend's authoritative local replica-storage grant.
+#[derive(Clone, Copy, Debug)]
+pub struct FriendGrantReport {
+    pub user: [u8; 32],
+    pub grant_bytes: u64,
+}
+
+/// One authoritative peer option for local control clients.
+#[derive(Clone, Debug)]
+pub struct PeerOption {
+    /// Friend user identity.
+    pub user: [u8; 32],
+    /// Display name from the newest verified contact card.
+    pub display: String,
+    /// One delegated node identity.
+    pub node: [u8; 32],
+    /// Last verified or observed address hints for the node.
+    pub addrs: Vec<String>,
+}
+
+/// One authoritative published-vault option for local control clients.
+#[derive(Clone, Debug)]
+pub struct VaultOption {
+    pub vid: [u8; 32],
+    pub epoch: u64,
+    /// Stable local label derived from the authoritative working directory.
+    pub name: String,
+}
+
+/// One verified trustee endpoint for a claimant ceremony package.
+#[derive(Clone, Debug)]
+pub struct ClaimantTrusteeHint {
+    pub user: [u8; 32],
+    pub node: [u8; 32],
+    pub addrs: Vec<String>,
+    pub relay_url: Option<String>,
+}
+
+pub struct RecoveryRestoreReport {
+    pub restored: Vec<Reconstructed>,
+    pub errors: Vec<([u8; 32], String)>,
 }
 
 /// The §10.2 share-health surface for one owned recovery set, for the status API.
@@ -270,6 +605,8 @@ pub struct PorRound {
     /// Whether a repair (re-replication + re-announce) actually changed the member
     /// set as a result of this round's losses.
     pub repaired: bool,
+    /// Identity-free count of replicas whose latest probe latency shifted far above baseline.
+    pub latency_anomalies: usize,
 }
 
 /// A reconstructed vault, returned by [`Daemon::sync_from`].
@@ -308,85 +645,47 @@ struct Shared {
     /// Each friend's newest verified `ContactCard`, keyed by user pubkey. This is
     /// the address book the control-stream gate consults (W5).
     friends: HashMap<[u8; 32], ContactCard>,
-    /// Per-friend storage grant in bytes: how much replica storage THIS node
-    /// grants THAT friend, keyed by the friend's user pubkey. Agreed at
-    /// add-friend time (both the initiating `befriend` path and the accepting
-    /// `serve_friend_accept` path) and enforced by `serve_replica_store` when the
-    /// friend places a replica on us; defaults to `DEFAULT_QUOTA_BYTES` (1 GiB)
-    /// when unspecified.
-    ///
-    /// This is LOCAL policy and is independent of what the friend advertises to
-    /// us in their `ContactCard.offers.storage_bytes` (§9.1): the grant is what I
-    /// enforce, the offer is what they claim to hold for me. A formal bilateral
-    /// over-the-wire storage-agreement message is a possible future spec addition;
-    /// the card-offer + local-grant model satisfies it for now (see spec-errata).
-    ///
-    /// ponytail: parallel map keyed like `friends`; there is no daemon unfriend
-    /// path removing entries from `s.friends` yet, so the two cannot drift. Fold
-    /// into a `FriendRecord { card, grant }` if `friends` ever gains a removal path.
+    /// Per-friend replica-storage grant in bytes (local policy this node enforces via
+    /// `serve_replica_store`), keyed by friend user pubkey. Defaults to `DEFAULT_QUOTA_BYTES`.
     friend_grants: HashMap<[u8; 32], u64>,
     /// Tickets this daemon has issued and will honor exactly once (§6).
     tickets: TicketBook,
     /// Per-owned-vault blob source (digest + ChunkIDs) for replica placement. Holds
     /// only the CURRENT epoch's source (overwritten on republish).
     vault_blobs: HashMap<[u8; 32], VaultBlobs>,
-    /// §3.5 reconciliation: blob sources `{vid -> (digest, chunk_ids)}` of OWNED
-    /// vaults whose manifest could NOT be re-derived at startup (envelope absent or
-    /// unopenable in FsStore) — the durable needs-refetch set. Persisted in the same
-    /// VAULT_BLOBS row as `vault_blobs`, so a failed re-derive NEVER erases the
-    /// vault's blob-source record: without this, the first post-boot persist rewrote
-    /// the row from the (empty) re-derived map and the vault silently vanished from
-    /// every later boot with no warning left to fire. Cleared per-vid by a successful
-    /// (re)publish or adopted sync baseline; re-populated fresh each boot from the
-    /// sources whose re-derive fails.
+    /// Blob sources `{vid -> (digest, chunk_ids)}` of OWNED vaults whose manifest could
+    /// not be re-derived at startup. Persisted in the same VAULT_BLOBS row as `vault_blobs`
+    /// so a failed re-derive never erases the vault's blob-source record. Cleared per-vid by
+    /// a successful (re)publish or adopted sync baseline; repopulated fresh each boot.
     needs_refetch: HashMap<[u8; 32], persist::BlobSource>,
-    /// The single authoritative working directory per vault (§11): the SAME tree is
-    /// the published source, the watched tree, AND the sync/reconstruct target. Set
-    /// at `publish_vault` time (to the caller's source) and on a first sync (to
-    /// `out_root/<vid>`), so a later sync reconstructs the merged result back into
-    /// the tree the watcher observes - which makes "absent from disk => tombstone"
-    /// sound (the working tree is always the full merged set, incl. conflict copies).
+    /// The single authoritative working directory per vault: the same tree is published
+    /// source, watched tree, and sync/reconstruct target. Set at `publish_vault` (caller's
+    /// source) and on first sync (`out_root/<vid>`), which makes "absent from disk =>
+    /// tombstone" sound since the working tree is always the full merged set.
     working_dirs: HashMap<[u8; 32], PathBuf>,
-    /// Every ChunkID ever published for a vault this daemon OWNS, mapped to that
-    /// vault's vid and RETAINED across epoch bumps (unlike `vault_blobs`). The
-    /// blob-read gate ([`authorize_fetch`]) consults this so a superseded-epoch
-    /// chunk stays in the owner-gated set: a still-disclosed old chunk is served
-    /// only to its audience, an undisclosed old chunk to no non-device. Without it,
-    /// a chunk dropped from the current `vault_blobs` on republish would fall out of
-    /// the owned set and be served to any dialer (W2). ponytail: grows with the
-    /// distinct owned chunks over the daemon's life; bound it together with
-    /// old-epoch blob eviction from the store (GC), tracked as a separate resource
-    /// concern (spec-errata W2-gc).
+    /// Every ChunkID ever published for a vault this daemon OWNS, mapped to its vid and
+    /// RETAINED across epoch bumps (unlike `vault_blobs`). [`authorize_fetch`] consults this
+    /// so a superseded-epoch chunk stays owner-gated instead of being served to any dialer (W2).
     owned_chunks: HashMap<[u8; 32], [u8; 32]>,
     /// Owner-side replica membership: vid -> accepted replica node ids.
     members: HashMap<[u8; 32], Vec<[u8; 32]>>,
     /// Owner-side replica invariant `r`, per vault.
     replica_target: HashMap<[u8; 32], usize>,
-    /// Vids this daemon stores *as a replica* for some owner (blobs live in the
-    /// iroh store; this records the relationship for read-serving/accounting).
+    /// Vids this daemon stores *as a replica* for some owner.
     held: HashSet<[u8; 32]>,
-    /// Every blob (manifest envelope + ciphertext chunk) this daemon holds *as a
-    /// replica* for another owner, mapped to the vid it belongs to. The blob-read
-    /// gate ([`authorize_fetch`]) consults this so a replica-held chunk is served
-    /// only to that vault owner's delegated devices or a current replica-set member
-    /// (§7.4 a/b), never to an arbitrary dialer (W8). Populated in
-    /// [`ControlHandler::serve_replica_store`] from the pushed blob hashes.
+    /// Every blob this daemon holds *as a replica*, mapped to its vid. [`authorize_fetch`]
+    /// consults this so a replica-held chunk is served only to the owner's delegated devices
+    /// or a current replica-set member, never an arbitrary dialer (W8).
     replica_chunks: HashMap<[u8; 32], [u8; 32]>,
-    /// For each vid held as a replica, the vault owner's *user* pubkey (derived from
-    /// the inviting owner node's friend card). The gate uses it to admit that owner's
-    /// delegated devices (§7.4 a).
+    /// For each replica-held vid, the vault owner's *user* pubkey; the gate admits that
+    /// owner's delegated devices.
     replica_owner: HashMap<[u8; 32], [u8; 32]>,
-    /// For each vid held as a replica, the current replica-set node ids from the
-    /// owner-signed `VaultAnnounce` received at placement. The gate admits a member
-    /// of this set so a co-replica can fetch for repair (§7.4 b).
+    /// For each replica-held vid, the current replica-set node ids from the owner-signed
+    /// announce; the gate admits a member so a co-replica can fetch for repair.
     replica_members: HashMap<[u8; 32], Vec<[u8; 32]>>,
-    /// For each vid held as a replica, the full owner-signed `VaultAnnounce` received
-    /// at placement/epoch-push (§8.4). Kept - not just its `replicas` list - so this
-    /// replica can serve it back to a recovering owner-device that lost every original
-    /// device: the announce drives that device's `select_targets`, and its old-node
-    /// signer satisfies the C1 delegated-signer check. With Option B (§4) the recovering
-    /// device re-derives per-chunk keys from the manifest's `pt_hash`, so no `FileGrant`
-    /// is retained or served - only this announce + the owner card.
+    /// For each replica-held vid, the full owner-signed `VaultAnnounce`. Kept so this replica
+    /// can serve it back to a recovering owner-device that lost every original device (drives
+    /// its `select_targets`, and its old-node signer satisfies the C1 delegated-signer check).
     replica_announce: HashMap<[u8; 32], VaultAnnounce>,
     /// Owner-side deny-list of peer node ids this daemon refuses to place on (S4).
     replica_deny: HashSet<[u8; 32]>,
@@ -410,162 +709,112 @@ struct Shared {
     /// Per-peer token buckets limiting how much a friend can push into our replica
     /// store per unit time (W1). Configured from [`ReplicaLimits`] at start.
     rate: RateLimiter,
-    /// Embedded-relay reachability lifecycle state (§6/W6). Tracks the URL our own
-    /// card currently advertises (`None` when the relay is down/withdrawn or we run
-    /// none), the local URL peer-dialback matches, and the last dialback time.
-    /// Driven by the maintenance loop's liveness probe; the own card's `relay_url`
-    /// is kept in lockstep with `advertised_url` (each change bumps the card
-    /// version, the monotonic rollback counter).
+    /// Embedded-relay reachability lifecycle state (§6/W6). The own card's `relay_url` is
+    /// kept in lockstep with `advertised_url`; each change bumps the card version.
     relay_health: RelayHealth,
-    /// Owner-side PoR bookkeeping (§10.1): per-`(replica, vid)` audit schedule,
-    /// round counter, and consecutive-failure streak against an injected clock.
-    /// Single-writer per vault: only the vault owner's `por_audit_round` mutates it.
+    /// Owner-side PoR bookkeeping: per-`(replica, vid)` audit schedule, round counter, and
+    /// consecutive-failure streak. Single-writer per vault (only `por_audit_round` mutates).
     por: AuditTracker,
-    /// Owner-side share-health trackers (§10.2), keyed by recovery-set id. Each
-    /// gates the daily attestation cadence and folds verified attestations into an
-    /// attested-live count under a freshness window.
+    /// Owner-side share-health trackers, keyed by recovery-set id: gate the attestation
+    /// cadence and count attested-live shares under a freshness window.
     share_sets: HashMap<u64, AttestTracker>,
-    /// Trustee-side stored shares this daemon holds for other owners, keyed by
-    /// recovery-set id, each with its continuous local CRC self-validation monitor
-    /// (§10.2). Answers `ShareAttestChallenge`s from the owning friend.
+    /// Trustee-side shares this daemon holds for other owners, keyed by recovery-set id,
+    /// each with its CRC self-validation monitor. Answers `ShareAttestChallenge`s.
     held_shares: HashMap<u64, (Share, ShareMonitor)>,
-    /// The subject (secret owner) each held share belongs to, keyed by recovery-set id.
-    /// Populated in [`ControlHandler::serve_grant`] alongside `held_shares`. The
-    /// `ShareDestroy` handler (§9.3 step 3c) consults it to bind an inbound destroy's
-    /// `rsid` to its claimed `subject`: without this an authorized-but-wrong owner could
-    /// name another owner's recovery-set id (which `held_shares` keys blindly) and drop a
-    /// share it never owned. Kept in lockstep with `held_shares` (serve_grant inserts,
-    /// `drop_held_share_of` + the destroy handler remove).
+    /// The subject each held share belongs to, keyed by recovery-set id. The `ShareDestroy`
+    /// handler binds an inbound destroy's `rsid` to its claimed `subject` through this, so an
+    /// authorized-but-wrong owner cannot name another owner's rsid and drop a share it never
+    /// owned. Kept in lockstep with `held_shares`.
     held_share_subjects: HashMap<u64, [u8; 32]>,
-    /// Per-owned-vault chunk secrets (key/nonce per ChunkID), retained from ingest
-    /// so the owner can later disclose a *subset* of files (§7.4) without
-    /// re-ingesting. Owner-only, in-memory, and zeroized on drop; no weaker than
-    /// already holding `k_root` (from which every content key derives) in memory.
+    /// Per-owned-vault chunk secrets (key/nonce per ChunkID), retained from ingest so the
+    /// owner can disclose a subset of files without re-ingesting. Zeroized on drop; no weaker
+    /// than already holding `k_root` in memory.
     vault_keys: HashMap<[u8; 32], ChunkKeys>,
-    /// Owner-side selective-disclosure table (§7.4 / D3): ChunkID -> audience users
-    /// authorized to fetch it, recorded from every issued `FileGrant`. The
-    /// blob-read gate ([`authorize_fetch`]) consults it so a granted chunk is
-    /// served only to an authenticated member of that grant's audience.
+    /// Owner-side selective-disclosure table: ChunkID -> audience users, recorded from every
+    /// issued `FileGrant`. [`authorize_fetch`] serves a granted chunk only to its audience.
     disclosure: DisclosureTable,
-    /// Nodes this daemon has authenticated on its `carapace/1` control stream (via
-    /// NodeID + card delegation, W5), classified as our own device or a specific
-    /// friend. The blob-read gate keys on this so that a raw `iroh-blobs` dialer is
-    /// served owned-vault chunks only after it proved, on the authenticated control
-    /// stream, who it is — closing the §7.4/D3 gap for owner-served granted content.
+    /// Nodes authenticated on the `carapace/1` control stream (NodeID + card delegation),
+    /// classified as own device or friend. The blob-read gate keys on this so a raw
+    /// `iroh-blobs` dialer gets owned-vault chunks only after proving who it is (§7.4/D3).
     blob_auth: HashMap<[u8; 32], BlobAuth>,
-    /// Owner-side recovery split-states (§8), keyed by recovery-set id. Holds the
-    /// open Chela split polynomial (a secret, kept in memory beside `k_root`) so
-    /// `recovery_extend` can issue further shares on the same polynomial without
-    /// re-splitting. ponytail: in-memory, daemon-lifetime like the rest of daemon
-    /// state; persist a sealed split-state blob if extend must survive a restart.
+    /// Owner-side recovery split-states, keyed by recovery-set id. Holds the open Chela split
+    /// polynomial (a secret, kept beside `k_root`) so `recovery_extend` issues further shares
+    /// on the same polynomial without re-splitting.
     split_states: HashMap<u64, RecoverySet>,
-    /// Recovery ceremonies this device tracks AS A TRUSTEE (§8.5), keyed by ceremony
-    /// id: the primitive state machine plus this trustee's own approval flag and
-    /// takeover flag. The API drives approve/abort against these; the delay-gated
-    /// share release reads `state.can_release` here.
+    /// Transient reservation while an asynchronous root split delivers its grants.
+    root_split_pending: bool,
+    /// Recovery ceremonies this device tracks AS A TRUSTEE, keyed by ceremony id: the state
+    /// machine plus this trustee's approval/takeover flags. The delay-gated release reads
+    /// `state.can_release` here.
     ceremonies: HashMap<[u8; 16], TrackedCeremony>,
-    /// Surfaced ceremony alarms (§8.5 step 2), keyed by ceremony id: every inbound
-    /// `RecoveryOpen` this device saw, whether or not it is a trustee of the subject,
-    /// so the status API can raise "recovery of your account started - is this you?"
-    /// even on the subject's own devices and friends (who hold no grant to track a
-    /// full ceremony). The anti-silent-takeover signal.
+    /// Surfaced ceremony alarms, keyed by ceremony id: every inbound `RecoveryOpen` this
+    /// device saw, so the status API can raise "recovery of your account started" even on the
+    /// subject's own devices/friends. The anti-silent-takeover signal.
     ceremony_alarms: HashMap<[u8; 16], AlarmRecord>,
-    /// Signature-valid subject aborts seen for a ceremony id, retained even when no
-    /// ceremony/alarm is tracked yet (§8.5 step 3). Best-effort per-peer fan-out has no
-    /// ordering, so a subject-signed `CeremonyAbort` can reach a trustee BEFORE that
-    /// trustee's `RecoveryOpen` (and the same open is re-sent later as the claimant's
-    /// share request). Without a durable record the early abort would be dropped and the
-    /// later open would re-track a fresh, non-aborted ceremony that releases at
-    /// delay-expiry - the exact silent takeover step 3 exists to stop. Populated
-    /// UNCONDITIONALLY by `serve_ceremony_abort` and consulted by `serve_recovery_open`
-    /// before any release. Authoritative only when a stored abort's `by` equals the
-    /// open's subject (a stranger cannot abort someone else's recovery). Kept as a
-    /// per-signer-deduped list, NOT a single slot: a stranger's inert abort must not be
-    /// able to crowd out the authoritative subject abort that arrives before the open.
-    /// ponytail: tiny metadata (16-byte id + a signed abort per distinct signer),
-    /// retained for the daemon's lifetime; no persistence (all daemon state is in-memory
-    /// per the documented deferral).
+    /// Signature-valid subject aborts per ceremony id, retained even when no ceremony is
+    /// tracked yet. Fan-out is unordered, so a subject-signed abort can arrive before the
+    /// trustee's `RecoveryOpen`; without a durable record the later open would re-track a
+    /// fresh non-aborted ceremony and release at delay-expiry (the silent takeover step 3
+    /// exists to stop). Authoritative only when a stored abort's `by` equals the open's
+    /// subject. A per-signer-deduped list, not a single slot, so a stranger's inert abort
+    /// cannot crowd out the authoritative subject abort.
     aborted_ceremonies: HashMap<[u8; 16], Vec<CeremonyAbort>>,
-    /// Injected wall clock for the ceremony delay gate (0 = real time). Test-only knob
-    /// (`set_test_clock`) so the 72 h abort delay is exercised without ever sleeping:
-    /// only the network-triggered ceremony paths (track `first_seen`, release gate)
-    /// read it; every other clock stays real.
+    /// Durable sliding-window histories. Both the subject and sponsor budgets must pass.
+    ceremony_subject_rate: HashMap<[u8; 32], Vec<u64>>,
+    ceremony_sponsor_rate: HashMap<[u8; 32], Vec<u64>>,
+    /// Compact terminal records stop replay from recreating removed ceremony state.
+    ceremony_tombstones: HashMap<[u8; 16], CeremonyTombstone>,
+    /// Ceremonies for which this trustee sent a share, bound to the exact recovered node from
+    /// the verified `RecoveryOpen`. The active ceremony expiry bounds this admission proof.
+    ceremony_released: HashMap<[u8; 16], [u8; 32]>,
+    /// Injected wall clock for the ceremony delay gate (0 = real time). Test-only knob so the
+    /// 72 h abort delay is exercised without sleeping; only the ceremony paths read it.
     test_now: u64,
-    /// Trustee-side: the full verified `ShareGrant`s this daemon holds for other
-    /// owners (W3, §8), keyed by the subject user pubkey whose secret was split. Held
-    /// verbatim (roster + recovery_delay + announce refs), so at ceremony time the
-    /// quorum has the co-trustee set to reach and the latest manifest pointers to
-    /// fetch - unlike a bare `Share`, which locates nothing without a live owner. The
-    /// embedded share is ALSO stored in `held_shares` for the attestation cadence.
+    /// Trustee-side: the full verified `ShareGrant`s this daemon holds for other owners,
+    /// keyed by subject user pubkey. Held verbatim (roster + recovery_delay + announce refs)
+    /// so at ceremony time the quorum has the co-trustee set and latest manifest pointers.
+    /// The embedded share is also stored in `held_shares` for the attestation cadence.
     held_grants: HashMap<[u8; 32], ShareGrant>,
-    /// Owner-side: the grants this daemon minted per recovery set (W3, §8), keyed by
-    /// recovery-set id. Retains each trustee's share + hints and the last-delivered
-    /// announce refs so the maintenance loop can re-issue refreshed grants pointing at
-    /// the latest manifest as new vault epochs publish (§10.2, §7.3).
+    /// Owner-side: grants this daemon minted per recovery set, keyed by recovery-set id.
+    /// Retains each trustee's share + hints and the last-delivered announce refs so the
+    /// maintenance loop can re-issue refreshed grants as new vault epochs publish.
     granted: HashMap<u64, OwnerGrants>,
-    /// §9.3 W5: in-flight re-splits this owner is driving to completion, keyed by the
-    /// OLD (ex-friend's) recovery-set id. Each wraps the guarded [`Resplit`] state
-    /// machine plus the dial hints for delivering the new set's grants, challenging it
-    /// live, and destroying the old shares. The maintenance loop advances them; the old
-    /// shares are NEVER destroyed until [`Resplit`] proves the new set live (`>= M +
-    /// slack`), and the daemon routes destruction only through `Resplit::share_destroy`.
+    /// In-flight re-splits this owner is driving, keyed by the OLD recovery-set id. Old shares
+    /// are NEVER destroyed until [`Resplit`] proves the new set live (`>= M + slack`), and
+    /// destruction routes only through `Resplit::share_destroy`.
     resplits: HashMap<u64, OpenResplit>,
-    /// §9.3.4 W5: re-splits an unfriend DETECTED (the ex-friend was a trustee of this
-    /// old recovery set) but that the user has NOT yet chosen to start, `old_rsid ->
-    /// [`PendingResplit`]`. §9.3.4 requires the client to PROMPT the user before
-    /// re-splitting a trustee out, so the unfriend teardown only records the pending
-    /// prompt here (with the suggested new trustee set = old honest set); nothing stands
-    /// up until the user hits `POST /api/recovery/{rsid}/resplit-start`
-    /// ([`Daemon::start_pending_resplit`]), which holds `k_root`. Durable across
-    /// maintenance ticks so the prompt persists until the user acts.
+    /// Re-splits an unfriend DETECTED but the user has NOT started, `old_rsid ->
+    /// PendingResplit`. §9.3.4 requires prompting the user first, so teardown only records the
+    /// pending prompt; nothing stands up until `POST /api/recovery/{rsid}/resplit-start`.
     pending_resplits: HashMap<u64, PendingResplit>,
-    /// §9.3.1 W5: outbound `DeleteRequest` batches queued by the RECEIVE side of an
-    /// unfriend (an inbound `FriendshipEnd`, handled in the control handler, has no
-    /// endpoint to dial out). Each side MUST send DeleteRequests for everything IT placed
-    /// on the other; the initiator sends inline in [`Daemon::unfriend`], but the receiver
-    /// defers to the maintenance loop ([`Daemon::drive_pending_delete_sends`]), which
-    /// drains this. Sending a DeleteRequest never triggers a FriendshipEnd, so there is
-    /// no unfriend loop.
+    /// Outbound `DeleteRequest` batches queued by the RECEIVE side of an unfriend (an inbound
+    /// `FriendshipEnd` has no endpoint to dial out). Drained by the maintenance loop
+    /// ([`Daemon::drive_pending_delete_sends`]); sending one never triggers a FriendshipEnd.
     pending_delete_sends: Vec<(Vec<EndpointAddr>, Placement)>,
-    /// §9.3 W5: node ids of unfriended peers whose replicas of OUR vaults must be
-    /// re-placed immediately - treated as confirmed lost NOW (no 24 h grace), via a
-    /// `Health::Unfriended` repair. Drained by `replace_unfriended_replicas`.
+    /// Node ids of unfriended peers whose replicas of OUR vaults must be re-placed
+    /// immediately - confirmed lost NOW (no 24 h grace). Drained by `replace_unfriended_replicas`.
     unfriended_nodes: HashSet<[u8; 32]>,
 }
 
-/// Consecutive failed liveness probes required before withdrawing an advertised
-/// relay (W6 hysteresis).
-///
-/// The probe is a 2 s loopback TCP connect; under load a single connect can time
-/// out on a perfectly healthy relay, and each spurious withdraw costs two card
-/// re-issues (withdraw plus re-advertise). Requiring three consecutive failures
-/// rides out a transient stall while still catching a genuinely dead listener
-/// within a few maintenance rounds.
+/// Consecutive failed liveness probes before withdrawing an advertised relay (W6
+/// hysteresis). The probe is a 2 s loopback TCP connect that can spuriously time out under
+/// load; three failures ride out a transient stall while still catching a dead listener.
 const RELAY_PROBE_FAILURE_THRESHOLD: u32 = 3;
 
-/// Embedded-relay reachability lifecycle state (§6/W6).
-///
-/// §6 requires a node's advertised relay to be dialback-verified and to be
-/// *advertised on success, withdrawn on loss* - never advertised unconditionally
-/// at startup. This tracks:
-/// - `advertised_url`: the relay URL currently folded into this node's own card
-///   (`None` when the relay is down/withdrawn, or when it runs no relay). The own
-///   card's `NodeEntry.relay_url` is kept exactly equal to this; every change is a
-///   card re-issue with a bumped (monotonic) version.
-/// - `local_url`: the URL our own endpoint registers on and reaches the relay at
-///   (loopback-substituted), which is also the URL an inbound relayed QUIC path
-///   carries - so peer-dialback matches an inbound relay path against it.
-/// - `verified_at`: the last time a friend was observed reaching us *through* our
-///   relay (peer-dialback, §6). Surfaced for the operator; see the module note on
-///   why it confirms rather than gates advertising.
+/// Embedded-relay reachability lifecycle state (§6/W6): advertise on dialback success,
+/// withdraw on loss, never advertise unconditionally at startup.
 #[derive(Default)]
 struct RelayHealth {
+    /// Relay URL folded into this node's own card (`None` when down/withdrawn or no relay).
+    /// The card's `NodeEntry.relay_url` is kept exactly equal to this.
     advertised_url: Option<String>,
+    /// URL our endpoint registers on and reaches the relay at (loopback-substituted); also
+    /// what an inbound relayed QUIC path carries, so peer-dialback matches against it.
     local_url: Option<RelayUrl>,
+    /// Last time a friend was observed reaching us through our relay (confirms, not gates).
     verified_at: Option<u64>,
-    /// Number of consecutive failed liveness probes since the last success (W6
-    /// hysteresis). Reset to 0 on any successful probe; a withdraw fires only
-    /// when it reaches [`RELAY_PROBE_FAILURE_THRESHOLD`].
+    /// Consecutive failed liveness probes since the last success; reset on success, withdraw
+    /// fires at [`RELAY_PROBE_FAILURE_THRESHOLD`].
     consecutive_failures: u32,
 }
 
@@ -584,18 +833,15 @@ struct OwnerGrants {
     refs: Vec<AnnounceRef>,
 }
 
-/// One trustee holding an owner-minted grant: its identity + node hints (for the
-/// co-trustee roster and delivery dial) plus its own share, re-signed into a
-/// refreshed grant when the refs advance. The share is a secret kept in memory
-/// beside `k_root`/`vault_keys`; no weaker than already holding the split source.
+/// One trustee holding an owner-minted grant: identity + node hints plus its own share,
+/// re-signed into a refreshed grant when the refs advance.
 #[derive(Clone)]
 struct GrantedTrustee {
     user: [u8; 32],
     node: [u8; 32],
     relay_url: Option<String>,
     share: Share,
-    /// Whether the last delivery to this trustee succeeded (surfaced on the status
-    /// view so an operator sees which trustees actually hold a current grant).
+    /// Whether the last delivery to this trustee succeeded (surfaced on the status view).
     delivered: bool,
 }
 
@@ -758,24 +1004,16 @@ struct RecoverySet {
 struct TrackedCeremony {
     /// The delay-anchored ceremony state (approvals, roster, `ceremony_enc`, subject).
     state: CeremonyState,
-    /// Whether THIS trustee has approved (its own out-of-band verification, §8.5 step
-    /// 4). A trustee releases its share only if it approved: a trustee that never
-    /// verified the claimant must not be dragged into releasing just because `M`
-    /// others did. `state.can_release` gates on `≥ M` approvals + the delay; this
-    /// adds the "and I, specifically, approved" requirement.
+    /// Whether THIS trustee approved. It releases its share only if it did: `can_release`
+    /// gates on `>= M` approvals + delay, this adds the "and I specifically approved" bit.
     approved: bool,
-    /// A valid subject-signed abort flagged this ceremony as an attempted takeover
-    /// (§8.5 step 3). Once set, this trustee never releases. (The sponsor / claimant /
-    /// reason for the status surface live in the paired [`AlarmRecord`], always present
-    /// alongside a tracked ceremony.)
+    /// A valid subject-signed abort flagged this ceremony as an attempted takeover; once
+    /// set, this trustee never releases.
     takeover: bool,
 }
 
-/// A surfaced ceremony alarm (§8.5 step 2) for the status API: enough to show
-/// "recovery of <subject> started by <sponsor>" and, on the subject's own device,
-/// offer the authoritative abort. Recorded for EVERY inbound `RecoveryOpen`, whether
-/// or not this device is a trustee, so the anti-silent-takeover signal reaches the
-/// subject's own devices and friends.
+/// A surfaced ceremony alarm for the status API, recorded for EVERY inbound `RecoveryOpen`
+/// (trustee or not) so the anti-silent-takeover signal reaches the subject's own devices.
 #[derive(Clone)]
 struct AlarmRecord {
     subject: [u8; 32],
@@ -789,6 +1027,23 @@ struct AlarmRecord {
     aborted: bool,
     /// The abort flagged it as an attempted takeover.
     takeover: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CeremonyTerminal {
+    Completed,
+    Aborted,
+    Expired,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct CeremonyTombstone {
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    terminal_at: u64,
+    terminal: CeremonyTerminal,
 }
 
 /// One recovery-ceremony row for the status API (§8.5 step 2/6): phase, approvals,
@@ -834,6 +1089,21 @@ pub enum RecoveryScope {
     Vault([u8; 32]),
 }
 
+fn ensure_root_split_available(shared: &Shared, scope: RecoveryScope) -> Result<()> {
+    if !matches!(scope, RecoveryScope::Root) {
+        return Ok(());
+    }
+    ensure!(
+        !shared.root_split_pending
+            && !shared
+                .split_states
+                .values()
+                .any(|set| matches!(set.scope, RecoveryScope::Root)),
+        "an active root recovery split already exists; use the explicit atomic replacement flow"
+    );
+    Ok(())
+}
+
 /// How a node authenticated itself on this daemon's `carapace/1` control stream,
 /// used by the blob-read gate ([`authorize_fetch`]) to bind a raw `iroh-blobs`
 /// dialer's NodeID to a verified identity.
@@ -843,74 +1113,66 @@ enum BlobAuth {
     OwnDevice,
     /// A delegated device of the named established friend (the friend branch).
     Friend([u8; 32]),
-    /// A delegated device of a vault OWNER we store replicas for, authenticated by a
-    /// self-consistent card the dialer presented (its user is an owner in
-    /// `replica_owner`). Grants nothing on our own owned chunks; only unlocks that
-    /// owner's replica-held chunks (§7.4 a, W8). Used for an owner device this
-    /// replica does not otherwise know (not enumerated in the stored friend card).
+    /// A delegated device of a vault OWNER we store replicas for (its user is an owner in
+    /// `replica_owner`). Unlocks only that owner's replica-held chunks, nothing of ours (W8).
     ReplicaDevice([u8; 32]),
 }
 
-/// The `carapace/1` control-stream handler. It authenticates the dialer against
-/// the TLS-verified remote node id, then dispatches on the first frame:
-///
-/// - `ContactCard` (type 2): a document pull. The dialer presents its card; the
-///   handler serves cards/announces/grants **only** if that card is validly
-///   self-signed, its user is this daemon's own user or an established friend,
-///   and it delegates the connection's authenticated remote node id (W5). Every
-///   other dialer gets nothing beyond the `Hello`.
-/// - `FriendRequest` (type 3): the acceptor half of the §9.2 handshake, gated by
-///   a single-use ticket this daemon issued rather than by friendship.
-/// - `ReplicaInvite` (type 10): the storage-peer half of §10.1 placement, gated
-///   on the inviting owner being an established friend (or self).
+/// The `carapace/1` control-stream handler: authenticates the dialer against the
+/// TLS-verified remote node id, then dispatches on the first frame (`ContactCard` doc pull,
+/// `FriendRequest` acceptor half, `ReplicaInvite` storage-peer half).
 #[derive(Clone)]
 struct ControlHandler {
     hello: Hello,
     node_key: SigningKey,
     user_key: SigningKey,
     self_user: [u8; 32],
-    /// The user master key (design §3.2): needed to SEAL secret state rows when a
-    /// control handler persists after a mutation (e.g. `serve_grant` storing a share).
+    /// The user master key: needed to SEAL secret state rows when a handler persists.
     k_root: Zeroizing<[u8; 32]>,
-    /// The redb source of truth on disk, shared with the owning [`Daemon`]. Control
-    /// handlers commit the WHOLE state through it BEFORE any externally visible effect
-    /// (design §3.2.3), e.g. `serve_share_destroy` commits the removal before the ack.
+    /// The redb source of truth on disk, shared with the owning [`Daemon`]. Handlers commit
+    /// the whole state through it BEFORE any externally visible effect.
     db: Arc<redb::Database>,
+    persist_count: Arc<AtomicU64>,
     blobs: IrohBlobStore,
+    replica_ingress: PathBuf,
     shared: Arc<RwLock<Shared>>,
-    /// Default per-friend storage grant (bytes) recorded when this node ACCEPTS a
-    /// friend request (`serve_friend_accept`). The per-friend grant is what
-    /// `serve_replica_store` later enforces as that friend's replica quota (W1);
-    /// the initiating `befriend` path can agree a different amount explicitly.
+    /// Default per-friend storage grant recorded when this node ACCEPTS a friend request;
+    /// `serve_replica_store` later enforces it as that friend's replica quota (W1).
     default_grant_bytes: u64,
-    /// Injector for peer addressing hints + relay URLs into the live endpoint, so
-    /// a friend's card learned on the accept path teaches this node how to dial
-    /// them back by node id via hole-punch/relay (§6).
+    /// Injector for peer addressing hints + relay URLs, so a friend's card learned on the
+    /// accept path teaches this node how to dial them back by node id (§6).
     hints: PeerHints,
-    /// Shared with the owning [`Daemon`]: the rollback-guarded store of documents
-    /// learned from peers (W2). `serve_docs` re-serves the third-party cards +
-    /// announces here so an owner's `VaultAnnounce` reaches a friend-of-a-friend
-    /// (anti-entropy store-and-forward, §6), and consults the newest stored self-card
-    /// so a revoked own device presenting an old self-card is refused (W7).
+    /// Shared rollback-guarded doc store (W2). `serve_docs` re-serves third-party cards +
+    /// announces (store-and-forward) and consults the newest self-card so a revoked own
+    /// device presenting an old self-card is refused (W7).
     docs: Arc<Mutex<DocStore>>,
+    /// Fast in-memory inbound limiter. Durable subject and sponsor histories are in `Shared`.
+    recovery_limiter: Arc<Mutex<RecoveryRateLimiter>>,
 }
 
 impl ControlHandler {
-    /// Persist the WHOLE `Shared` + `DocStore` in one txn and commit (design §3.2). The
-    /// caller holds the `shared` write lock and passes the guard, so RAM and disk mutate
-    /// in one critical section; the commit happens BEFORE any ack / network effect
-    /// (§3.2.3). `docs` is locked internally (lock order `shared`->`docs`). Fail-loud on
-    /// commit failure.
+    /// Persist the whole `Shared` + `DocStore` in one txn and commit. Caller holds the
+    /// `shared` write lock; commit happens before any ack / network effect. Lock order
+    /// `shared`->`docs`. Fail-loud on commit failure.
     fn persist_locked(&self, s: &Shared) {
         let docs = self.docs.lock().expect("docs lock");
-        persist::commit_all(&self.db, s, &docs, &self.k_root);
+        persist::commit_all(
+            &self.db,
+            s,
+            &docs,
+            &self.k_root,
+            &persist::StateIdentity {
+                user: self.self_user,
+                node: self.node_key.verifying_key().to_bytes(),
+            },
+        );
+        self.persist_count.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn serve(&self, conn: Connection) -> Result<()> {
         let remote = *conn.remote_id().as_bytes();
-        // W6/§6 peer-dialback: if this friend reached us over our own advertised
-        // relay, that is external proof the relay is reachable. Recorded here, at
-        // accept time, before iroh upgrades a relayed path to a direct one.
+        // W6 peer-dialback: a friend reaching us over our own relay is external proof it
+        // is reachable. Recorded before iroh upgrades a relayed path to a direct one.
         self.note_relay_dialback(&conn);
         let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -970,17 +1232,9 @@ impl ControlHandler {
         Ok(())
     }
 
-    /// W6/§6 peer-dialback verification: if this inbound connection has a relay
-    /// path whose relay is *our* advertised relay, a peer reached us through it, so
-    /// record the time as external-reachability confirmation. iroh labels an inbound
-    /// relayed path with the relay URL we received on (a relay in our own set), so a
-    /// match against `relay_health.local_url` attributes it to our relay
-    /// specifically. No-op when we run no relay.
-    ///
-    /// ponytail (known ceiling): iroh promotes a relayed path to a direct one as
-    /// soon as hole-punching succeeds, so this catches inbound connections that are
-    /// still (or only ever) relayed - which is exactly the population for which the
-    /// relay matters. It is confirmation, not a gate (see `drive_relay_health`).
+    /// W6 peer-dialback: if this inbound connection has a relay path matching our own
+    /// advertised relay (`relay_health.local_url`), record the time as external-reachability
+    /// confirmation. No-op when we run no relay. Confirmation, not a gate.
     fn note_relay_dialback(&self, conn: &Connection) {
         let local = {
             let s = self.shared.read().expect("shared lock");
@@ -1003,14 +1257,9 @@ impl ControlHandler {
     }
 
     /// Serve the document set iff the presented card authorizes the connection's
-    /// authenticated remote node id (W5). Unauthorized dialers get only the Hello.
-    ///
-    /// Beyond this node's own cards/announces/grants, an authorized friend also
-    /// receives the third-party cards + announces this node learned from other
-    /// friends (anti-entropy store-and-forward, §6/W7): an owner's `VaultAnnounce`
-    /// reaches a trustee through any mutual friend, and a returning node re-syncs the
-    /// graph from any one friend. The forwarded set is version/epoch deduped and
-    /// rollback-guarded per signer by the receiver's own [`DocStore`].
+    /// authenticated remote node id (W5); unauthorized dialers get only the Hello. An
+    /// authorized friend also receives the third-party cards + announces learned from other
+    /// friends (store-and-forward, §6/W7), deduped and rollback-guarded by the receiver.
     async fn serve_docs(
         &self,
         card: &ContactCard,
@@ -1020,8 +1269,7 @@ impl ControlHandler {
         write_msg(send, &self.hello).await?;
 
         let now = unix_now();
-        // Snapshot the forwardable third-party docs + newest stored self-card under the
-        // docs lock FIRST, then take the shared lock — never nested, matching
+        // Snapshot under the docs lock FIRST, then the shared lock - never nested, matching
         // `sync_impl`'s docs-before-shared order (no lock held across an `.await`).
         let (fwd_cards, fwd_announces, newest_self) = {
             let d = self.docs.lock().expect("docs lock");
@@ -1032,16 +1280,13 @@ impl ControlHandler {
             )
         };
 
-        // W5: classify the dialer against its authenticated remote node id. On
-        // success, record the classification so the blob-read gate can bind this
-        // node's later raw iroh-blobs fetches to a verified identity (§7.4/D3).
+        // W5: classify the dialer against its authenticated remote node id; the recorded
+        // classification lets the blob-read gate bind later raw iroh-blobs fetches (§7.4/D3).
         enum Serve {
-            // Friend/self (W5): own docs plus the store-and-forward third-party docs.
+            // Friend/self: own docs plus the store-and-forward third-party docs.
             Authorized(Vec<ContactCard>, Vec<VaultAnnounce>, Vec<FileGrant>),
-            // §8.4 recovery: a delegated device of an owner whose vaults we replicate.
-            // Serve ONLY that owner's card + the announce we retained for its vaults -
-            // never any other owner's, no grant (Option B: the recovering device
-            // re-derives keys from the manifest pt_hash), and no store-and-forward dump.
+            // §8.4 recovery: a delegated device of an owner whose vaults we replicate. Serve
+            // ONLY that owner's card + retained announce, no grant, no store-and-forward dump.
             ReplicaOwner(Vec<ContactCard>, Vec<VaultAnnounce>),
             No,
         }
@@ -1049,27 +1294,47 @@ impl ControlHandler {
             let mut s = self.shared.write().expect("shared lock");
             match classify_dialer(&s, &self.self_user, card, remote, now, newest_self.as_ref()) {
                 Some(auth) => {
-                    s.blob_auth.insert(*remote, auth);
-                    Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    if s.blob_auth.contains_key(remote) || s.blob_auth.len() < MAX_PEER_RECORDS {
+                        if card.user == self.self_user {
+                            live_sync::remember_own_nodes(
+                                &mut s,
+                                card,
+                                &self.node_key,
+                                &self.user_key,
+                                Some(remote),
+                            )?;
+                            self.persist_locked(&s);
+                        }
+                        s.blob_auth.insert(*remote, auth);
+                        Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    } else {
+                        Serve::No
+                    }
                 }
-                // W8/§7.4 a + §8.4: a dialer we serve no ordinary documents to may be a
-                // delegated device of an owner whose vault we replicate. Record the
-                // ReplicaDevice classification so its raw iroh-blobs fetches of that
-                // owner's replica-held chunks are admitted, AND serve back the owner
-                // docs we retained at placement so a recovering owner-device that lost
-                // every original device can: drive `select_targets` (the announce) and
-                // satisfy the C1 delegated-signer check on that old-node-signed announce
-                // (the owner card delegating the original signer). Option B (§4): the
-                // recovering device re-derives per-chunk keys from the manifest's
-                // `pt_hash`, so no `FileGrant` is served - this is the claimant's ONLY
-                // authorization + announce path, so it stays.
+                // W8/§7.4 a + §8.4: a dialer served no ordinary docs may be a delegated device
+                // of an owner whose vault we replicate. Record ReplicaDevice so its fetches of
+                // that owner's replica-held chunks are admitted, and serve back the retained
+                // owner card + announce so a recovering owner-device (that lost every original
+                // device) can drive `select_targets` and satisfy the C1 delegated-signer check.
+                None if recovery_claimant_device(&s, card, remote, now) => {
+                    if s.blob_auth.contains_key(remote) || s.blob_auth.len() < MAX_PEER_RECORDS {
+                        s.blob_auth.insert(*remote, BlobAuth::Friend(card.user));
+                        Serve::Authorized(s.cards.clone(), s.announces.clone(), s.grants.clone())
+                    } else {
+                        Serve::No
+                    }
+                }
                 None => match replica_owner_device(&s, card, remote, now) {
                     Some(owner) => {
+                        if !s.blob_auth.contains_key(remote)
+                            && s.blob_auth.len() >= MAX_PEER_RECORDS
+                        {
+                            return Ok(());
+                        }
                         s.blob_auth.insert(*remote, BlobAuth::ReplicaDevice(owner));
                         let cards: Vec<ContactCard> =
                             s.friends.get(&owner).cloned().into_iter().collect();
-                        // Only this exact owner's vaults - never leak another owner's
-                        // announce to this device.
+                        // Only this exact owner's vaults - never leak another owner's announce.
                         let mut announces: Vec<VaultAnnounce> = Vec::new();
                         for (vid, ann) in &s.replica_announce {
                             if s.replica_owner.get(vid) == Some(&owner) {
@@ -1090,8 +1355,8 @@ impl ControlHandler {
             Serve::Authorized(c, a, g) => (c, true, a, g),
             Serve::ReplicaOwner(c, a) => (c, false, a, Vec::new()),
         };
-        // Own/owner docs first, then (friend path only) the learned third-party docs we
-        // re-serve. Overlap is harmless: the receiver dedups/rolls-back per signer.
+        // Own/owner docs first, then (friend path only) the forwarded third-party docs.
+        // Overlap is harmless: the receiver dedups/rolls-back per signer.
         for card in &cards {
             write_msg(send, card).await?;
         }
@@ -1130,8 +1395,7 @@ impl ControlHandler {
         let requester_user = verify_friend_request(&req, now)
             .map_err(|e| anyhow::anyhow!("friend request rejected: {e}"))?;
 
-        // Acceptor picks `established`; the requester must countersign the same
-        // core over the wire (never the requester's private key locally).
+        // Acceptor picks `established`; the requester countersigns the same core over the wire.
         let established = now;
         write_u64(send, established).await?;
         let countersig = read_sig(recv).await?;
@@ -1157,21 +1421,16 @@ impl ControlHandler {
             .map_err(|e| anyhow::anyhow!("friend accept failed: {e}"))?;
             s.friendships.insert(requester_user, friendship);
             s.friends.insert(requester_user, req.card.clone());
-            // Agree a per-friend replica-storage grant at add-friend time. On the
-            // accept path we grant this node's configured default; the initiating
-            // `befriend` path can agree a different amount explicitly.
+            // Per-friend replica-storage grant: the accept path grants this node's default.
             s.friend_grants
                 .insert(requester_user, self.default_grant_bytes);
-            // §3.2.3: commit the friendship (friends/friendships/grant) BEFORE sending
-            // FriendAccept, so a crash cannot leave the requester believing it befriended
-            // a node that forgot the friendship. (Tickets are EPH; a lost single-use
-            // ticket just yields TicketUnknown on retry, §3.3.)
+            // Commit the friendship BEFORE sending FriendAccept, so a crash cannot leave the
+            // requester believing it befriended a node that forgot the friendship.
             self.persist_locked(&s);
             accept
         };
 
-        // §6: learn how to reach this new friend by node id (their direct addrs
-        // and self-hosted relay), so we can dial them back via hole-punch/relay.
+        // §6: learn how to reach this new friend by node id so we can dial them back.
         learn_card_hints(&self.hints, &req.card).await;
 
         write_msg(send, &accept).await?;
@@ -1194,16 +1453,12 @@ impl ControlHandler {
         inv.verify()
             .map_err(|e| anyhow::anyhow!("replica invite bad sig: {e}"))?;
 
-        // Authorize the inviting owner and rate-limit its push under one write
-        // lock (all synchronous; the lock is released before any `.await`). The
-        // invite signer must be an established friend (or our own device) AND the
-        // connection's authenticated peer, and it must have rate-budget for the
-        // advertised size (W1: a single friend cannot flood the store).
+        // Authorize the inviting owner and rate-limit its push under one write lock (released
+        // before any `.await`). The signer must be an established friend (or own device) AND
+        // the authenticated peer, with rate-budget for the advertised size (W1: no flooding).
         let (admitted, owner_user) = {
             let mut s = self.shared.write().expect("shared lock");
-            // The inviting owner must be an established friend (or our own device);
-            // resolve it to the owner's *user* pubkey so the blob-read gate can later
-            // admit that owner's delegated devices (§7.4 a, W8).
+            // Resolve the owner to its *user* pubkey so the gate can later admit its devices.
             let owner_user = owner_user_of_node(&s, &self.self_user, &inv.by, now);
             let admitted = owner_user.is_some()
                 && inv.by == *remote
@@ -1215,12 +1470,9 @@ impl ControlHandler {
             return Ok(());
         }
 
-        // W1 + per-friend grant: the storage quota is the limit THIS node agreed to
-        // grant the inviting friend at add-friend time (looked up by the friend's
-        // user pubkey via the node that signed the invite), NOT a global default. A
-        // placement larger than that friend's grant is declined outright. A node
-        // with no friend record falls back to DEFAULT_QUOTA_BYTES defensively (S4
-        // already gates placement on friendship, so this should not be reached).
+        // W1: the storage quota is what THIS node granted the inviting friend at add-friend
+        // time, not a global default; a larger placement is declined. A node with no friend
+        // record falls back to DEFAULT_QUOTA_BYTES defensively (S4 already gates on friendship).
         let grant = {
             let s = self.shared.read().expect("shared lock");
             friend_storage_grant(&s, &inv.by, now)
@@ -1238,11 +1490,8 @@ impl ControlHandler {
         accept.sign(&self.node_key);
         write_msg(send, &accept).await?;
 
-        // The owner pushes the current owner-signed VaultAnnounce so this replica
-        // learns the replica set it belongs to (§7.4 b, W8). Verify it binds the
-        // inviting owner and this vault before trusting its member list. Option B (§4):
-        // no FileGrant follows - a recovering owner-device re-derives per-chunk keys
-        // from the manifest's pt_hash, so the replica retains only the announce.
+        // The owner pushes the current owner-signed VaultAnnounce so this replica learns its
+        // replica set (§7.4 b, W8). Verify it binds the inviting owner and this vault first.
         let announce = read_msg::<VaultAnnounce>(recv).await?;
         announce
             .verify()
@@ -1256,37 +1505,32 @@ impl ControlHandler {
             "replica announce signer is not the inviting owner"
         );
 
-        // Receive the pushed blobs: envelope first (verified), then each chunk.
-        // W1: cap the blob count and track the running received-byte total for this
-        // (peer, vid), aborting the moment it would exceed the advertised size
-        // (which is <= the granted quota). The store never grows past the quota.
+        // Receive the pushed blobs: envelope first (verified), then each chunk. W1: cap the
+        // blob count and abort the moment the running byte total would exceed the advertised
+        // size (<= the granted quota), so the store never grows past the quota.
         let count = read_u64(recv).await?;
         ensure!(
-            count <= MAX_REPLICA_BLOBS,
-            "replica push declared {count} blobs, over the cap of {MAX_REPLICA_BLOBS}"
+            count > 0 && count <= MAX_REPLICA_BLOBS,
+            "replica push declared invalid blob count {count}; valid range is 1..={MAX_REPLICA_BLOBS}"
         );
-        let mut received: u64 = 0;
-        // S3: do not pre-reserve `count` (peer-declared, up to MAX_REPLICA_BLOBS): a
-        // tiny push could force a ~32 MiB reservation. Grow as blobs arrive; the real
-        // bound is the `received <= inv.approx_bytes` byte cap below.
-        let mut stored: Vec<[u8; 32]> = Vec::new();
+        let mut stage =
+            ReplicaIngressStage::create(&self.replica_ingress, count, inv.approx_bytes, &announce)?;
         for i in 0..count {
-            let bytes = read_blob(recv).await?;
-            received = received.saturating_add(bytes.len() as u64);
+            stage.receive(recv, i).await?;
+        }
+        stage.finish()?;
+        // Hold through the durable replica-state commit. GC uses the same store guard, so it
+        // cannot remove these write-time tags before replica roots reach state.redb.
+        let _blob_mutation = self.blobs.begin_durable_mutation().await;
+        let mut stored: Vec<[u8; 32]> = Vec::new();
+        for (path, expected_hash) in stage.files() {
+            let bytes = std::fs::read(path)?;
+            let stored_hash = self.blobs.add(&bytes).await?;
             ensure!(
-                received <= inv.approx_bytes,
-                "replica push exceeded its advertised {} bytes",
-                inv.approx_bytes
+                stored_hash == *expected_hash,
+                "served blob hash changed after validation"
             );
-            if i == 0 {
-                let env = ManifestEnvelope::from_bytes(&bytes)
-                    .map_err(|e| anyhow::anyhow!("replica envelope decode: {e}"))?;
-                env.verify()
-                    .map_err(|e| anyhow::anyhow!("replica envelope bad sig: {e}"))?;
-            }
-            // The iroh blob hash is the ChunkID (and the envelope digest for i==0);
-            // record it so the fetch gate can bind it to this replica-held vault (W8).
-            stored.push(self.blobs.add(&bytes).await?);
+            stored.push(stored_hash);
         }
         // Durability barrier: force the FsStore to commit the received blobs so
         // the §3.2.3 ordering below is real — never persist replica bookkeeping
@@ -1318,14 +1562,9 @@ impl ControlHandler {
     }
 
     /// Trustee half of the §10.2 share-health cadence: answer an owner's
-    /// `ShareAttestChallenge` for a share this daemon holds. The challenge signer
-    /// must be an established friend (or our own device) AND the connection's
-    /// authenticated peer, so only the owning friend can probe liveness. The reply
-    /// echoes label fields only (`card_number` + nonce) via
-    /// [`carapace_recovery::answer_attest_challenge`] - never the share words. A
-    /// daemon holding no share for the named set, or holding a corrupt one,
-    /// finishes the stream with no attestation frame (a silent non-answer, which the
-    /// owner counts as "not live").
+    /// `ShareAttestChallenge`. The signer must be an established friend (or own device) AND
+    /// the authenticated peer. The reply echoes label fields only, never the share words; a
+    /// daemon holding no/corrupt share finishes with no frame (the owner counts "not live").
     async fn serve_attest(
         &self,
         ch: ShareAttestChallenge,
@@ -1336,8 +1575,7 @@ impl ControlHandler {
         ch.verify()
             .map_err(|e| anyhow::anyhow!("attest challenge bad sig: {e}"))?;
 
-        // Copy the share out under the read lock; answer (and await the write)
-        // outside it so no lock is held across `.await`.
+        // Copy the share out under the read lock; answer outside it (no lock across `.await`).
         let share = {
             let s = self.shared.read().expect("shared lock");
             let authorized =
@@ -1357,21 +1595,11 @@ impl ControlHandler {
         Ok(())
     }
 
-    /// Trustee half of grant delivery (§8, W3): receive a `ShareGrant` an owner
-    /// minted for us and, if it is authentic, store the FULL grant (roster +
-    /// recovery_delay + announce refs) keyed by its subject user - not a bare share,
-    /// which locates nothing without a live owner. Two independent checks must pass:
-    ///
-    /// - the grant's own signature verifies AND its embedded share decodes (the
-    ///   words' CRC self-validates), via [`verify_share_grant`]; and
-    /// - the connection's authenticated peer signed the grant (`grant.by == remote`)
-    ///   and is an established friend (or our own device) - so only a friend we chose
-    ///   as our owner can plant a grant on us (delegation gate, mirrors `serve_attest`).
-    ///
-    /// On success the embedded share is ALSO recorded in `held_shares` so the existing
-    /// attestation cadence + local self-validation keep working. A grant that fails
-    /// either check is dropped with no ack frame (a silent decline). The owner learns
-    /// delivery succeeded from the ack.
+    /// Trustee half of grant delivery (§8, W3): store an authentic `ShareGrant` in full
+    /// (roster + recovery_delay + announce refs) keyed by subject user. Two checks must pass:
+    /// the grant's signature + embedded share verify ([`verify_share_grant`]), and the
+    /// authenticated peer both signed it and is an established friend (or own device). The
+    /// share is also recorded in `held_shares`; a failing grant is dropped with no ack.
     async fn serve_grant(
         &self,
         grant: ShareGrant,
@@ -1379,8 +1607,7 @@ impl ControlHandler {
         send: &mut SendStream,
     ) -> Result<()> {
         let now = unix_now();
-        // Signature + embedded-share (CRC) verification. A tampered grant or a
-        // corrupt share is rejected here before anything is stored.
+        // Signature + embedded-share (CRC) verification, before anything is stored.
         let share = match verify_share_grant(&grant) {
             Ok(share) => share,
             Err(_) => {
@@ -1392,8 +1619,8 @@ impl ControlHandler {
 
         let stored = {
             let mut s = self.shared.write().expect("shared lock");
-            // Delegation gate: the owner node that signed the grant must be the
-            // connection's authenticated peer AND an established friend (or ours).
+            // Delegation gate: the grant signer must be the authenticated peer AND an
+            // established friend (or ours).
             let authorized =
                 grant.by == *remote && node_is_authorized(&s, &self.self_user, remote, now);
             if !authorized {
@@ -1401,19 +1628,16 @@ impl ControlHandler {
             } else {
                 let subject = grant.subject;
                 s.held_grants.insert(subject, grant);
-                // Keep the existing share self-validation + attestation-answer path
-                // working: the embedded share is the authoritative object the words
-                // carry. Preserve any existing monitor's cadence state.
+                // Also record the embedded share for self-validation + attestation, keeping
+                // any existing monitor's cadence.
                 s.held_shares
                     .entry(rsid)
                     .and_modify(|(sh, _)| *sh = share.clone())
                     .or_insert_with(|| (share.clone(), ShareMonitor::new()));
-                // Bind this rsid to its owner so an inbound ShareDestroy naming this
-                // rsid must also name this subject (§9.3 step 3c authorization).
+                // Bind this rsid to its owner so an inbound ShareDestroy must also name this
+                // subject (§9.3 step 3c authorization).
                 s.held_share_subjects.insert(rsid, subject);
-                // §3.2.3: commit the held share/grant BEFORE acking, so a crash can
-                // never ack a grant we did not durably store (the owner treats an
-                // un-acked grant as undelivered and re-delivers).
+                // Commit BEFORE acking, so a crash never acks a grant we did not durably store.
                 self.persist_locked(&s);
                 true
             }
@@ -1425,73 +1649,130 @@ impl ControlHandler {
         Ok(())
     }
 
-    /// Receive a `RecoveryOpen` (§8.5 step 2 fan-out AND the §8.5 step 5 claimant
-    /// share request - the same signed message serves both). Any dialer may relay an
-    /// open; only its self-signature is required to record the alarm, so the
-    /// anti-silent-takeover signal reaches the subject's own devices and friends
-    /// (which hold no grant). If we hold a grant for the subject we ALSO track the full
-    /// ceremony - deriving the roster as `{this trustee} ∪ the grant's co-trustees`
-    /// (the owner-minted grant is owner-signed and excludes the holder, so the ceremony
-    /// roster is reconstructed here, not from the grant signer) - and, once the gate is
-    /// open (we approved AND `≥ M` approvals AND the delay elapsed AND no abort), reply
-    /// with our share HPKE-sealed to `open.ceremony_enc`. No trustee ever sees another's
-    /// share, and nothing is ever sent unsealed.
-    ///
-    /// The delay clock is anchored to the LOCAL `first_seen` captured the first time we
-    /// track a ceremony id (never reset by a re-send), so a backdated sponsor
-    /// `opened_at` cannot collapse the abort window (spec-errata E4).
+    /// Receive a `RecoveryOpen` (§8.5 step-2 fan-out AND the step-5 claimant share request -
+    /// same signed message). Any dialer may relay one; its self-signature alone records the
+    /// alarm so the anti-silent-takeover signal reaches the subject's own devices/friends. If
+    /// we hold a grant for the subject we also track the full ceremony (roster = `{this
+    /// trustee} ∪ the grant's co-trustees`) and, once the gate is open (we approved AND `>= M`
+    /// approvals AND the delay elapsed AND no abort), reply with our share HPKE-sealed to
+    /// `open.ceremony_enc`. The delay clock anchors to a LOCAL `first_seen` never reset by a
+    /// re-send, so a backdated sponsor `opened_at` cannot collapse the abort window (E4).
     async fn serve_recovery_open(&self, open: RecoveryOpen, send: &mut SendStream) -> Result<()> {
-        if open.verify().is_err() {
+        if open.verify().is_err() || !ceremony_text_is_valid(&open) {
             send.finish()?; // an unsigned/forged open is neither an alarm nor trackable
             return Ok(());
+        }
+        // Authenticate a new trustee-tracked open against its held grant before it can
+        // consume the subject's inbound rate budget. Charge before alarm insertion, and
+        // do not charge a repeat request for a ceremony that is already tracked.
+        let inbound_rate_subject = {
+            let s = self.shared.read().expect("shared lock");
+            if s.ceremonies.contains_key(&open.ceremony_id)
+                || s.ceremony_tombstones.contains_key(&open.ceremony_id)
+            {
+                None
+            } else {
+                let now = ceremony_now(&s);
+                s.held_grants.get(&open.subject).and_then(|grant| {
+                    validated_recovery_open(&self.self_user, &open, grant, now)
+                        .ok()
+                        .map(|_| (open.subject, now))
+                })
+            }
+        };
+        if let Some((subject, now)) = inbound_rate_subject {
+            let accepted = self
+                .recovery_limiter
+                .lock()
+                .expect("recovery limiter lock")
+                .check_and_record(subject, now)
+                .is_ok();
+            if !accepted {
+                let mut s = self.shared.write().expect("shared lock");
+                if finish_ceremony(
+                    &mut s,
+                    open.ceremony_id,
+                    open.subject,
+                    open.by,
+                    now,
+                    CeremonyTerminal::Rejected,
+                ) {
+                    self.persist_locked(&s);
+                }
+                send.finish()?;
+                return Ok(());
+            }
         }
         let mut share_to_send: Option<CeremonyShare> = None;
         {
             let mut s = self.shared.write().expect("shared lock");
             let now = ceremony_now(&s);
+            if s.ceremony_tombstones.contains_key(&open.ceremony_id) {
+                drop(s);
+                send.finish()?;
+                return Ok(());
+            }
             let is_self = open.subject == self.self_user;
-            // Does the SPONSOR (the RecoveryOpen signer) qualify for a durable alarm?
-            // Mirrors persist::enc_alarms's C1 bound (a stranger's alarm stays RAM-only),
-            // and gates whether a stranger's open may force a full-state redb commit at
-            // all: without it an unauthenticated dialer spraying fresh ceremony ids would
-            // fsync the whole state per dial (I/O-amplification DoS). The subject is NOT a
-            // qualifier - it is public, so an attacker would just set it to our pubkey.
-            let sponsor_qualifies = s.held_grants.contains_key(&open.by)
-                || s.friends.contains_key(&open.by)
-                || self
-                    .docs
-                    .lock()
-                    .expect("docs lock")
-                    .card(&open.by)
-                    .is_some();
-            // Track whether anything DURABLE actually changed, so a no-op open (a re-send,
-            // or a stranger's open we neither alarm-persist nor track) skips the commit.
+            // Does the SPONSOR qualify for a durable alarm? Mirrors persist::enc_alarms's
+            // bound and gates whether a stranger's open may force a full-state commit at all
+            // (else an unauthenticated dialer spraying ceremony ids fsyncs per dial). The
+            // subject is NOT a qualifier - it is public, so an attacker would set it to us.
+            let sponsor_qualifies = open.by == self.self_user
+                || signer_qualifies(
+                    &open.by,
+                    &s.held_grants,
+                    &s.friends,
+                    &self.docs.lock().expect("docs lock"),
+                );
+            if !sponsor_qualifies {
+                drop(s);
+                send.finish()?;
+                return Ok(());
+            }
+            // Track whether anything DURABLE changed, so a no-op open skips the commit.
             let mut dirty = false;
-            // Alarm for every observer, deduped by ceremony id (a re-send never clears
-            // an abort flag). This is what /api/status surfaces. Only a qualifying-sponsor
-            // alarm is durable (enc_alarms filters the rest), so only that is `dirty`.
-            let alarm_new = !s.ceremony_alarms.contains_key(&open.ceremony_id);
-            s.ceremony_alarms
-                .entry(open.ceremony_id)
-                .or_insert_with(|| AlarmRecord {
-                    subject: open.subject,
-                    sponsor: open.by,
-                    claimant_display: open.claimant_display.clone(),
-                    reason: open.reason.clone(),
-                    is_self_subject: is_self,
-                    aborted: false,
-                    takeover: false,
-                });
-            if alarm_new && sponsor_qualifies {
+            let is_new = !s.ceremonies.contains_key(&open.ceremony_id)
+                && !s.ceremony_alarms.contains_key(&open.ceremony_id);
+            if is_new {
+                if admit_new_ceremony(&mut s, open.subject, open.by, now).is_err() {
+                    if finish_ceremony(
+                        &mut s,
+                        open.ceremony_id,
+                        open.subject,
+                        open.by,
+                        now,
+                        CeremonyTerminal::Rejected,
+                    ) {
+                        self.persist_locked(&s);
+                    }
+                    drop(s);
+                    send.finish()?;
+                    return Ok(());
+                }
                 dirty = true;
             }
-            // A subject-signed abort may have arrived BEFORE this open (fan-out has no
-            // ordering, and the same open is re-sent as the claimant's later share
-            // request). It is authoritative iff its signer is THIS open's subject - only
-            // now, with the open in hand, can we resolve the subject to apply the
-            // `by == subject` check. Apply it so the ceremony can NEVER release, mirroring
-            // the normal open-then-abort path (§8.5 step 3). A stranger's stored abort
-            // fails the subject check and stays inert.
+            // Alarm for every observer, deduped by ceremony id. Only a qualifying-sponsor
+            // alarm is durable (enc_alarms filters the rest), so only that sets `dirty`.
+            let alarm_new = !s.ceremony_alarms.contains_key(&open.ceremony_id)
+                && s.ceremony_alarms.len() < MAX_CEREMONY_RECORDS;
+            if alarm_new {
+                s.ceremony_alarms.insert(
+                    open.ceremony_id,
+                    AlarmRecord {
+                        subject: open.subject,
+                        sponsor: open.by,
+                        claimant_display: open.claimant_display.clone(),
+                        reason: open.reason.clone(),
+                        is_self_subject: is_self,
+                        aborted: false,
+                        takeover: false,
+                    },
+                );
+                dirty = true;
+            }
+            // A subject-signed abort may have arrived BEFORE this open (unordered fan-out).
+            // It is authoritative iff its signer is THIS open's subject - resolvable only now.
+            // Apply it so the ceremony can NEVER release; a stranger's abort stays inert.
             let subject_abort = s
                 .aborted_ceremonies
                 .get(&open.ceremony_id)
@@ -1508,19 +1789,23 @@ impl ControlHandler {
             }
             // Trustee role: track (once) and, if the gate is open, seal our share.
             if let Some(grant) = s.held_grants.get(&open.subject).cloned() {
-                // Track once, anchoring `first_seen` at the first observation - a re-send
-                // (or the claimant's later share request) never resets it (E4).
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    s.ceremonies.entry(open.ceremony_id)
-                {
-                    if let Ok(state) = track_from_grant(&self.self_user, &open, &grant, now) {
-                        e.insert(TrackedCeremony {
-                            state,
-                            approved: false,
-                            takeover: false,
-                        });
-                        // A tracked ceremony (persisted, the E4 delay anchor) was created.
-                        dirty = true;
+                // Track once, anchoring `first_seen` at first observation; a re-send never
+                // resets it (E4).
+                if s.ceremonies.len() < MAX_CEREMONY_RECORDS {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        s.ceremonies.entry(open.ceremony_id)
+                    {
+                        if let Ok(state) =
+                            validated_recovery_open(&self.self_user, &open, &grant, now)
+                        {
+                            e.insert(TrackedCeremony {
+                                state,
+                                approved: false,
+                                takeover: false,
+                            });
+                            // A tracked ceremony (persisted, the E4 delay anchor) was created.
+                            dirty = true;
+                        }
                     }
                 }
                 // Fold in an abort that beat the open: cancel the freshly (or previously)
@@ -1534,9 +1819,13 @@ impl ControlHandler {
                     }
                 }
                 if let Some(tc) = s.ceremonies.get(&open.ceremony_id) {
-                    if tc.approved && !tc.takeover && tc.state.can_release(now) {
-                        // Seal to the claimant's fresh ceremony key, signed with our
-                        // USER key so the claimant authenticates us against the roster.
+                    if tc.approved
+                        && !tc.takeover
+                        && !ceremony_is_expired(tc, now)
+                        && tc.state.can_release(now)
+                    {
+                        // Seal to the claimant's ceremony key, signed with our USER key so the
+                        // claimant authenticates us against the roster.
                         if let Ok(cs) = build_ceremony_share(
                             &self.user_key,
                             open.ceremony_id,
@@ -1548,12 +1837,17 @@ impl ControlHandler {
                     }
                 }
             }
-            // §3.2.3 / §8.5: commit the ceremony tracking (the E4 `first_seen` delay
-            // anchor, the alarm, and any beat-the-open abort/takeover flag) BEFORE
-            // sending our share, so a reboot cannot forget an abort and later re-track a
-            // fresh, non-aborted ceremony that releases at delay-expiry. Skipped when the
-            // open changed nothing durable (a re-send, or a stranger's RAM-only alarm) so
-            // an unauthenticated dialer cannot force a commit per dial (audit #3).
+            if share_to_send.is_some()
+                && s.ceremony_released
+                    .insert(open.ceremony_id, open.new_node)
+                    .is_none()
+            {
+                dirty = true;
+            }
+            // Commit the ceremony tracking (E4 `first_seen` anchor, alarm, beat-the-open
+            // abort/takeover flag) BEFORE sending our share, so a reboot cannot forget an
+            // abort and re-track a fresh ceremony that releases at delay-expiry. Skipped on a
+            // no-op open so an unauthenticated dialer cannot force a commit per dial.
             if dirty {
                 self.persist_locked(&s);
             }
@@ -1581,8 +1875,7 @@ impl ControlHandler {
                 None => false,
             };
             if approved {
-                // Persist the folded-in co-trustee approval so the release gate's
-                // approval count survives a reboot mid-ceremony (§8.5).
+                // Persist the approval so the release gate's count survives a reboot mid-ceremony.
                 self.persist_locked(&s);
             }
         }
@@ -1590,54 +1883,85 @@ impl ControlHandler {
         Ok(())
     }
 
-    /// Receive a `CeremonyAbort` (§8.5 step 3). `state.abort` enforces `ab.by ==
-    /// subject` (authoritative, unforgeable by an impostor): a valid subject abort
-    /// cancels the ceremony permanently and this device flags it as an attempted
-    /// takeover, so no share ever releases afterward. Also flags the alarm record so an
-    /// alarm-only observer (a subject device / friend holding no grant) still shows it.
+    /// Receive a `CeremonyAbort` (§8.5 step 3). `state.abort` enforces `ab.by == subject`: a
+    /// valid subject abort cancels the ceremony permanently and flags an attempted takeover,
+    /// so no share releases afterward. Also flags the alarm for alarm-only observers.
     async fn serve_ceremony_abort(&self, ab: CeremonyAbort, send: &mut SendStream) -> Result<()> {
         if ab.verify().is_ok() {
             let mut s = self.shared.write().expect("shared lock");
-            // Record every signature-valid abort keyed by ceremony id, EVEN IF nothing is
-            // tracked yet: fan-out has no ordering, so this abort may precede our own
-            // `RecoveryOpen`. `serve_recovery_open` consults this before any release and
-            // decides authority (by == subject) once the open supplies the subject. A
-            // stranger's abort is kept but is inert there. Dedup by signer so a griefing
-            // stranger cannot crowd out the authoritative subject abort. (§8.5 step 3.)
-            let seen = s.aborted_ceremonies.entry(ab.ceremony_id).or_default();
-            if !seen.iter().any(|a| a.by == ab.by) {
-                seen.push(ab.clone());
+            let signer_qualifies = ab.by == self.self_user
+                || signer_qualifies(
+                    &ab.by,
+                    &s.held_grants,
+                    &s.friends,
+                    &self.docs.lock().expect("docs lock"),
+                );
+            if !signer_qualifies {
+                drop(s);
+                send.finish()?;
+                return Ok(());
+            }
+            let mut dirty = false;
+            let mut terminal_abort = None;
+            // Record every signature-valid abort keyed by ceremony id even if nothing is
+            // tracked yet (unordered fan-out may deliver it before our `RecoveryOpen`);
+            // `serve_recovery_open` decides authority (by == subject) later. Dedup by signer so
+            // a griefing stranger cannot crowd out the authoritative subject abort.
+            let can_add_record = s.aborted_ceremonies.contains_key(&ab.ceremony_id)
+                || s.aborted_ceremonies.len() < MAX_CEREMONY_RECORDS;
+            if can_add_record {
+                let seen = s.aborted_ceremonies.entry(ab.ceremony_id).or_default();
+                if seen.len() < MAX_ABORTS_PER_CEREMONY && !seen.iter().any(|a| a.by == ab.by) {
+                    seen.push(ab.clone());
+                    dirty = true;
+                }
             }
             if let Some(tc) = s.ceremonies.get_mut(&ab.ceremony_id) {
-                if tc.state.abort(&ab).is_ok() {
+                if !tc.takeover && tc.state.abort(&ab).is_ok() {
                     tc.takeover = true;
+                    dirty = true;
+                    terminal_abort = Some(tc.state.subject);
                 }
             }
             if let Some(al) = s.ceremony_alarms.get_mut(&ab.ceremony_id) {
-                if ab.by == al.subject {
+                if ab.by == al.subject && (!al.aborted || !al.takeover) {
                     al.aborted = true;
                     al.takeover = true;
+                    dirty = true;
                 }
             }
-            // §8.5 abort durability: persist the recorded abort (bounded to qualifying
-            // signers, C1) + any takeover flag BEFORE finishing, so the abort still blocks
-            // a release after a reboot - even if it arrived before our own RecoveryOpen.
-            self.persist_locked(&s);
+            if let Some(subject) = terminal_abort {
+                let sponsor = s
+                    .ceremony_alarms
+                    .get(&ab.ceremony_id)
+                    .map_or(ab.by, |alarm| alarm.sponsor);
+                let now = ceremony_now(&s);
+                finish_ceremony(
+                    &mut s,
+                    ab.ceremony_id,
+                    subject,
+                    sponsor,
+                    now,
+                    CeremonyTerminal::Aborted,
+                );
+                dirty = true;
+            }
+            // Persist the recorded abort (bounded to qualifying signers) + takeover flag
+            // BEFORE finishing, so it still blocks a release after a reboot.
+            if dirty {
+                self.persist_locked(&s);
+            }
         }
         send.finish()?;
         Ok(())
     }
 
-    /// Receive a `FriendshipEnd` (§9.3): the ex-friend terminated unilaterally. Verify
-    /// it, resolve the ex-friend from the signer node (a node one of our friends'
-    /// cards delegates), and run the LOCAL unfriend teardown - drop them from the
-    /// friend graph, delete everything we hold OF them, queue their replicas of our
-    /// vaults for immediate re-placement, and mark a pending re-split for every
-    /// recovery set they were a trustee of. The network follow-through (re-placement +
-    /// re-split prompt + our own reciprocal `DeleteRequest`s) is driven by the maintenance
-    /// loop, which holds `k_root` and an endpoint. We do NOT echo a `FriendshipEnd` back
-    /// (that would loop); we DO queue our own `DeleteRequest`s for everything WE placed on
-    /// them (§9.3.1: each side deletes what it placed on the other), sent from the loop.
+    /// Receive a `FriendshipEnd` (§9.3): the ex-friend terminated unilaterally. Verify,
+    /// resolve the ex-friend from the signer node, and run the LOCAL unfriend teardown (drop
+    /// from the friend graph, delete everything we hold OF them, queue their replicas of our
+    /// vaults for re-placement, mark a pending re-split per recovery set they were a trustee
+    /// of). The network follow-through is driven by the maintenance loop. We do NOT echo a
+    /// `FriendshipEnd` back (that would loop) but DO queue our own reciprocal `DeleteRequest`s.
     async fn serve_friendship_end(
         &self,
         end: FriendshipEnd,
@@ -1703,8 +2027,8 @@ impl ControlHandler {
             match owner {
                 Some(owner_user) => {
                     apply_delete_request(&mut s, &req, &owner_user);
-                    // §3.2.3: commit the deletion of the owner's replica data BEFORE
-                    // acking, so a crash cannot ack a delete we did not durably apply.
+                    // Commit the deletion BEFORE acking, so a crash cannot ack a delete we
+                    // did not durably apply.
                     self.persist_locked(&s);
                     Some(build_delete_ack(&self.node_key, &req, now))
                 }
@@ -1720,14 +2044,11 @@ impl ControlHandler {
         Ok(())
     }
 
-    /// Trustee half of the re-split destroy step (§9.3 step 3c): the owner instructs us
-    /// to destroy the OLD share we hold for `subject`'s old recovery set. Verify the
-    /// instruction, require the signer to be an established friend (or self) AND the
-    /// connection's peer, and only if we actually HOLD that old share destroy it and
-    /// reply with a signed [`ShareDestroyAck`]. A newer re-split grant may have already
-    /// overwritten our held grant for this subject with the NEW set - we keep that and
-    /// only drop the grant if it still points at the old recovery set. We never ack a
-    /// share we do not hold (an honest destroy is the whole point of the step).
+    /// Trustee half of the re-split destroy step (§9.3 step 3c): the owner instructs us to
+    /// destroy the OLD share for `subject`'s old recovery set. Verify, require the signer to
+    /// be an established friend (or self) AND the peer, and only if we HOLD that old share
+    /// destroy it and reply with a signed [`ShareDestroyAck`]. A newer re-split grant for the
+    /// NEW set survives: the grant is dropped only if it still points at the old set.
     async fn serve_share_destroy(
         &self,
         ds: ShareDestroy,
@@ -1738,17 +2059,15 @@ impl ControlHandler {
         let ack = if ds.verify().is_ok() {
             let mut s = self.shared.write().expect("shared lock");
             // Bind the destroyer to the subject: the signer node must map to the SUBJECT
-            // owner (not merely to some current friend), AND the rsid it names must be one
-            // we actually hold FOR that subject. Without both, any current friend could
-            // destroy an unrelated owner's share by naming its rsid (held_shares is keyed
-            // by rsid alone). Mirrors serve_delete_request's owner-binding pattern.
+            // owner, AND the rsid it names must be one we hold FOR that subject. Without both,
+            // any friend could destroy an unrelated owner's share by naming its rsid.
             let authorized = ds.by == *remote
                 && owner_user_of_node(&s, &self.self_user, &ds.by, now) == Some(ds.subject)
                 && s.held_share_subjects.get(&ds.rsid) == Some(&ds.subject);
             if authorized && s.held_shares.remove(&ds.rsid).is_some() {
                 s.held_share_subjects.remove(&ds.rsid);
-                // Drop the held grant only if it still names the old set; a re-split
-                // grant for the NEW set (same subject) must survive the old destroy.
+                // Drop the held grant only if it still names the old set; a NEW-set re-split
+                // grant (same subject) must survive.
                 let drop_grant = s
                     .held_grants
                     .get(&ds.subject)
@@ -1757,9 +2076,8 @@ impl ControlHandler {
                 if drop_grant {
                     s.held_grants.remove(&ds.subject);
                 }
-                // §3.2.3 + §9.3 stranding: commit the share REMOVAL BEFORE acking, so a
-                // crash cannot resurrect a "destroyed" share whose ack the owner already
-                // counted (which would leave the old set live past a re-split).
+                // Commit the share REMOVAL BEFORE acking, so a crash cannot resurrect a
+                // "destroyed" share whose ack the owner already counted.
                 self.persist_locked(&s);
                 Some(build_share_destroy_ack(
                     &self.node_key,
@@ -1805,61 +2123,42 @@ pub struct Daemon {
     node_key: SigningKey,
     user_key: SigningKey,
     k_root: Zeroizing<[u8; 32]>,
-    /// Persistent per-signer document rollback state (cards by version, announces
-    /// by epoch), kept across `sync_from` calls for the daemon's lifetime so a
-    /// stale replica cannot roll an already-seen epoch back (W2). Held only for
-    /// synchronous verification work; never locked across an `.await`.
-    ///
-    /// ponytail: in-memory, daemon-lifetime state. The blob store is also
-    /// in-memory, so nothing survives a restart anyway; persist to disk here and
-    /// in the blob store together if durable rollback across restarts is needed.
+    /// Per-signer document rollback state (cards by version, announces by epoch), kept for
+    /// the daemon's lifetime so a stale replica cannot roll an already-seen epoch back (W2).
+    /// Held only for synchronous verification; never locked across an `.await`.
     docs: Arc<Mutex<DocStore>>,
-    /// Per-vault publish serialization (§11 / MAJOR 5). A vault's whole publish -
-    /// read-prev, ingest, commit - runs under its own async lock so the watcher's
-    /// background `publish_vault` and a sync's `publish_merged`/baseline-persist can
-    /// never interleave on the same vid (no lost update, no two digests at one
-    /// epoch, no re-ingest of a half-written merged tree). The outer `Mutex` only
-    /// guards the get-or-insert of the per-vid lock; it is never held across an
-    /// `.await`. ponytail: grows one entry per distinct owned/synced vid over the
-    /// daemon's life; prune alongside vault teardown if that is ever added.
+    /// Per-vault publish serialization (§11): a vault's whole publish (read-prev, ingest,
+    /// commit) runs under its own async lock so the watcher's `publish_vault` and a sync's
+    /// `publish_merged` never interleave on the same vid. The outer `Mutex` only guards the
+    /// get-or-insert of the per-vid lock and is never held across an `.await`.
     publish_locks: Mutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
-    /// Per-subject recovery-open rate limiter (§8.5): a forged/abusive `RecoveryOpen`
-    /// cannot exhaust an honest subject's budget. Single long-lived limiter guarded by
-    /// its own mutex so `ceremony_open` can charge it without touching `shared`.
-    recovery_limiter: Mutex<RecoveryRateLimiter>,
-    /// Serializes §9.3 re-split stand-up + drive so the initiating `unfriend` and the
-    /// maintenance loop never advance the same re-split concurrently. Without it, two
-    /// concurrent `advance_resplits` runs can each see the same `old_rsid` as pending and
-    /// both call `begin_resplit` -> two independent fresh splits (two new recovery-set ids,
-    /// two grant sets), of which only the first is kept - burning an rsid + a Shamir split
-    /// per race. ponytail: one global re-split lock; split per-rsid only if re-split
-    /// throughput ever matters (it is a rare unfriend-triggered path).
+    /// Ephemeral watcher/sync observations; authoritative paths remain in Shared.
+    live_state: Mutex<HashMap<[u8; 32], live_sync::LiveState>>,
+    peer_sync_errors: Mutex<HashMap<[u8; 32], String>>,
+    ingest_limit: Arc<tokio::sync::Semaphore>,
+    /// Serializes unfriend and maintenance re-split progress.
     resplit_lock: tokio::sync::Mutex<()>,
-    /// The embedded relay server (§6), held to keep it running for the daemon's
-    /// life. `Some` iff this node runs a relay. Its liveness is probed each
-    /// maintenance round to drive the advertise/withdraw lifecycle (W6); its mapped
-    /// WAN address (when the NAT port-mapper resolves one) is what friends advertise.
+    /// Bounded, identity-free operational history. It never contains error text.
+    operational_history: Mutex<OperationalHistory>,
+    /// The embedded relay server (§6), held to keep it running. `Some` iff this node runs a
+    /// relay. Probed each maintenance round to drive the advertise/withdraw lifecycle (W6).
     relay: Option<CarapaceRelay>,
-    /// Public DNS name / WAN address to advertise for the relay instead of its
-    /// mapped/bound address (§6), from [`NetConfig::relay_host`]. Preferred over the
-    /// port-mapper's external address when set (an operator's stable DDNS name).
+    /// Public DNS name / WAN address to advertise for the relay instead of its mapped/bound
+    /// address (§6), from [`NetConfig::relay_host`]. Preferred over the port-mapper's address.
     relay_host: Option<String>,
-    /// The durable state directory (design §3): holds `blobs/` (FsStore) and
-    /// `state.redb`. Retained so background/reboot paths can locate durable state.
+    /// The durable state directory: holds `blobs/` (FsStore) and `state.redb`.
     state_dir: PathBuf,
-    /// The redb source of truth on disk (design §3.2). Every compound mutation funnels
-    /// the WHOLE `Shared` + `DocStore` back through [`persist::persist_all`] into one txn
-    /// and commits BEFORE any externally visible effect. Wrapped in `Arc` so background
-    /// tasks persist without borrowing `self`.
+    /// The redb source of truth on disk. Every compound mutation funnels the whole `Shared` +
+    /// `DocStore` back through [`persist::persist_all`] in one txn, committed before any
+    /// externally visible effect. `Arc` so background tasks persist without borrowing `self`.
     db: Arc<redb::Database>,
-    /// Cleanup guard for a `from_seeds` daemon's process-unique ephemeral state dir:
-    /// `Some` only when `State::dir` was `None`. Removes the whole tree on drop so a
-    /// seed-only test daemon leaves nothing behind.
+    persist_count: Arc<AtomicU64>,
+    /// Cleanup guard for a `from_seeds` daemon's ephemeral state dir: `Some` only when
+    /// `State::dir` was `None`. Removes the tree on drop.
     _ephemeral_dir: Option<EphemeralDir>,
     /// The iroh protocol router serving `iroh_blobs::ALPN` (gated blob reads) and
-    /// `carapace/1`. Held for the daemon's lifetime; [`Daemon::shutdown`] shuts it
-    /// down FIRST, which runs `BlobsProtocol::shutdown` → a clean FsStore shutdown
-    /// (commits the store's open write batch — see `IrohBlobStore::sync`).
+    /// `carapace/1`. [`Daemon::shutdown`] shuts it down FIRST, which runs a clean FsStore
+    /// shutdown (commits the store's open write batch).
     router: Router,
 }
 
@@ -1886,46 +2185,34 @@ fn ephemeral_state_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Handle for a live §11 filesystem watcher started by [`Daemon::watch_vault`].
-///
-/// Keep it alive to keep watching; drop it to stop. Drop halts the underlying
-/// `notify` watcher (closing the event channel) and aborts the debounce/re-ingest
-/// task, so shutdown is clean and cancel-safe (no lock is held across an `.await`
-/// in that task).
+/// Handle for a live §11 filesystem watcher started by [`Daemon::watch_vault`]. Keep it
+/// alive to keep watching; drop it to stop the `notify` watcher and re-ingest task.
 pub struct VaultWatcher {
-    // Field order matters for Drop: the notify watcher is dropped first (below via
-    // the generated Drop glue after our explicit `drop` impl runs), closing the
-    // event channel. Held to keep fs events flowing while the handle lives.
+    // Field order matters for Drop: the notify watcher is dropped after our explicit `drop`
+    // runs, closing the event channel.
     _watcher: notify::RecommendedWatcher,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for VaultWatcher {
     fn drop(&mut self) {
-        // Abort the re-ingest task; dropping `_watcher` afterwards closes the
-        // channel. Abort is safe here: publish_vault holds the `shared` lock only
-        // for synchronous critical sections, never across an `.await`.
+        // Abort the re-ingest task; dropping `_watcher` afterwards closes the channel. Safe:
+        // publish_vault holds the `shared` lock only synchronously, never across `.await`.
         self.task.abort();
     }
 }
 
-/// Handle for the background maintenance loop started by [`Daemon::run_maintenance`]
-/// (§10.1/§10.2). Keep it alive to keep the loop running; drop it (or call
-/// [`MaintenanceHandle::stop`]) to tear the loop down.
-///
-/// The loop task holds only a [`Weak`] to the daemon and upgrades it per round, so it
-/// never keeps the daemon alive: once the last `Arc<Daemon>` is dropped the loop ends
-/// on its own. Drop aborts the task; this is cancel-safe because every maintenance
-/// action releases its locks before each `.await` (no lock is held across a network
-/// round-trip), so an abort mid-round only drops an in-flight future.
+/// Handle for the background maintenance loop started by [`Daemon::run_maintenance`]. Keep
+/// it alive to keep the loop running; drop it (or [`MaintenanceHandle::stop`]) to tear it
+/// down. The loop holds only a [`Weak`] to the daemon, so the last `Arc<Daemon>` drop ends
+/// it; abort is cancel-safe (no lock held across an `.await`).
 pub struct MaintenanceHandle {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MaintenanceHandle {
-    /// Stop the loop and await its full teardown, so the caller can then reclaim the
-    /// sole `Arc<Daemon>` (e.g. `Arc::try_unwrap` + [`Daemon::shutdown`]) with no
-    /// lingering strong reference held by an in-flight round.
+    /// Stop the loop and await its teardown, so the caller can reclaim the sole `Arc<Daemon>`
+    /// with no strong reference held by an in-flight round.
     pub async fn stop(mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -1963,35 +2250,37 @@ impl Daemon {
         Ok(manifest)
     }
 
-    /// Persist the WHOLE `Shared` + `DocStore` in one redb txn and commit it (design
-    /// §3.2). The caller MUST already hold the `shared` write lock and pass the guard so
-    /// the RAM mutation and the durable write share one critical section (§3.2.4). A
-    /// commit failure CRASHES the daemon (§3.2.5 fail-loud: never continue with RAM ahead
-    /// of disk). Commit happens BEFORE any externally visible effect at every call site
-    /// (§3.2.3). `docs` is locked internally (lock order: `shared` then `docs`).
+    /// Persist the whole `Shared` + `DocStore` in one redb txn and commit. Caller holds the
+    /// `shared` write lock; commit is fail-loud (crashes on failure) and happens before any
+    /// externally visible effect. `docs` is locked internally (order: `shared` then `docs`).
     fn persist_locked(&self, s: &Shared) {
         let docs = self.docs.lock().expect("docs lock");
         self.persist_locked_with(s, &docs);
     }
 
-    /// As [`persist_locked`] but for a caller that already holds the `docs` lock too
-    /// (e.g. a control handler that just mutated the `DocStore`), preserving the single
-    /// `shared`->`docs` lock order.
+    /// As [`persist_locked`] but for a caller that already holds the `docs` lock too,
+    /// preserving the `shared`->`docs` lock order.
     fn persist_locked_with(&self, s: &Shared, docs: &DocStore) {
-        persist::commit_all(&self.db, s, docs, &self.k_root);
+        persist::commit_all(
+            &self.db,
+            s,
+            docs,
+            &self.k_root,
+            &persist::StateIdentity {
+                user: self.user_id(),
+                node: self.node_id(),
+            },
+        );
+        self.persist_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Bind the endpoint from `state`, start serving the blob store and the
-    /// `carapace/1` control protocol, and publish this device's `ContactCard`
-    /// (with a user-signed delegation of the node key). Uses the default
-    /// [`ReplicaLimits`]; see [`Daemon::start_with_limits`] to tune them.
+    /// Bind the endpoint from `state`, start serving the blob store and the `carapace/1`
+    /// control protocol, and publish this device's `ContactCard`. Default [`ReplicaLimits`].
     pub async fn start(state: State) -> Result<Self> {
         Self::start_with_limits(state, ReplicaLimits::default()).await
     }
 
-    /// Like [`Daemon::start`] but with explicit replica-store limits (W1). Tests
-    /// use this to set a small quota or a tight rate limit and exercise the
-    /// cut-offs without pushing gigabytes.
+    /// Like [`Daemon::start`] but with explicit replica-store limits (W1), for tests.
     pub async fn start_with_limits(state: State, limits: ReplicaLimits) -> Result<Self> {
         Self::start_on(
             state,
@@ -2007,11 +2296,8 @@ impl Daemon {
         .await
     }
 
-    /// Like [`Daemon::start_with_limits`] but with full network wiring
-    /// ([`NetConfig`]): a caller-chosen bind, friends' self-hosted relays to
-    /// consume, and optionally running this node's own embedded relay (§6). A node
-    /// that runs a relay advertises its URL in its ContactCard and issued tickets
-    /// and registers on it so friends can reach it via relay fallback.
+    /// Like [`Daemon::start_with_limits`] but with full network wiring ([`NetConfig`]):
+    /// caller-chosen bind, friends' relays to consume, and optionally an embedded relay (§6).
     pub async fn start_on(state: State, limits: ReplicaLimits, cfg: NetConfig) -> Result<Self> {
         let node_key = state.node_key.clone();
         let user_key = state.user_key();
@@ -2020,8 +2306,8 @@ impl Daemon {
         let self_user = user_key.verifying_key().to_bytes();
         let self_node = node_key.verifying_key().to_bytes();
 
-        // Resolve the durable state directory (design §3). A `from_seeds` daemon has
-        // none, so allocate a process-unique ephemeral dir guarded for cleanup on drop.
+        // Resolve the durable state directory. A `from_seeds` daemon has none, so allocate an
+        // ephemeral dir guarded for cleanup on drop.
         let (state_dir, ephemeral_dir) = match state.dir.clone() {
             Some(d) => (d, None),
             None => {
@@ -2033,6 +2319,7 @@ impl Daemon {
         // Open the durable state (design §3.2/§3.5): the redb source of truth on disk.
         // Startup order is strict - load BEFORE the router accepts, or a peer could
         // replay a card against an empty store and legitimize it (§3.5).
+        state::ensure_private_directory(&state_dir)?;
         let db_path = state_dir.join("state.redb");
         // Tripwire (§3.5/req 10): state.redb absent beside a SURVIVING durable artifact -
         // served blobs OR the identity keys (`root.key`/`node.key`). The keys arm catches
@@ -2043,17 +2330,19 @@ impl Daemon {
         // to avoid a false positive on a genuine first run.
         let survivor_present = state_dir.join("blobs").exists()
             || state_dir.join("root.key").exists()
-            || state_dir.join("node.key").exists();
+            || state_dir.join("node.key").exists()
+            || state_dir.join("credential.id").exists();
         if !persist::db_exists(&db_path) && survivor_present && !keys_freshly_generated {
-            eprintln!(
-                "carapace: WARNING durable artifacts (blobs/ or identity keys) present but \
-                 {db_path:?} is absent - starting with EMPTY durable state (rollback/abort/PoR \
-                 history and the fetch gate are reset). If this is not a fresh install, restore \
-                 state.redb before serving."
+            anyhow::bail!(
+                "durable artifacts exist but {db_path:?} is absent; restore state.redb or use an explicit operator recovery command"
             );
         }
         let db = Arc::new(persist::open_db(&db_path)?);
-        let loaded = persist::load_all(&db, &k_root)?;
+        let identity = persist::StateIdentity {
+            user: self_user,
+            node: self_node,
+        };
+        let loaded = persist::load_all(&db, &k_root, &identity)?;
         let card_version_floor = loaded.card_version;
         let vault_blob_sources = loaded.vault_blob_sources;
 
@@ -2081,12 +2370,9 @@ impl Daemon {
             }
             None => None,
         };
-        // The URL our OWN endpoint registers on and reaches the relay at
-        // (loopback-substituted, so it works without NAT hairpinning). This is NOT
-        // the WAN URL we advertise to friends: that is computed per health round
-        // from the relay host / mapped external address (W6). Keeping registration
-        // on the local URL guarantees our endpoint stays a client of its own relay,
-        // which is what lets friends relay *to* us.
+        // The URL our OWN endpoint registers on and reaches the relay at (loopback-
+        // substituted). NOT the WAN URL advertised to friends (computed per health round);
+        // registering on the local URL keeps our endpoint a client of its own relay.
         let local_relay_url = relay.as_ref().map(|r| r.local_url());
 
         // The endpoint's usable relay set: friends' relays plus our own local URL
@@ -2100,7 +2386,7 @@ impl Daemon {
 
         // Default bind: loopback for a plain in-process node, but all-interfaces
         // once relays are in play so the portmapper can open our port.
-        let bind = cfg.bind.unwrap_or_else(|| {
+        let mut bind = cfg.bind.unwrap_or_else(|| {
             if relay.is_some() || !relays.is_empty() {
                 std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
             } else {
@@ -2108,37 +2394,61 @@ impl Daemon {
             }
         });
 
-        let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await?;
-        // Durable served blob store (design §3.1): FsStore at `<state_dir>/blobs`,
-        // surviving restart. Blobs are already ciphertext, so no extra sealing.
-        let blobs = IrohBlobStore::load(&state_dir.join("blobs")).await?;
+        // MemoryLookup has no external discovery: both peers must retain their
+        // advertised port when they restart. Port zero chooses once per state dir.
+        let peer_port_path = state_dir.join("peer-port");
+        let mut save_peer_port = false;
+        if bind.port() == 0 {
+            match std::fs::read_to_string(&peer_port_path) {
+                Ok(port) => {
+                    let port: std::num::NonZeroU16 = port.trim().parse().with_context(|| {
+                        format!("invalid peer port in {}", peer_port_path.display())
+                    })?;
+                    bind.set_port(port.get());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => save_peer_port = true,
+                Err(e) => return Err(e).context("read persisted peer port"),
+            }
+        }
+        let ep = CarapaceEndpoint::bind_on(&node_key, bind, &relays).await
+            .with_context(|| format!("bind peer address {bind}; if the port is occupied, free it or choose an explicit --bind address and update peer cards"))?;
+        if save_peer_port {
+            let port = ep
+                .direct_addr()?
+                .ip_addrs()
+                .next()
+                .context("endpoint has no bound socket")?
+                .port();
+            live_sync::write_peer_port(&peer_port_path, port.to_string().as_bytes())?;
+        }
+        // Durable served blob store: FsStore at `<state_dir>/blobs`. Blobs are already
+        // ciphertext, so no extra sealing.
+        let blob_directory = state_dir.join("blobs");
+        state::ensure_private_directory(&blob_directory)?;
+        let blobs = IrohBlobStore::load(&blob_directory).await?;
+        let replica_ingress = state_dir.join(".replica-ingress");
+        cleanup_replica_ingress(&replica_ingress)?;
+        state::ensure_private_directory(&replica_ingress)?;
 
-        // DERIVE (design §3.5/A1): re-derive each owned vault's decrypted `Manifest` from
-        // the envelope in FsStore + `K_manifest` (never persisted in clear). A vault whose
-        // envelope is absent/unopenable is left out - it becomes needs-refetch and the
-        // owner can republish from its working dir (reconciliation, not a startup abort).
+        // DERIVE: re-derive each owned vault's decrypted `Manifest` from the envelope in
+        // FsStore + `K_manifest` (never persisted in clear). A vault whose envelope is
+        // absent/unopenable becomes needs-refetch (reconciliation, not a startup abort).
         // The FsStore fetch is async, so re-derive OFF the lock, then insert under it.
         let mut rebuilt_vaults = Vec::new();
         let mut refetch_vaults = Vec::new();
         for (vid, digest, chunk_ids) in vault_blob_sources {
             match Self::rederive_manifest(&blobs, &k_root, vid, digest).await {
                 Ok(manifest) => {
-                    // EPH rebuild (§3.3): re-derive the per-chunk keys from the manifest's
-                    // pt_hash + K_content so a post-reboot disclose/republish works without
-                    // re-ingesting. Never persisted (a key dump).
+                    // EPH rebuild: re-derive per-chunk keys from the manifest's pt_hash +
+                    // K_content so a post-reboot disclose/republish works. Never persisted.
                     let vkeys = VaultKeys::derive(&*k_root, vid);
                     let keys = chunk_keys_from_manifest(&manifest, &*vkeys.k_content);
                     rebuilt_vaults.push((vid, digest, chunk_ids, manifest, keys));
                 }
-                Err(e) => {
-                    eprintln!(
-                        "carapace: WARNING vault {} manifest could not be re-derived at startup \
-                         ({e}); marked needs-refetch (republish or anti-entropy will repair)",
-                        hex32(&vid)
-                    );
-                    // Keep the blob source as the durable needs-refetch record. Dropping
-                    // it here let the next persist rewrite the VAULT_BLOBS row without
-                    // this vault, silently erasing it from every later boot.
+                Err(_) => {
+                    ops::log("recovery.manifest_rederive_failed", None);
+                    // Keep the blob source as the durable needs-refetch record; dropping it
+                    // here would let the next persist silently erase this vault from disk.
                     refetch_vaults.push((vid, digest, chunk_ids));
                 }
             }
@@ -2161,33 +2471,50 @@ impl Daemon {
             }
         }
 
-        // This device's ContactCard starts WITHOUT a relay URL (W6/§6: a relay is
-        // never advertised unconditionally at startup). The advertise happens only
-        // after a liveness probe confirms the relay is up - the initial
-        // `drive_relay_health` below, then every maintenance round.
+        // This device's ContactCard starts WITHOUT a relay URL (W6: never advertise a relay
+        // unconditionally at startup). Advertise happens only after a liveness probe.
         let mut card = build_card(&user_key, &node_key, &k_root, None);
-        // F3 (design §3.5): the own-card version is a persisted monotonic counter. On
-        // boot the fresh card is minted at `max(unix_now(), persisted + 1)` so it
-        // STRICTLY exceeds every version the prior run reached (even a rapid restart
-        // under heavy relay flapping), and a friend's DocStore never rejects it as a
-        // rollback (§6). The wall-clock floor keeps versions human-meaningful.
+        // F3: own-card version is a persisted monotonic counter. On boot the fresh card is
+        // minted at `max(unix_now(), persisted + 1)` so it strictly exceeds every version the
+        // prior run reached and a friend's DocStore never rejects it as a rollback.
         card.version = unix_now().max(card_version_floor.saturating_add(1));
+        card.nodes[0].addrs = ep
+            .direct_addr()?
+            .ip_addrs()
+            .filter(|addr| !addr.ip().is_unspecified())
+            .map(ToString::to_string)
+            .collect();
+        {
+            let s = shared.read().expect("shared lock");
+            if let Some(previous) = s.cards.iter().find(|card| card.user == self_user) {
+                card.nodes.extend(
+                    previous
+                        .nodes
+                        .iter()
+                        .filter(|node| {
+                            node.node_id != self_node
+                                && card_delegates_node(previous, &node.node_id, unix_now())
+                        })
+                        .take(63)
+                        .cloned(),
+                );
+            }
+        }
         card.sign(&user_key);
         {
             let mut s = shared.write().expect("shared lock");
-            // Replace any persisted prior own card (do NOT accumulate duplicates across
-            // reboots); the friend arm keys on `friends`, `cards` holds only own cards.
+            // Replace any persisted prior own card (no duplicates across reboots).
             s.cards.retain(|c| c.by != self_user);
             s.cards.push(card);
             s.rate = RateLimiter::new(limits.rate_capacity, limits.rate_refill_per_sec);
             s.relay_health.local_url = local_relay_url;
         }
 
-        // The rollback-guarded document store, shared between the daemon's own pull
-        // path (`sync_from`) and the accept handler's `serve_docs` so learned docs are
-        // re-served during anti-entropy (store-and-forward, §6/W7). Loaded from disk so
-        // the §6 rollback high-water marks survive restart.
+        // The rollback-guarded document store, shared between `sync_from` and `serve_docs`
+        // (store-and-forward, §6/W7). Loaded from disk so rollback high-water marks survive.
         let docs = Arc::new(Mutex::new(loaded.docs));
+        let recovery_limiter = Arc::new(Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)));
+        let persist_count = Arc::new(AtomicU64::new(0));
 
         let hello = Hello {
             protocol: 1,
@@ -2201,37 +2528,28 @@ impl Daemon {
             self_user,
             k_root: k_root.clone(),
             db: Arc::clone(&db),
+            persist_count: Arc::clone(&persist_count),
             blobs: blobs.clone(),
+            replica_ingress,
             shared: Arc::clone(&shared),
             default_grant_bytes: limits.quota_bytes,
             // Feed hints from friend cards learned on the accept path (§6).
             hints: ep.hints(),
             docs: Arc::clone(&docs),
+            recovery_limiter: Arc::clone(&recovery_limiter),
         };
-        // §7.4 / D3 fetch authorization (closes S5 for owned granted content): the
-        // blob store no longer answers `iroh_blobs::ALPN` fetches from any dialer.
-        // Every get-request is gated by `authorize_fetch` against the dialer's
-        // authenticated node id and the requested ChunkID. Owner-served chunks of a
-        // vault we own are released only to our own delegated devices, this vault's
-        // replica-set members, or a friend authenticated as a member of a grant's
-        // audience covering that chunk — so a leaked grant document alone (presented
-        // by a non-audience party) authorizes nothing.
-        //
-        // W8/§7.4 replica gate: chunks we hold *as a replica* for another owner are
-        // no longer on the inherited residual. `authorize_fetch` serves them only to
-        // that vault owner's delegated devices (proved by the card the dialer
-        // presents on our control stream) or a current replica-set member from the
-        // owner's announce — an arbitrary dialer is refused.
-        // F3 (design §6): persist the freshly minted own-card version floor BEFORE the
-        // router starts accepting, so a peer can never observe a card version that has not
-        // reached disk. Otherwise a crash between the first serve and the startup snapshot
-        // would let the floor rewind and re-mint a version a friend's DocStore already
-        // rejected (clock-rollback self-DoS). The post-relay-probe re-issue is captured by
-        // the `persist_snapshot` after the daemon is built.
+        // §7.4/D3 + W8 fetch authorization: every `iroh_blobs::ALPN` get-request is gated by
+        // `authorize_fetch` against the dialer's authenticated node id and the ChunkID.
+        // Owner-served chunks go only to own devices, replica-set members, or a grant-audience
+        // friend; replica-held chunks only to the owner's devices or a current member.
+        // F3: persist the freshly minted own-card version floor BEFORE the router accepts, so a
+        // peer can never observe a card version that has not reached disk (else a crash could
+        // rewind the floor and re-mint a version a friend's DocStore already rejected).
         {
             let s = shared.read().expect("shared lock");
             let d = docs.lock().expect("docs lock");
-            persist::commit_all(&db, &s, &d, &k_root);
+            persist::commit_all(&db, &s, &d, &k_root, &identity);
+            persist_count.fetch_add(1, Ordering::Relaxed);
         }
 
         let gate_shared = Arc::clone(&shared);
@@ -2256,29 +2574,30 @@ impl Daemon {
             k_root,
             docs,
             publish_locks: Mutex::new(HashMap::new()),
-            // §8.5: at most 5 recovery opens per subject per 24 h window.
-            recovery_limiter: Mutex::new(RecoveryRateLimiter::new(24 * 3600, 5)),
+            live_state: Mutex::new(HashMap::new()),
+            peer_sync_errors: Mutex::new(HashMap::new()),
+            ingest_limit: Arc::new(tokio::sync::Semaphore::new(1)),
             resplit_lock: tokio::sync::Mutex::new(()),
+            operational_history: Mutex::new(OperationalHistory::default()),
             relay,
             relay_host: cfg.relay_host,
             state_dir,
             db,
+            persist_count,
             _ephemeral_dir: ephemeral_dir,
             router,
         };
 
-        // W6/§6: elect the relay only after a liveness probe confirms it is up -
-        // never unconditionally at startup. On success this re-issues the card at
-        // version 2 carrying the relay URL; if the relay is not (yet) alive the card
-        // stays relay-less and the maintenance loop advertises it once it comes up.
+        // W6: elect the relay only after a liveness probe confirms it up. On success this
+        // re-issues the card carrying the relay URL; else it stays relay-less until the loop
+        // advertises it.
         if daemon.relay.is_some() {
             let alive = daemon.probe_relay_alive().await;
             daemon.drive_relay_health(alive);
         }
 
-        // Persist the startup snapshot so the F3 own-card version floor (bumped above,
-        // and possibly again by the relay-health card re-issue) reaches disk, and any
-        // load-time normalization (own-card dedupe, share_sets rebuild) is captured.
+        // Persist the startup snapshot so the F3 version floor (and any relay-health card
+        // re-issue + load-time normalization) reaches disk.
         daemon.persist_snapshot();
 
         Ok(daemon)
@@ -2314,10 +2633,8 @@ impl Daemon {
         self.shared.read().expect("shared lock").split_states.len()
     }
 
-    /// The current PoR round counter (the challenge-unpredictability nonce, §10.1) for
-    /// `(node, vid)`. Test accessor for the audit #1/#6 reboot regression: a reboot must
-    /// resume from this counter, never rewind to a spent round, and the maintenance-loop
-    /// restamp must keep it.
+    /// The current PoR round counter (challenge-unpredictability nonce) for `(node, vid)`.
+    /// Test accessor for the reboot regression: a reboot must resume, never rewind.
     #[doc(hidden)]
     pub fn por_round(&self, node: [u8; 32], vid: [u8; 32]) -> u64 {
         self.shared
@@ -2325,6 +2642,15 @@ impl Daemon {
             .expect("shared lock")
             .por
             .round(node, vid)
+    }
+
+    /// Identity-free count of current PoR latency anomaly signals.
+    pub fn por_latency_anomaly_count(&self) -> usize {
+        self.shared
+            .read()
+            .expect("shared lock")
+            .por
+            .latency_anomaly_count()
     }
 
     /// Whether this daemon holds an owned-vault chunk in the owner-gated fetch set
@@ -2337,11 +2663,16 @@ impl Daemon {
             .contains_key(chunk_id)
     }
 
-    /// The durable state directory (design §3): root of `blobs/` (FsStore) and, once
-    /// the redb state layer lands, `state.redb`. For a `from_seeds` daemon this is a
-    /// process-unique ephemeral dir cleaned up on drop.
+    /// The durable state directory: root of `blobs/` (FsStore) and `state.redb`. For a
+    /// `from_seeds` daemon this is an ephemeral dir cleaned up on drop.
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Number of durable state commits completed by this daemon process.
+    #[doc(hidden)]
+    pub fn persist_commit_count(&self) -> u64 {
+        self.persist_count.load(Ordering::Relaxed)
     }
 
     /// A directly dialable address for this daemon (localhost).
@@ -2355,9 +2686,8 @@ impl Daemon {
         new_vid(&self.user_key.verifying_key().to_bytes())
     }
 
-    /// The per-vid publish lock (§11 / MAJOR 5), created on first use. Held across
-    /// the WHOLE of `publish_vault` and a sync's apply phase so those two paths
-    /// serialize on a vid and never clobber each other's read-prev -> commit.
+    /// The per-vid publish lock (§11), created on first use. Held across the whole of
+    /// `publish_vault` and a sync's apply phase so they serialize on a vid.
     fn publish_lock(&self, vid: [u8; 32]) -> Arc<tokio::sync::Mutex<()>> {
         self.publish_locks
             .lock()
@@ -2367,37 +2697,67 @@ impl Daemon {
             .clone()
     }
 
-    /// Ingest `src` into vault `vid`: (re-)chunk + seal every file, load the
-    /// ciphertext + manifest envelope into the served blob store, seal a
-    /// per-chunk access grant, and publish a freshly signed `VaultAnnounce` +
-    /// `FileGrant`. Records `src` as this vault's authoritative working directory
-    /// (§11), so a later sync reconstructs the merged result back into the same
-    /// tree this ingest reads.
-    ///
-    /// Bumps the vault's epoch and republishes ONLY when the re-ingested tree
-    /// differs from the last published manifest. A no-op re-ingest (e.g. the
-    /// watcher firing on the daemon's own just-applied merge, whose files and
-    /// mtimes round-trip exactly) returns the current epoch WITHOUT a bump, so the
-    /// per-signer announce line stays monotonic and two devices converge instead of
-    /// ping-ponging epochs. Returns the vault's epoch.
-    ///
-    /// The whole read-prev -> ingest -> commit runs under the vid's publish lock so
-    /// it serializes with a concurrent sync `publish_merged` on the same vid
-    /// (MAJOR 5): no lost update, and never two different digests at one epoch.
-    ///
-    /// ponytail: ingest runs inline on the async worker (fine for a demo); a
-    /// production daemon would `spawn_blocking` the heavy CPU/IO path.
+    /// Ingest `src` into vault `vid`: (re-)chunk + seal every file, load ciphertext +
+    /// manifest envelope into the served blob store, and publish a freshly signed
+    /// `VaultAnnounce` + `FileGrant`. Records `src` as the vault's authoritative working
+    /// directory (§11). Bumps the epoch and republishes ONLY when the re-ingested tree
+    /// differs from the last manifest; a no-op re-ingest returns the current epoch without a
+    /// bump, so two devices converge instead of ping-ponging epochs. Runs under the vid's
+    /// publish lock so it serializes with a concurrent sync `publish_merged`. Returns the epoch.
     pub async fn publish_vault(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
         let lock = self.publish_lock(vid);
         let _publish = lock.lock().await;
+        let result = self.publish_vault_locked(src, vid).await;
+        self.note_publish_result(vid, &result);
+        result
+    }
 
+    async fn refresh_vault(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
+        let lock = self.publish_lock(vid);
+        let _publish = lock.lock().await;
+        let result = async {
+            ensure!(
+                !self
+                    .shared
+                    .read()
+                    .expect("shared lock")
+                    .needs_refetch
+                    .contains_key(&vid),
+                "vault baseline needs repair before disk changes can be reconciled"
+            );
+            self.publish_vault_locked(src, vid).await
+        }
+        .await;
+        self.note_publish_result(vid, &result);
+        result
+    }
+
+    async fn publish_vault_locked(&self, src: &Path, vid: [u8; 32]) -> Result<u64> {
+        let permit = Arc::clone(&self.ingest_limit).acquire_owned().await?;
+        let src = std::fs::canonicalize(src).context("open vault working directory")?;
+        ensure!(src.is_dir(), "vault working directory is unavailable");
+        self.ensure_disjoint_working_dir(vid, &src)?;
+        let state_dir = std::fs::canonicalize(&self.state_dir)?;
+        let managed = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .working_dirs
+            .get(&vid)
+            .is_some_and(|dir| {
+                std::fs::canonicalize(dir).ok().as_ref() == Some(&src)
+                    && src == state_dir.join("vaults").join(hex32(&vid))
+            });
+        ensure!(
+            managed || (!src.starts_with(&state_dir) && !state_dir.starts_with(&src)),
+            "vault folder must not overlap the daemon state directory"
+        );
         let vkeys = VaultKeys::derive(&*self.k_root, vid);
         let (cur_epoch, prev) = {
-            let mut s = self.shared.write().expect("shared lock");
+            let s = self.shared.read().expect("shared lock");
             // §11: this source IS the vault's authoritative working directory
             // (watched + sync target). A publish declares it, so overwrite any prior
             // (e.g. a first-sync fallback) - a later sync reconstructs merges here.
-            s.working_dirs.insert(vid, src.to_path_buf());
             let cur = *s.epochs.get(&vid).unwrap_or(&0);
             // §11: carry the previously-published manifest so a re-ingest bumps
             // this device's per-file version-vector component on real changes
@@ -2408,9 +2768,26 @@ impl Daemon {
         };
         let epoch = cur_epoch + 1;
 
-        // Ingest into a plain in-memory store, then mirror blobs into iroh.
-        let mut mem = MemoryStore::new();
-        let ingest = ingest_dir(src, &self.node_key, &vkeys, epoch, prev.as_ref(), &mut mem)?;
+        // Ingest ciphertext into temporary disk storage, then mirror it into iroh.
+        let node_key = self.node_key.clone();
+        let source = src.clone();
+        let previous = prev.clone();
+        let (ingest, mem, _scratch_dir, _permit) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let scratch_dir = EphemeralDir(ephemeral_state_dir()?);
+                let mut store = FsStore::open(&scratch_dir.0)?;
+                let ingest = ingest_dir(
+                    &source,
+                    &node_key,
+                    &vkeys,
+                    epoch,
+                    previous.as_ref(),
+                    &mut store,
+                )?;
+                Ok((ingest, store, scratch_dir, permit))
+            })
+            .await
+            .context("vault ingest task")??;
 
         // No-op guard: if the re-ingested file set is byte-for-byte identical to
         // what we last published (same paths, hashes, mtimes, per-file VVs), there
@@ -2418,11 +2795,18 @@ impl Daemon {
         // watcher re-observing the daemon's own just-written merged/reconstructed
         // tree, and republishing it would spuriously advance the announce line.
         if let Some(prevm) = &prev {
-            if ingest.manifest.files == prevm.files {
+            if ingest.manifest.files == prevm.files && self.own_announce_digest(&vid).is_some() {
+                let mut s = self.shared.write().expect("shared lock");
+                if s.working_dirs.get(&vid) != Some(&src) {
+                    s.working_dirs.insert(vid, src);
+                    self.persist_locked(&s);
+                }
                 return Ok(cur_epoch);
             }
         }
 
+        // Keep newly added blobs rooted through the durable state commit against GC.
+        let blob_mutation = self.blobs.begin_durable_mutation().await;
         let env_digest = self.blobs.add(&ingest.envelope.to_bytes()).await?;
         ensure!(
             env_digest == ingest.digest,
@@ -2467,6 +2851,7 @@ impl Daemon {
         let push_targets = {
             let mut s = self.shared.write().expect("shared lock");
             // Commit the bumped epoch (read-prev..commit is atomic under the vid lock).
+            s.working_dirs.insert(vid, src);
             s.epochs.insert(vid, epoch);
             // W2: retain every published ChunkID in the owner-gated set across epoch
             // bumps, so superseded chunks keep the §7.4 owner gate (see `owned_chunks`).
@@ -2533,59 +2918,81 @@ impl Daemon {
                 .unwrap_or_default()
         };
 
+        drop(blob_mutation);
+        drop(mem);
+        drop(_scratch_dir);
+        drop(_permit);
+
         // Push the new epoch to enrolled replicas OUTSIDE the shared lock. Best-effort:
         // iroh blobs are content-addressed so a replica only pulls the chunks it lacks
         // (dedup), and an offline replica is caught by the existing PoR/repair path, so
         // a failed push MUST NOT fail the publish (mirror the other best-effort sends).
         if !push_targets.is_empty() {
-            match self.gather_blob_bytes(&vb).await {
-                Ok(blobs) => {
-                    let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+            match self.blob_total_bytes(&vb).await {
+                Ok(total) => {
                     for peer in &push_targets {
-                        if let Err(e) = self.invite_and_push(peer, vid, epoch, total, &blobs).await
-                        {
-                            eprintln!(
-                                "carapaced: epoch push of {} to replica {} failed (best-effort): {e:#}",
-                                hex32(&vid),
-                                hex32(peer.id.as_bytes())
-                            );
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            self.invite_and_push(peer, vid, epoch, total, &vb),
+                        )
+                        .await
+                        .context("replica epoch push timed out")
+                        .and_then(|r| r);
+                        let mut errors = self.peer_sync_errors.lock().expect("peer sync errors");
+                        match result {
+                            Ok(Some(_)) => {
+                                errors.remove(peer.id.as_bytes());
+                            }
+                            Ok(None) => {
+                                errors.insert(
+                                    *peer.id.as_bytes(),
+                                    "replica declined latest epoch".into(),
+                                );
+                            }
+                            Err(e) => {
+                                ops::log("replica.epoch_push_failed", None);
+                                errors.insert(
+                                    *peer.id.as_bytes(),
+                                    format!("replica epoch push: {e:#}"),
+                                );
+                            }
                         }
                     }
                 }
-                Err(e) => eprintln!(
-                    "carapaced: could not gather blobs to push epoch of {} to replicas: {e:#}",
-                    hex32(&vid)
-                ),
+                Err(e) => self.note_live_result(vid, &Err::<(), _>(e)),
             }
         }
         Ok(epoch)
     }
 
-    /// §11 / W12: start a debounced filesystem watcher over `src` that re-ingests
-    /// vault `vid` (via [`Daemon::publish_vault`]) whenever files under it change,
-    /// giving Dropbox-like live sync (new chunks + epoch++ manifest, pushed and
-    /// announced to replicas and other owner devices).
-    ///
-    /// Consumes a cloned `Arc<Daemon>` and holds only a [`std::sync::Weak`] to it, so the
-    /// returned [`VaultWatcher`] never keeps the daemon alive — a caller can still
-    /// `Arc::try_unwrap` + [`Daemon::shutdown`]. Drop the [`VaultWatcher`] to stop
-    /// watching; that halts fs events and cancels the re-ingest task.
-    ///
-    /// ponytail: re-ingests the *whole* vault on any change (matches the existing
-    /// one-shot `publish_vault`); a large-vault deployment would want incremental,
-    /// per-file re-chunking driven off the event paths.
+    /// §11: start a debounced filesystem watcher over `src` that re-ingests vault `vid` (via
+    /// [`Daemon::publish_vault`]) whenever files change, giving Dropbox-like live sync. Holds
+    /// only a [`std::sync::Weak`] to the daemon, so the [`VaultWatcher`] never keeps it alive;
+    /// drop it to stop watching.
     pub fn watch_vault(self: Arc<Self>, vid: [u8; 32], src: PathBuf) -> Result<VaultWatcher> {
         use notify::{event::EventKind, recommended_watcher, RecursiveMode, Watcher};
 
-        // Unbounded but each item is zero-sized: an event storm costs bytes, and
-        // the debounce loop collapses the whole backlog into a single re-ingest.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // One pending notification is enough: each pass reads the whole tree.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        let event_daemon = Arc::downgrade(&self);
         let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
+            let ev = match res {
+                Ok(event) => event,
+                Err(error) => {
+                    if let Some(daemon) = event_daemon.upgrade() {
+                        daemon.note_live_result(
+                            vid,
+                            &Err::<(), _>(anyhow::anyhow!("filesystem watcher: {error}")),
+                        );
+                    }
+                    return;
+                }
+            };
+            {
                 // Skip pure access/open events: only content-affecting changes
                 // (create/modify/remove/rename) should trigger a re-ingest.
                 if !matches!(ev.kind, EventKind::Access(_)) {
-                    let _ = tx.send(());
+                    let _ = tx.try_send(());
                 }
             }
         })
@@ -2618,11 +3025,8 @@ impl Daemon {
                 let Some(daemon) = weak.upgrade() else {
                     break; // daemon gone
                 };
-                if let Err(e) = daemon.publish_vault(&src, vid).await {
-                    eprintln!(
-                        "carapace watch: re-ingest of {} failed: {e:#}",
-                        src.display()
-                    );
+                if daemon.refresh_vault(&src, vid).await.is_err() {
+                    ops::log("vault.watch_publish_failed", None);
                 }
             }
         });
@@ -2673,7 +3077,8 @@ impl Daemon {
         peer: EndpointAddr,
         out_root: &Path,
     ) -> Result<Vec<Reconstructed>> {
-        self.sync_impl(peer.clone(), peer, out_root).await
+        self.sync_impl(peer.clone(), peer, out_root, false, Duration::from_secs(30))
+            .await
     }
 
     /// Like [`Daemon::sync_from`], but pull documents (announce + grant) from
@@ -2686,7 +3091,183 @@ impl Daemon {
         blob_peer: EndpointAddr,
         out_root: &Path,
     ) -> Result<Vec<Reconstructed>> {
-        self.sync_impl(doc_peer, blob_peer, out_root).await
+        self.sync_impl(
+            doc_peer,
+            blob_peer,
+            out_root,
+            false,
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    /// Recover vaults after claimant activation. Pull verified documents from every
+    /// trustee, bind announces to the signed-grant references, select the maximum epoch,
+    /// and fetch blobs from each distinct replica named by the accepted announce.
+    pub async fn recover_retained_at(
+        &self,
+        trustees: &[([u8; 32], Vec<String>)],
+        refs: &[AnnounceRef],
+        out_root: &Path,
+    ) -> Result<Vec<Reconstructed>> {
+        let trustees: Vec<_> = trustees
+            .iter()
+            .map(|(node, addrs)| (*node, addrs.clone(), None))
+            .collect();
+        let report = self
+            .recover_retained_at_with_relays(&trustees, refs, out_root)
+            .await?;
+        ensure!(
+            report.errors.is_empty(),
+            "one or more referenced vaults could not be recovered"
+        );
+        Ok(report.restored)
+    }
+
+    pub async fn recover_retained_at_with_relays(
+        &self,
+        trustees: &[ClaimantAddress],
+        refs: &[AnnounceRef],
+        out_root: &Path,
+    ) -> Result<RecoveryRestoreReport> {
+        ensure!(
+            trustees.len() <= 64 && refs.len() <= 4096,
+            "recovery input exceeds limits"
+        );
+        let wanted: HashMap<_, _> = max_epoch_refs(refs)
+            .into_iter()
+            .map(|reference| (reference.vid, reference))
+            .collect();
+        let mut report = RecoveryRestoreReport {
+            restored: Vec::new(),
+            errors: Vec::new(),
+        };
+        if wanted.is_empty() {
+            return Ok(report);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let mut accepted: HashMap<[u8; 32], (EndpointAddr, VaultAnnounce)> = HashMap::new();
+        for (node, addrs, relay) in trustees {
+            let mut doc_peer = endpoint_addr(*node, addrs)?;
+            if let Some(relay) = relay {
+                let url: RelayUrl = relay.parse()?;
+                doc_peer = doc_peer.with_relay_url(url.clone());
+                self.ep.add_relay(url).await;
+            }
+            self.ep.add_peer(doc_peer.clone());
+            self.shared
+                .write()
+                .expect("shared lock")
+                .peer_addrs
+                .insert(*node, doc_peer.clone());
+            let targets = match tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(15)),
+                self.pull_verified_targets(&doc_peer),
+            )
+            .await
+            {
+                Ok(Ok(targets)) => targets,
+                _ => continue,
+            };
+            for (vid, announce) in targets {
+                if let Some(reference) = wanted.get(&vid) {
+                    if announce.epoch >= reference.epoch
+                        && (announce.epoch != reference.epoch
+                            || announce.digest == reference.digest)
+                        && accepted
+                            .get(&vid)
+                            .is_none_or(|(_, current)| current.epoch < announce.epoch)
+                    {
+                        accepted.insert(vid, (doc_peer.clone(), announce));
+                    }
+                }
+            }
+        }
+        for vid in wanted.keys() {
+            let Some((doc_peer, announce)) = accepted.remove(vid) else {
+                report.errors.push((
+                    *vid,
+                    "no authenticated replica meets the recorded vault epoch".into(),
+                ));
+                continue;
+            };
+            let mut restored = None;
+            let mut error = "no available replica".to_string();
+            for replica in &announce.replicas {
+                if tokio::time::Instant::now() >= deadline {
+                    error = "recovery network budget exhausted; retry".into();
+                    break;
+                }
+                let blob_peer = if *replica == *doc_peer.id.as_bytes() {
+                    Some(doc_peer.clone())
+                } else {
+                    resolve_peer(
+                        &self.shared.read().expect("shared lock").peer_addrs,
+                        replica,
+                    )
+                };
+                let Some(blob_peer) = blob_peer else { continue };
+                if blob_peer.id != doc_peer.id
+                    && !matches!(
+                        tokio::time::timeout_at(
+                            deadline.min(tokio::time::Instant::now() + Duration::from_secs(15)),
+                            self.authenticate_to(&blob_peer)
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    )
+                {
+                    continue;
+                }
+                // Network calls inside reconstruction are bounded. Do not cancel its local writes.
+                match self
+                    .reconstruct_one(&blob_peer, vid, &announce, out_root)
+                    .await
+                {
+                    Ok(vault) => {
+                        restored = Some(vault);
+                        break;
+                    }
+                    Err(failure) => error = format!("{failure:#}"),
+                }
+            }
+            if let Some(vault) = restored {
+                report.restored.push(vault);
+            } else {
+                report.errors.push((*vid, error));
+            }
+        }
+        report.restored.sort_by_key(|vault| vault.vid);
+        report.errors.sort_by_key(|(vid, _)| *vid);
+        Ok(report)
+    }
+
+    async fn pull_verified_targets(
+        &self,
+        doc_peer: &EndpointAddr,
+    ) -> Result<Vec<([u8; 32], VaultAnnounce)>> {
+        let conn = self.ep.connect(doc_peer.clone(), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let own_card = {
+            let s = self.shared.read().expect("shared lock");
+            s.cards.first().cloned().context("no own card")?
+        };
+        write_msg(&mut send, &own_card).await?;
+        let mut cards = Vec::new();
+        let mut announces = Vec::new();
+        while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
+            match ty {
+                ContactCard::TYPE => cards.push(ContactCard::from_map(body)?),
+                VaultAnnounce::TYPE => announces.push(VaultAnnounce::from_map(body)?),
+                _ => {}
+            }
+        }
+        send.finish()?;
+        let now = unix_now();
+        let self_user = self.user_id();
+        let mut docs = DocStore::new();
+        let targets = select_targets(&mut docs, &self_user, &cards, &announces, now);
+        Ok(targets)
     }
 
     async fn sync_impl(
@@ -2694,35 +3275,46 @@ impl Daemon {
         doc_peer: EndpointAddr,
         blob_peer: EndpointAddr,
         out_root: &Path,
+        retry_seen: bool,
+        peer_timeout: Duration,
     ) -> Result<Vec<Reconstructed>> {
         // ---- anti-entropy pull over the control stream ----
         // Drain the whole stream into buffers first; the verification pass below
         // runs synchronously so we never hold the doc lock across an `.await`.
-        let conn = self.ep.connect(doc_peer.clone(), ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        // Present our own card so the peer can authorize this pull (W5). The peer
-        // serves documents only if our card's user is itself or a friend and the
-        // card delegates our (TLS-authenticated) node id.
-        let own_card = {
-            let s = self.shared.read().expect("shared lock");
-            s.cards.first().cloned().context("no own card")?
-        };
-        write_msg(&mut send, &own_card).await?;
+        let (recv_cards, recv_announces) = tokio::time::timeout(peer_timeout, async {
+            let conn = self.ep.connect(doc_peer.clone(), ALPN).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            // Present our own card so the peer can authorize this pull (W5). The peer
+            // serves documents only if our card's user is itself or a friend and the
+            // card delegates our (TLS-authenticated) node id.
+            let own_card = {
+                let s = self.shared.read().expect("shared lock");
+                s.cards.first().cloned().context("no own card")?
+            };
+            write_msg(&mut send, &own_card).await?;
 
-        let mut recv_cards: Vec<ContactCard> = Vec::new();
-        let mut recv_announces: Vec<VaultAnnounce> = Vec::new();
-        // Option B (§4): reconstruction targets come from announces alone; per-chunk
-        // keys are re-derived from the manifest `pt_hash`, so no FileGrant is pulled
-        // here. A friend peer may still forward its own self-grants (disclosure-only);
-        // they are ignored by this sync path.
-        while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
-            match ty {
-                ContactCard::TYPE => recv_cards.push(ContactCard::from_map(body)?),
-                VaultAnnounce::TYPE => recv_announces.push(VaultAnnounce::from_map(body)?),
-                _ => {}
+            let mut recv_cards: Vec<ContactCard> = Vec::new();
+            let mut recv_announces: Vec<VaultAnnounce> = Vec::new();
+            // Option B (§4): reconstruction targets come from announces alone; per-chunk
+            // keys are re-derived from the manifest `pt_hash`, so no FileGrant is pulled
+            // here. A friend peer may still forward its own self-grants (disclosure-only);
+            // they are ignored by this sync path.
+            let mut frames = 0usize;
+            while let Some((ty, body)) = read_frame_raw(&mut recv).await? {
+                frames += 1;
+                ensure!(frames <= 100_000, "peer document batch is too large");
+                match ty {
+                    ContactCard::TYPE => recv_cards.push(ContactCard::from_map(body)?),
+                    VaultAnnounce::TYPE => recv_announces.push(VaultAnnounce::from_map(body)?),
+                    _ => {}
+                }
             }
-        }
-        send.finish()?;
+            send.finish()?;
+
+            Ok::<_, anyhow::Error>((recv_cards, recv_announces))
+        })
+        .await
+        .context("device document pull timed out")??;
 
         // §9.3.4 liveness: a completed doc pull is a real live-reachability signal for the
         // peer(s) we just synced with (unlike a cached address). The re-split status surface
@@ -2748,7 +3340,24 @@ impl Daemon {
                     newer_cards.push(card.clone());
                 }
             }
-            let targets = select_targets(&mut docs, &self_user, &recv_cards, &recv_announces, now);
+            let mut targets =
+                select_targets(&mut docs, &self_user, &recv_cards, &recv_announces, now);
+            // Receiving an announce and applying its data are separate operations.
+            // Retry the exact verified high-water document after a failed download
+            // or restart; never accept an older or equivocated signed document.
+            if retry_seen {
+                for ann in &recv_announces {
+                    if targets.iter().any(|(_, target)| target == ann) {
+                        continue;
+                    }
+                    let delegated = recv_cards.iter().chain(docs.cards()).any(|card| {
+                        card.user == self_user && card_delegates_node(card, &ann.by, now)
+                    });
+                    if delegated && docs.announces().any(|known| known == ann) {
+                        targets.push((ann.vid, ann.clone()));
+                    }
+                }
+            }
             (targets, newer_cards)
         };
 
@@ -2787,18 +3396,46 @@ impl Daemon {
         // has no identity for our node id and refuses every replica-held chunk. When
         // blob and doc peer are the same node the doc pull above already did this.
         if blob_peer.id != doc_peer.id {
-            self.authenticate_to(&blob_peer).await?;
+            tokio::time::timeout(peer_timeout, self.authenticate_to(&blob_peer))
+                .await
+                .context("device authentication timed out")??;
         }
 
         // ---- per-vault: fetch, open, reconstruct ----
         // W3: one poisoned/unfetchable vault must not abort the others; collect
         // the error and move on.
         let mut out = Vec::new();
+        let mut failed = false;
         for (vid, ann) in &targets {
-            match self.reconstruct_one(&blob_peer, vid, ann, out_root).await {
-                Ok(r) => out.push(r),
-                Err(e) => eprintln!("carapaced: skipping vault {}: {e:#}", hex32(vid)),
+            match self
+                .reconstruct_one_timed(&blob_peer, vid, ann, out_root, peer_timeout)
+                .await
+            {
+                Ok(r) => {
+                    self.note_live_result(*vid, &Ok::<(), anyhow::Error>(()));
+                    out.push(r);
+                }
+                Err(e) => {
+                    ops::log("vault.reconstruct_failed", None);
+                    failed = true;
+                    // A failed first download has no working-directory row yet.
+                    // Retain its error on the peer so the API can still display it.
+                    self.peer_sync_errors
+                        .lock()
+                        .expect("peer sync errors")
+                        .insert(
+                            *blob_peer.id.as_bytes(),
+                            format!("vault {}: {e:#}", hex32(vid)),
+                        );
+                    self.note_live_result(*vid, &Err::<(), _>(e));
+                }
             }
+        }
+        if !failed {
+            self.peer_sync_errors
+                .lock()
+                .expect("peer sync errors")
+                .remove(blob_peer.id.as_bytes());
         }
         Ok(out)
     }
@@ -2813,19 +3450,33 @@ impl Daemon {
         ann: &VaultAnnounce,
         out_root: &Path,
     ) -> Result<Reconstructed> {
+        self.reconstruct_one_timed(blob_peer, vid, ann, out_root, Duration::from_secs(30))
+            .await
+    }
+
+    async fn reconstruct_one_timed(
+        &self,
+        blob_peer: &EndpointAddr,
+        vid: &[u8; 32],
+        ann: &VaultAnnounce,
+        out_root: &Path,
+        peer_timeout: Duration,
+    ) -> Result<Reconstructed> {
         let vkeys = VaultKeys::derive(&*self.k_root, *vid);
 
-        // W8: fetch into a throwaway store, NOT `self.blobs`, which the router serves
-        // over `iroh_blobs::ALPN`. Fetching the owner's/replica's ciphertext into the
-        // served store would re-serve it ungated from this device (the residual
-        // `authorize_fetch` `true` covers any hash absent from the owned/replica maps),
-        // voiding the replica fetch gate on any device that reconstructs. We only need
-        // the bytes to open the manifest and write plaintext to disk. Mirrors the PoR
-        // probe's `scratch` store.
+        // Download outside the served store until the authenticated baseline can
+        // be committed with its fetch authorization and GC roots.
         let scratch = IrohBlobStore::new();
         // Manifest envelope by digest.
-        let bconn = self.ep.connect(blob_peer.clone(), iroh_blobs::ALPN).await?;
-        scratch.fetch(&bconn, ann.digest).await?;
+        let bconn = tokio::time::timeout(
+            peer_timeout,
+            self.ep.connect(blob_peer.clone(), iroh_blobs::ALPN),
+        )
+        .await
+        .context("device blob connection timed out")??;
+        tokio::time::timeout(peer_timeout, scratch.fetch(&bconn, ann.digest))
+            .await
+            .context("manifest download timed out")??;
         let env_bytes = scratch.get_bytes(ann.digest).await?;
         let envelope = ManifestEnvelope::from_bytes(&env_bytes)?;
         let incoming = open_envelope(&envelope, &vkeys.k_manifest)?;
@@ -2850,7 +3501,70 @@ impl Daemon {
         // cannot read-prev/commit in between - that would lose an update or ingest a
         // half-written merged tree. The whole apply is serialized on the vid.
         let publish_lock = self.publish_lock(*vid);
-        let _apply = publish_lock.lock().await;
+        let _apply = publish_lock.lock_owned().await;
+        let source = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .working_dirs
+            .get(vid)
+            .cloned();
+        let pending_restore = match source.as_ref() {
+            Some(source) => carapace_vault::has_pending_restore(source)?,
+            None => false,
+        };
+        // Rebuild an unavailable local baseline from its durable, identity-bound
+        // digest before deciding which disk changes are local edits. A newer remote
+        // manifest alone cannot tell us whether an absent local file was deleted.
+        let retained = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .needs_refetch
+            .get(vid)
+            .cloned();
+        if let Some((digest, chunk_ids)) = retained {
+            let baseline = async {
+                let bytes = if digest == ann.digest {
+                    env_bytes.clone()
+                } else {
+                    let retained_store = IrohBlobStore::new();
+                    tokio::time::timeout(peer_timeout, retained_store.fetch(&bconn, digest))
+                        .await.context("retained baseline download timed out")??;
+                    retained_store.get_bytes(digest).await?
+                };
+                let baseline = open_envelope(&ManifestEnvelope::from_bytes(&bytes)?, &vkeys.k_manifest)?;
+                let epoch = self.shared.read().expect("shared lock").epochs.get(vid).copied();
+                ensure!(baseline.vid == *vid && Some(baseline.epoch) == epoch,
+                    "retained baseline identity or epoch mismatch");
+                Ok::<_, anyhow::Error>(baseline)
+            }.await.context("cannot authenticate retained baseline; local changes remain unresolved and were not overwritten")?;
+            let keys = chunk_keys_from_manifest(&baseline, &*vkeys.k_content);
+            let mut s = self.shared.write().expect("shared lock");
+            s.vault_keys.insert(*vid, keys);
+            s.vault_blobs.insert(
+                *vid,
+                VaultBlobs {
+                    digest,
+                    chunk_ids,
+                    manifest: baseline,
+                },
+            );
+            // Keep needs_refetch until repaired blobs and metadata commit together.
+        }
+        if let Some(source) = source.as_ref() {
+            if !pending_restore {
+                // Reconcile only a complete disk tree under the same vault lock.
+                self.publish_vault_locked(source, *vid).await?;
+            }
+        }
+        let repairing_baseline = self
+            .shared
+            .read()
+            .expect("shared lock")
+            .needs_refetch
+            .contains_key(vid);
+        let _work = Arc::clone(&self.ingest_limit).acquire_owned().await?;
 
         // §11: if THIS device already published (or synced) a manifest for this
         // vault, MERGE the two rather than blindly reconstructing the received one -
@@ -2877,7 +3591,8 @@ impl Daemon {
                 // Only re-publish when the merge produced state we did not already
                 // hold; a converged (no-op) merge must not bump the epoch, or the two
                 // devices would ping-pong announces forever.
-                let changed = merged.files != local_manifest.files
+                let changed = repairing_baseline
+                    || merged.files != local_manifest.files
                     || !vv_equal(&merged.vv, &local_manifest.vv);
                 let epoch = if changed {
                     local_manifest.epoch.max(incoming.epoch) + 1
@@ -2903,10 +3618,19 @@ impl Daemon {
             }
         };
 
+        if !republish && !first_sync && !pending_restore {
+            return Ok(Reconstructed {
+                vid: *vid,
+                epoch: manifest.epoch,
+                out_dir: self.shared.read().expect("shared lock").working_dirs[vid].clone(),
+            });
+        }
+
         // Materialize every referenced chunk: chunks we already own come from our
         // served store, the peer's (conflict-loser or dominant-remote) come from the
         // blob peer. On a first sync all of them come from the peer.
-        let mut store = MemoryStore::new();
+        let _scratch_dir = EphemeralDir(ephemeral_state_dir()?);
+        let mut store = FsStore::open(&_scratch_dir.0)?;
         for f in &manifest.files {
             if f.deleted {
                 continue;
@@ -2918,8 +3642,13 @@ impl Daemon {
                 let ct = match self.blobs.get_bytes(*id).await {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        scratch.fetch(&bconn, *id).await?;
-                        scratch.get_bytes(*id).await?
+                        // Drop each download store after one chunk so ciphertext
+                        // memory is bounded by a chunk, not the whole vault.
+                        let chunk_scratch = IrohBlobStore::new();
+                        tokio::time::timeout(peer_timeout, chunk_scratch.fetch(&bconn, *id))
+                            .await
+                            .context("chunk download timed out")??;
+                        chunk_scratch.get_bytes(*id).await?
                     }
                 };
                 carapace_vault::ChunkStore::put(&mut store, *id, ct)?;
@@ -2933,30 +3662,60 @@ impl Daemon {
         // sound. If this device has no working dir yet (a pure receiver's first
         // sync), fall back to `out_root/<vid>` and adopt it as the working dir.
         let out_dir = {
-            let mut s = self.shared.write().expect("shared lock");
-            let adopting = !s.working_dirs.contains_key(vid);
-            let dir = s
-                .working_dirs
-                .entry(*vid)
-                .or_insert_with(|| out_root.join(hex32(vid)))
-                .clone();
-            // §11 (audit #4): `working_dirs` is a persisted category. When we adopt a new
-            // working dir for a pure receiver's first sync, commit it now - a later
-            // `publish_merged`/`persist_sync_baseline` may not run (a no-op re-sync), and
-            // a lost working dir strands this vault's future edits.
-            if adopting {
-                self.persist_locked(&s);
+            let s = self.shared.read().expect("shared lock");
+            if let Some(dir) = s.working_dirs.get(vid) {
+                dir.clone()
+            } else {
+                let candidate = out_root.join(hex32(vid));
+                if candidate.exists() {
+                    ensure!(
+                        std::fs::read_dir(&candidate)?.next().is_none(),
+                        "sync destination contains unmanaged files: {}",
+                        candidate.display()
+                    );
+                }
+                candidate
             }
-            dir
         };
-        reconstruct(&manifest, &store, &keys, &out_dir)?;
-        // §11: apply tombstone deletions so a propagated delete removes a file a
-        // prior reconstruct may have written into this working dir.
-        for f in &manifest.files {
-            if f.deleted && manifest_rel_is_safe(&f.path) {
-                let _ = std::fs::remove_file(out_dir.join(&f.path));
-            }
-        }
+        self.ensure_disjoint_working_dir(*vid, &live_sync::registered_path(&out_dir)?)?;
+        let backup_root = self.state_dir.join("restore-backups").join(hex32(vid));
+        // The apply guard travels with blocking writes: stopping the runtime
+        // cannot release the vault lock while a filesystem write is still running.
+        let (manifest, keys, store, out_dir, _apply, _work, _scratch_dir) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                if pending_restore {
+                    // ponytail: a full private copy per rare retry preserves edits made
+                    // during interruption without guessing which mixed files are new.
+                    state::ensure_private_directory(
+                        backup_root.parent().context("backup parent")?,
+                    )?;
+                    state::ensure_private_directory(&backup_root)?;
+                    let attempt = tempfile::Builder::new()
+                        .prefix("attempt-")
+                        .tempdir_in(&backup_root)?
+                        .keep();
+                    carapace_vault::backup_interrupted_tree(&out_dir, &attempt).context(
+                        "partial restore backup failed; working files were not overwritten",
+                    )?;
+                    // Publish the backup hierarchy before overwriting source files.
+                    #[cfg(unix)]
+                    for directory in backup_root.ancestors().take(3) {
+                        std::fs::File::open(directory)?.sync_all()?;
+                    }
+                }
+                reconstruct(&manifest, &store, &keys, &out_dir)?;
+                // §11: apply tombstone deletions so a propagated delete removes a file a
+                // prior reconstruct may have written into this working dir.
+                for f in &manifest.files {
+                    if f.deleted {
+                        carapace_vault::remove_restored_file(&out_dir, &f.path)?;
+                    }
+                }
+
+                Ok((manifest, keys, store, out_dir, _apply, _work, _scratch_dir))
+            })
+            .await
+            .context("vault reconstruction task")??;
 
         if republish {
             // Re-publish the merged state so the other device(s) converge on it
@@ -2969,7 +3728,18 @@ impl Daemon {
             // device's baseline WITHOUT announcing/serving, so a later local edit
             // (or watcher re-ingest) diffs against the incoming state instead of
             // re-minting every file as new and spawning a spurious conflict copy.
-            self.persist_sync_baseline(vid, &manifest, &keys, ann.digest);
+            // A baseline must survive restart with its envelope and chunks.
+            let _blob_mutation = self.blobs.begin_durable_mutation().await;
+            self.blobs.add(&env_bytes).await?;
+            for file in &manifest.files {
+                for (id, _, _) in &file.chunks {
+                    if let Some(bytes) = carapace_vault::ChunkStore::get(&store, id)? {
+                        self.blobs.add(&bytes).await?;
+                    }
+                }
+            }
+            self.blobs.sync().await?;
+            self.persist_sync_baseline(vid, &manifest, &keys, ann.digest, &out_dir);
         }
 
         Ok(Reconstructed {
@@ -2979,18 +3749,15 @@ impl Daemon {
         })
     }
 
-    /// MAJOR 4: persist a first-sync reconstruction as this device's published
-    /// baseline for `vid` (manifest + per-chunk secrets + epoch) WITHOUT touching
-    /// announces/grants/owned_chunks - the device is a silent receiver until it
-    /// makes a local change. `publish_vault`'s prev-diff then works against the
-    /// incoming state, so an unchanged re-ingest is a no-op and a real local edit
-    /// bumps cleanly instead of re-minting every file as new.
+    /// Persist the complete first-sync baseline, authoritative directory and blob
+    /// authorization together. Its own announce is created on the next publish.
     fn persist_sync_baseline(
         &self,
         vid: &[u8; 32],
         manifest: &Manifest,
         keys: &ChunkKeys,
         digest: [u8; 32],
+        out_dir: &Path,
     ) {
         let mut seen = HashSet::new();
         let mut chunk_ids = Vec::new();
@@ -3002,8 +3769,13 @@ impl Daemon {
             }
         }
         let mut s = self.shared.write().expect("shared lock");
+        s.working_dirs.insert(*vid, out_dir.to_path_buf());
         s.epochs.insert(*vid, manifest.epoch);
         s.vault_keys.insert(*vid, keys.clone());
+        for id in &chunk_ids {
+            s.owned_chunks.insert(*id, *vid);
+        }
+        s.owned_chunks.insert(digest, *vid);
         s.vault_blobs.insert(
             *vid,
             VaultBlobs {
@@ -3020,24 +3792,25 @@ impl Daemon {
         self.persist_locked(&s);
     }
 
-    /// §11: adopt an already-merged manifest as this device's new published
-    /// baseline for `vid` so the reconciliation propagates. Adds every referenced
-    /// chunk - including the peer's just fetched into `store` - to the served blob
-    /// store, seals + node-signs a fresh envelope, builds a matching grant, and
-    /// replaces this vault's announce/grant/blob-source at the bumped epoch.
+    /// §11: adopt an already-merged manifest as this device's new published baseline for
+    /// `vid` so the reconciliation propagates: add every referenced chunk to the served
+    /// store, seal + node-sign a fresh envelope, and replace this vault's
+    /// announce/grant/blob-source at the bumped epoch.
     async fn publish_merged(
         &self,
         vid: &[u8; 32],
         manifest: &Manifest,
         keys: &ChunkKeys,
-        store: &MemoryStore,
+        store: &FsStore,
     ) -> Result<()> {
+        // Serialize all served-store writes through their state commit against GC.
+        let _blob_mutation = self.blobs.begin_durable_mutation().await;
         let vkeys = VaultKeys::derive(&*self.k_root, *vid);
         let envelope = seal_manifest(manifest, &vkeys, &self.node_key)?;
         let digest = self.blobs.add(&envelope.to_bytes()).await?;
 
-        // Load every referenced chunk into the served store so this device can serve
-        // the reconciled manifest to its peers (both its own and the peer's copies).
+        // Load every referenced chunk into the served store so this device can serve the
+        // reconciled manifest to its peers.
         let mut seen = HashSet::new();
         let mut chunk_ids = Vec::new();
         for f in &manifest.files {
@@ -3055,8 +3828,7 @@ impl Daemon {
                 chunk_ids.push(*id);
             }
         }
-        // Durability barrier (§3.2.2): commit the merged blobs before the epoch
-        // commit below — same rule as `publish_vault`.
+        // Durability barrier: commit the merged blobs before the epoch commit (as publish_vault).
         self.blobs.sync().await?;
 
         let grant = self.build_file_grant(manifest, keys, *vid, manifest.epoch)?;
@@ -3066,8 +3838,8 @@ impl Daemon {
         for id in &chunk_ids {
             s.owned_chunks.insert(*id, *vid);
         }
-        // F1 (design §3.5): gate the served manifest-envelope digest too (see
-        // `publish_vault`), so a default-deny gate still serves it to own devices.
+        // F1: gate the served manifest-envelope digest too, so a default-deny gate still
+        // serves it to own devices.
         s.owned_chunks.insert(digest, *vid);
         s.vault_keys.insert(*vid, keys.clone());
         let replicas = replica_list(self.node_id(), s.members.get(vid));
@@ -3092,12 +3864,10 @@ impl Daemon {
                 manifest: manifest.clone(),
             },
         );
-        // A merged republish repairs a needs-refetch vault too (§3.5).
+        // A merged republish repairs a needs-refetch vault too.
         s.needs_refetch.remove(vid);
-        // §11 (audit #4): this inserted persisted gate categories (epochs, owned_chunks
-        // incl. the envelope digest, announces, grants, vault_blobs). Commit them under
-        // the held write lock, or a reboot default-denies our own re-served blobs and
-        // rolls back our own-announce for this vault.
+        // Commit the persisted gate categories under the held lock, or a reboot default-denies
+        // our own re-served blobs and rolls back our own-announce for this vault.
         self.persist_locked(&s);
         Ok(())
     }
@@ -3128,10 +3898,8 @@ impl Daemon {
             .cloned()
     }
 
-    /// Test/diagnostic helper: perform a document pull against `peer` and return
-    /// the counts of `(cards, announces, grants)` frames the peer actually served.
-    /// A peer that refuses this dialer (W5) serves only its `Hello`, so all three
-    /// counts are zero; an authorized dialer sees the peer's document set.
+    /// Test helper: document-pull against `peer` and return the `(cards, announces, grants)`
+    /// frame counts served. A refused dialer (W5) gets only the `Hello`, so all zero.
     #[doc(hidden)]
     pub async fn pull_doc_counts(&self, peer: EndpointAddr) -> Result<(usize, usize, usize)> {
         let conn = self.ep.connect(peer, ALPN).await?;
@@ -3154,10 +3922,9 @@ impl Daemon {
         Ok((cards, announces, grants))
     }
 
-    /// Present our own card on `peer`'s `carapace/1` control stream so it can
-    /// classify our node id (W5/§7.4). We discard whatever documents it serves; the
-    /// side effect - the peer recording our blob-read authorization - is the point.
-    /// Used before fetching replica-held blobs from a peer that is not the doc peer.
+    /// Present our own card on `peer`'s control stream so it classifies our node id (W5/§7.4);
+    /// the side effect (the peer recording our blob-read authorization) is the point. Used
+    /// before fetching replica-held blobs from a peer that is not the doc peer.
     async fn authenticate_to(&self, peer: &EndpointAddr) -> Result<()> {
         let own_card = {
             let s = self.shared.read().expect("shared lock");
@@ -3166,8 +3933,7 @@ impl Daemon {
         let conn = self.ep.connect(peer.clone(), ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
         write_msg(&mut send, &own_card).await?;
-        // Drain the peer's response (Hello + any served docs) so it processes our
-        // card fully before we open the blob stream.
+        // Drain the peer's response so it processes our card fully before we open the blob stream.
         while (read_frame_raw(&mut recv).await?).is_some() {}
         send.finish()?;
         Ok(())
@@ -3207,15 +3973,11 @@ impl Daemon {
         Ok(ticket)
     }
 
-    /// Drive the requester side of the §9.2 handshake against the ticket issuer at
-    /// `peer`: send a `FriendRequest`, countersign the friendship core the acceptor
-    /// chooses, and on a valid `FriendAccept` persist the dual-signed `Friendship`
-    /// plus the acceptor's card. Returns the completed friendship.
-    ///
-    /// `grant_bytes` is the per-friend replica-storage limit THIS node agrees to
-    /// grant the new friend (enforced later by `serve_replica_store` when they
-    /// place a replica on us); `None` uses `DEFAULT_QUOTA_BYTES` (1 GiB). This is
-    /// local policy, independent of the friend's advertised `offers.storage_bytes`.
+    /// Drive the requester side of the §9.2 handshake against the ticket issuer at `peer`:
+    /// send a `FriendRequest`, countersign the acceptor's friendship core, and on a valid
+    /// `FriendAccept` persist the dual-signed `Friendship` + the acceptor's card.
+    /// `grant_bytes` is the per-friend replica-storage limit this node grants (local policy);
+    /// `None` uses `DEFAULT_QUOTA_BYTES`.
     pub async fn befriend(
         &self,
         peer: EndpointAddr,
@@ -3233,14 +3995,12 @@ impl Daemon {
         };
         let req = build_friend_request(&self.node_key, own_card, ticket.token);
 
-        // §6: inject the ticket's addressing hints (issuer node id + direct addrs
-        // + self-hosted relay URLs) so we can dial the issuer by node id even when
-        // `peer` carries no direct address (the NAT-blind, relay-only path).
+        // §6: inject the ticket's addressing hints so we can dial the issuer by node id even
+        // when `peer` carries no direct address (the NAT-blind, relay-only path).
         learn_ticket_hints(&self.ep.hints(), ticket).await;
 
-        // Record the acceptor's dialable address so the maintenance loop can later
-        // re-reach it (PoR probes, attestation challenges) without a discovery
-        // round-trip (§6). Captured before `peer` is consumed by the dial below.
+        // Record the acceptor's dialable address so the maintenance loop can re-reach it
+        // without a discovery round-trip. Captured before `peer` is consumed by the dial.
         let peer_addr = peer.clone();
         let peer_node = *peer.id.as_bytes();
         let conn = self.ep.connect(peer, ALPN).await?;
@@ -3263,27 +4023,28 @@ impl Daemon {
 
         let friendship = verify_friend_accept(&accept, now, &self_user)
             .map_err(|e| anyhow::anyhow!("friend accept invalid: {e}"))?;
-        // S3: the accept must actually come from the ticket's issuer, and the
-        // resulting friendship must bind that same party - defense in depth against
-        // a redirected/substituted acceptor.
+        // S3: the accept must come from the ticket's issuer and the friendship must bind that
+        // same party - defense in depth against a redirected/substituted acceptor.
         ensure!(
             accept_binds_ticket(&accept, &ticket.user, &friendship),
             "friend accept does not match the ticket issuer"
         );
         {
             let mut s = self.shared.write().expect("shared lock");
+            ensure!(
+                s.peer_addrs.contains_key(&peer_node) || s.peer_addrs.len() < MAX_PEER_RECORDS,
+                "peer address cache is full"
+            );
             s.friendships.insert(acceptor_user, friendship.clone());
             s.friends.insert(acceptor_user, accept.card.clone());
-            // Agree the per-friend replica-storage grant at add-friend time.
             s.friend_grants
                 .insert(acceptor_user, grant_bytes.unwrap_or(DEFAULT_QUOTA_BYTES));
             s.peer_addrs.insert(peer_node, peer_addr);
-            // Commit the friendship before returning it to the caller (the acceptor
-            // already committed its side in serve_friend_accept). peer_addrs is EPH.
+            // Commit the friendship before returning it (the acceptor already committed its
+            // side in serve_friend_accept). peer_addrs is EPH.
             self.persist_locked(&s);
         }
-        // §6: learn the acceptor's card hints (relay + direct addrs) for later
-        // dials (anti-entropy, PoR probes) by node id.
+        // §6: learn the acceptor's card hints for later dials by node id.
         learn_card_hints(&self.ep.hints(), &accept.card).await;
         drop(conn);
         Ok(friendship)
@@ -3292,23 +4053,13 @@ impl Daemon {
     // ---- unfriend + trustee re-split (§9.3, W5) ------------------------
 
     /// Terminate a friendship unilaterally and run the §9.3 flow. Synchronously tears down
-    /// local state (drop them from the friend graph, delete everything we hold OF them,
-    /// queue their replicas of our vaults for immediate re-placement, and record a PENDING
-    /// re-split for every recovery set they were a trustee of); then, best-effort over the
-    /// control stream, signs + sends a [`FriendshipEnd`] (effective for us on send) and one
-    /// [`DeleteRequest`] per placement we made on them (§9.3 step 1); re-places the vaults
-    /// they replicated for us treating them as lost NOW (§9.3 step 2, no 24 h grace); and
-    /// drives any already-open re-split forward. Idempotent-ish: unfriending a non-friend
-    /// returns `was_friend = false` and does nothing.
-    ///
-    /// §9.3.4: a trustee re-split is NOT auto-started here - it is recorded pending (with a
-    /// suggested new set) so the client can prompt the user, who starts it via
-    /// [`Daemon::start_pending_resplit`]. `resplit_rsids` names those pending sets.
-    ///
-    /// The catastrophic-key-loss invariant holds throughout: a re-split's OLD shares are
-    /// only ever destroyed through [`Resplit::share_destroy`], which refuses until the
-    /// NEW set attests `>= M + slack`. Outstanding `FileGrant`s to the ex-friend remain
-    /// disclosed-forever (§7.4); this flow does not and cannot revoke them.
+    /// local state (drop from the friend graph, delete everything we hold OF them, queue
+    /// their replicas of our vaults for re-placement, record a PENDING re-split per recovery
+    /// set they were a trustee of); then best-effort signs + sends a [`FriendshipEnd`] and one
+    /// [`DeleteRequest`] per placement, re-places the vaults they replicated for us treating
+    /// them as lost NOW, and drives any already-open re-split. Unfriending a non-friend returns
+    /// `was_friend = false`. A trustee re-split is recorded pending, not auto-started (§9.3.4).
+    /// OLD shares are only ever destroyed through [`Resplit::share_destroy`] (`>= M + slack`).
     pub async fn unfriend(&self, ex_user: [u8; 32]) -> Result<UnfriendOutcome> {
         let now = unix_now();
         let teardown = {
@@ -3317,15 +4068,13 @@ impl Daemon {
                 return Ok(UnfriendOutcome::default());
             }
             let td = teardown_unfriended_state(&mut s, ex_user);
-            // §3.2.2-3: commit the whole teardown (friend graph drop, deletes, pending
-            // re-split marks) BEFORE signing/sending the FriendshipEnd + DeleteRequests.
+            // Commit the whole teardown BEFORE signing/sending the FriendshipEnd + DeleteRequests.
             self.persist_locked(&s);
             td
         };
 
-        // §9.3 step 1: sign a FriendshipEnd (effective for us on send) and push it plus
-        // one DeleteRequest per placement to the ex-friend's devices (best-effort - an
-        // offline ex-friend is carried the end via its next card version instead).
+        // §9.3 step 1: sign a FriendshipEnd and push it plus one DeleteRequest per placement
+        // to the ex-friend's devices (best-effort).
         let end = end_friendship(&self.node_key, ex_user, now);
         let reqs = build_delete_requests(&self.node_key, &teardown.placement);
         for addr in &teardown.ex_addrs {
@@ -3335,9 +4084,8 @@ impl Daemon {
             }
         }
 
-        // §9.3 step 2: re-place the vaults they replicated for us, treating them as lost
-        // now (no grace). Drive any ALREADY-OPEN re-split forward; a NEW trustee re-split is
-        // left pending for the user to start (§9.3.4 prompt), not auto-started here.
+        // §9.3 step 2: re-place the vaults they replicated for us (no grace). Drive any
+        // ALREADY-OPEN re-split; a NEW trustee re-split is left pending for the user to start.
         self.replace_unfriended_replicas().await;
         self.advance_resplits().await;
 
@@ -3347,10 +4095,9 @@ impl Daemon {
         })
     }
 
-    /// Dial `addr` and send one signed [`DeleteRequest`], reading back the (optional)
-    /// signed [`DeleteAck`] (§9.3 step 1). The ack is verified and returned for the
-    /// caller's bookkeeping - it is NOT proof of deletion (nothing is), so a missing or
-    /// bad ack is not an error. Bounded by the connect timeout.
+    /// Dial `addr` and send one signed [`DeleteRequest`], reading back the optional verified
+    /// [`DeleteAck`] (§9.3 step 1). The ack is not proof of deletion, so a missing/bad ack is
+    /// not an error. Bounded by the connect timeout.
     async fn send_delete_request(
         &self,
         addr: &EndpointAddr,
@@ -3392,13 +4139,9 @@ impl Daemon {
         ack
     }
 
-    /// §9.3 step 2: re-replicate every OWNED vault an unfriended peer held a replica of
-    /// onto other accepting friends, treating the ex-friend as confirmed lost NOW
-    /// ([`Health::Unfriended`], no 24 h grace). Drains the `unfriended_nodes` queue.
-    /// Independent of any DeleteAck: repair fires regardless of whether the ex-friend
-    /// complied. Candidates are the remaining friends' known addresses (an unfriended
-    /// node is already gone from `peer_addrs` and the friend graph, so it can never be
-    /// re-selected).
+    /// §9.3 step 2: re-replicate every OWNED vault an unfriended peer held a replica of onto
+    /// other accepting friends, treating the ex-friend as lost NOW ([`Health::Unfriended`], no
+    /// grace). Drains `unfriended_nodes`; fires regardless of any DeleteAck.
     async fn replace_unfriended_replicas(&self) {
         let (nodes, vids, candidates) = {
             let s = self.shared.read().expect("shared lock");
@@ -3422,22 +4165,18 @@ impl Daemon {
         for vid in vids {
             let _ = self.repair_vault(vid, &healths, &candidates).await;
         }
-        // Clear the queue: a vault still short after this pass is retried by the PoR /
-        // reachability repair path, not spun on here.
+        // Clear the queue: a vault still short after this pass is retried by the PoR/
+        // reachability repair path.
         let mut s = self.shared.write().expect("shared lock");
         s.unfriended_nodes.retain(|n| !nodes.contains(n));
     }
 
-    /// Drive every OPEN re-split forward one step (§9.3 step 3). Called from the initiating
-    /// `unfriend` and from the maintenance loop. It does NOT stand up PENDING re-splits:
-    /// §9.3.4 requires the user to be prompted first, so a pending re-split becomes open
-    /// only through [`Daemon::start_pending_resplit`]. Driving delivers new grants,
-    /// challenges the new set, and - ONLY once [`Resplit`] reports the new set live - sends
-    /// the old set its destroy instruction.
+    /// Drive every OPEN re-split forward one step (§9.3 step 3), from `unfriend` and the
+    /// maintenance loop. Does NOT stand up PENDING re-splits (§9.3.4 needs a user prompt).
+    /// Delivers new grants, challenges the new set, and - ONLY once [`Resplit`] reports it
+    /// live - sends the old set its destroy instruction.
     async fn advance_resplits(&self) {
-        // Serialize the drive: two concurrent runs of the same open re-split would
-        // double-deliver / double-challenge. Held across the network drive; only ever
-        // serializes the rare unfriend-triggered path.
+        // Serialize the drive so two concurrent runs of the same re-split can't double-deliver.
         let _guard = self.resplit_lock.lock().await;
         let open: Vec<u64> = {
             self.shared
@@ -3453,17 +4192,11 @@ impl Daemon {
         }
     }
 
-    /// §9.3.4 W5: start a re-split the user was prompted about (`POST
-    /// /api/recovery/{rsid}/resplit-start`). Stands up the pending re-split for `old_rsid`
-    /// into an open one (using `k_root`), removes it from the pending queue, and drives it
-    /// one step (delivering the new set's grants). `new_trustees`, when given, overrides the
-    /// suggested new set (each a user pubkey of an established friend or an old trustee);
-    /// otherwise the suggested set (old honest set) is used.
-    ///
-    /// Idempotent-ish: if the re-split is already open it just drives it. Errors if no
-    /// pending re-split is recorded for `old_rsid`, or if the chosen set cannot form a
-    /// working set. The destroy-gate invariant is untouched - this only stands up the NEW
-    /// set; old shares are still destroyed only through [`Resplit::share_destroy`].
+    /// §9.3.4: start a re-split the user was prompted about. Stands up the pending re-split
+    /// for `old_rsid` into an open one (using `k_root`), removes it from the pending queue, and
+    /// drives it one step. `new_trustees` overrides the suggested new set; otherwise the old
+    /// honest set is used. If already open it just drives it. The destroy-gate invariant is
+    /// untouched - old shares are still destroyed only through [`Resplit::share_destroy`].
     pub async fn start_pending_resplit(
         &self,
         old_rsid: u64,
@@ -3511,18 +4244,15 @@ impl Daemon {
             .with_context(|| format!("re-split for recovery set {old_rsid} vanished"))
     }
 
-    /// §9.3.1 W5: drain the receive-side outbound `DeleteRequest` queue. Each entry is a
-    /// batch queued by [`ControlHandler::serve_friendship_end`] (our own DeleteRequests for
-    /// everything WE placed on an ex-friend that unfriended US). Sends each to the
-    /// ex-friend's last-known addresses, best-effort. A DeleteRequest never triggers a
-    /// FriendshipEnd, so this cannot loop back into another unfriend.
+    /// §9.3.1: drain the receive-side outbound `DeleteRequest` queue (batches queued by
+    /// [`ControlHandler::serve_friendship_end`] for everything WE placed on an ex-friend that
+    /// unfriended US). Best-effort; a DeleteRequest never triggers a FriendshipEnd.
     async fn drive_pending_delete_sends(&self) {
         let batches: Vec<(Vec<EndpointAddr>, Placement)> = {
             let mut s = self.shared.write().expect("shared lock");
             let taken = std::mem::take(&mut s.pending_delete_sends);
             if !taken.is_empty() {
-                // Commit the drained queue so a crash mid-send does not resurrect the
-                // batch and double-send DeleteRequests (harmless but avoidable).
+                // Commit the drained queue so a crash mid-send does not resurrect the batch.
                 self.persist_locked(&s);
             }
             taken
@@ -3586,8 +4316,8 @@ impl Daemon {
                     if let Some(o) = s.resplits.get_mut(&old_rsid) {
                         o.delivered.extend(newly_delivered);
                     }
-                    // §3.2.3: commit the delivered-grant set before the next drive treats
-                    // those trustees as done (a crash must not re-deliver a stale grant).
+                    // Commit the delivered-grant set before the next drive treats those
+                    // trustees as done (a crash must not re-deliver a stale grant).
                     self.persist_locked(&s);
                 }
 
@@ -3665,8 +4395,8 @@ impl Daemon {
                             let _ = o.rs.record_destroy_ack(ack);
                         }
                     }
-                    // §3.2.3: commit the recorded destroy-acks before treating the old
-                    // shares as gone (a crash must not re-issue a destroy already acked).
+                    // Commit the recorded destroy-acks before treating the old shares as gone
+                    // (a crash must not re-issue a destroy already acked).
                     self.persist_locked(&s);
                 }
                 // §9.3 step 4: once every old honest trustee has destroy-acked the
@@ -3700,10 +4430,8 @@ impl Daemon {
             .collect()
     }
 
-    /// §9.3.4 W5: the PENDING re-split prompts - re-splits an unfriend detected but the
-    /// user has not yet started. One row per pending re-split, each with the suggested new
-    /// trustee set and its members' live reachability, so the GUI can render the prompt and
-    /// let the user start it via `POST /api/recovery/{rsid}/resplit-start`.
+    /// §9.3.4: the PENDING re-split prompts - one row per re-split an unfriend detected but
+    /// the user has not started, with the suggested new trustee set and its live reachability.
     pub fn pending_resplit_statuses(&self) -> Vec<PendingResplitStatus> {
         let s = self.shared.read().expect("shared lock");
         let now = unix_now();
@@ -3757,9 +4485,7 @@ impl Daemon {
     pub fn deny_replica_peer(&self, node: [u8; 32]) {
         let mut s = self.shared.write().expect("shared lock");
         s.replica_deny.insert(node);
-        // `replica_deny` is a persisted S4 policy category: commit it so the deny
-        // survives a reboot (audit #5), else a denied peer could be re-placed after
-        // restart.
+        // Commit the S4 deny so it survives a reboot, else a denied peer could be re-placed.
         self.persist_locked(&s);
     }
 
@@ -3782,16 +4508,27 @@ impl Daemon {
             .unwrap_or_default()
     }
 
-    /// Invite each friend in `peers` to store a replica of `vid`, targeting
-    /// invariant `r`. Each accepting peer is pushed the manifest envelope plus
-    /// every ciphertext chunk and recorded as a member; the announce is re-signed
-    /// to reflect the new set. Returns the node ids that accepted.
+    /// Invite each friend in `peers` to store a replica of `vid`, targeting invariant `r`.
+    /// Each accepting peer is pushed the envelope + every chunk, recorded as a member, and the
+    /// announce re-signed. Returns the node ids that accepted.
     pub async fn place_replicas(
         &self,
         vid: [u8; 32],
         peers: &[EndpointAddr],
         r: usize,
     ) -> Result<Vec<[u8; 32]>> {
+        if self.own_announce_digest(&vid).is_none() {
+            let source = self
+                .shared
+                .read()
+                .expect("shared lock")
+                .working_dirs
+                .get(&vid)
+                .cloned()
+                .context("vault has no working directory")?;
+            self.publish_vault(&source, vid).await?;
+        }
+
         let (vb, epoch) = {
             let s = self.shared.read().expect("shared lock");
             let vb = s
@@ -3802,8 +4539,7 @@ impl Daemon {
             let epoch = *s.epochs.get(&vid).context("vault has no epoch")?;
             (vb, epoch)
         };
-        let blobs = self.gather_blob_bytes(&vb).await?;
-        let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+        let total = self.blob_total_bytes(&vb).await?;
 
         let now = unix_now();
         let self_user = self.user_id();
@@ -3815,10 +4551,7 @@ impl Daemon {
             if !self.replica_candidate_ok(&node, &self_user, now) {
                 continue;
             }
-            if let Some(node) = self
-                .invite_and_push(peer, vid, epoch, total, &blobs)
-                .await?
-            {
+            if let Some(node) = self.invite_and_push(peer, vid, epoch, total, &vb).await? {
                 placed.push(node);
             }
         }
@@ -3832,24 +4565,17 @@ impl Daemon {
             }
             s.replica_target.insert(vid, r);
             reannounce(&mut s, vid, self.node_id(), &self.node_key);
-            // Persist the recorded replica set (members, target, re-announce) so the
-            // placement + its fetch-gate membership survive restart.
+            // Persist the replica set so the placement + its fetch-gate membership survive restart.
             self.persist_locked(&s);
         }
         Ok(placed)
     }
 
-    /// Run the §10.1 repair loop for `vid`: drop members confirmed lost by the
-    /// injected `healths` (unfriended, or unreachable past the 24 h grace), then
-    /// re-replicate from `candidates` up to the invariant `r`, re-announcing the
-    /// new set. Returns `true` if the member set changed.
-    ///
-    /// ponytail: the re-announce reuses the content epoch rather than bumping it,
-    /// because `announce.epoch` is bound to the sealed manifest here (reconstruct
-    /// checks `manifest.epoch == announce.epoch`). A fresh puller therefore always
-    /// sees the current set; a peer that already cached the announce would not pick
-    /// up a set change until the next content epoch. Decouple the replica-set
-    /// version from the content epoch if in-place set propagation is required.
+    /// Run the §10.1 repair loop for `vid`: drop members confirmed lost by `healths`
+    /// (unfriended, or unreachable past the 24 h grace), then re-replicate from `candidates`
+    /// up to invariant `r`, re-announcing the new set. Returns `true` if the set changed.
+    /// The re-announce reuses the content epoch (announce.epoch is bound to the sealed
+    /// manifest), so a fresh puller sees the current set but a cached one lags until the next epoch.
     pub async fn repair_vault(
         &self,
         vid: [u8; 32],
@@ -3878,8 +4604,7 @@ impl Daemon {
         });
 
         if members.len() < r {
-            let blobs = self.gather_blob_bytes(&vb).await?;
-            let total: u64 = blobs.iter().map(|b| b.len() as u64).sum();
+            let total = self.blob_total_bytes(&vb).await?;
             let self_user = self.user_id();
             for peer in candidates {
                 if members.len() >= r {
@@ -3893,10 +4618,7 @@ impl Daemon {
                 if !self.replica_candidate_ok(&node, &self_user, now) {
                     continue;
                 }
-                if let Some(n) = self
-                    .invite_and_push(peer, vid, epoch, total, &blobs)
-                    .await?
-                {
+                if let Some(n) = self.invite_and_push(peer, vid, epoch, total, &vb).await? {
                     members.push(n);
                 }
             }
@@ -3906,9 +4628,8 @@ impl Daemon {
             return Ok(false);
         }
         {
-            // S7: merge rather than blindly overwrite, so a concurrent placement
-            // that added a member while we were pushing is not clobbered. Drop the
-            // members we confirmed lost, then union in the repaired set.
+            // S7: merge rather than overwrite, so a concurrent placement that added a member
+            // while we pushed is not clobbered. Drop the lost members, then union the repaired set.
             let mut s = self.shared.write().expect("shared lock");
             let cur = s.members.entry(vid).or_default();
             cur.retain(|m| {
@@ -3931,13 +4652,14 @@ impl Daemon {
 
     /// Fetch the envelope (index 0) plus every unique chunk from this daemon's
     /// blob store, in the order a replica expects them pushed.
-    async fn gather_blob_bytes(&self, vb: &VaultBlobs) -> Result<Vec<Vec<u8>>> {
-        let mut out = Vec::with_capacity(1 + vb.chunk_ids.len());
-        out.push(self.blobs.get_bytes(vb.digest).await?);
-        for id in &vb.chunk_ids {
-            out.push(self.blobs.get_bytes(*id).await?);
+    async fn blob_total_bytes(&self, vb: &VaultBlobs) -> Result<u64> {
+        let mut total = 0u64;
+        for id in std::iter::once(&vb.digest).chain(&vb.chunk_ids) {
+            total = total
+                .checked_add(self.blobs.get_bytes(*id).await?.len() as u64)
+                .context("vault byte count overflow")?;
         }
-        Ok(out)
+        Ok(total)
     }
 
     /// Dial `peer`'s control stream, send a `ReplicaInvite`, and on a valid
@@ -3949,7 +4671,7 @@ impl Daemon {
         vid: [u8; 32],
         epoch: u64,
         total: u64,
-        blobs: &[Vec<u8>],
+        vb: &VaultBlobs,
     ) -> Result<Option<[u8; 32]>> {
         let node = *peer.id.as_bytes();
         let conn = self.ep.connect(peer.clone(), ALPN).await?;
@@ -3980,11 +4702,9 @@ impl Daemon {
             "placement exceeds granted quota"
         );
 
-        // Send the current owner-signed announce so the replica learns the set it
-        // joins and can gate later fetches on membership (§7.4 b, W8), and can serve it
-        // back to a recovering owner-device that lost every original device. Option B
-        // (§4): no FileGrant is pushed - the recovering device re-derives per-chunk keys
-        // from the manifest pt_hash, so own-device sync and recovery need no grant.
+        // Send the current owner-signed announce so the replica learns the set it joins,
+        // gates later fetches on membership (§7.4 b, W8), and can serve it back to a
+        // recovering owner-device. Option B (§4): no FileGrant is pushed.
         let announce = {
             let s = self.shared.read().expect("shared lock");
             s.announces
@@ -3995,24 +4715,26 @@ impl Daemon {
         };
         write_msg(&mut send, &announce).await?;
 
-        write_u64(&mut send, blobs.len() as u64).await?;
-        for b in blobs {
-            write_blob(&mut send, b).await?;
+        let blob_count = 1 + vb.chunk_ids.len() as u64;
+        write_u64(&mut send, blob_count).await?;
+        for id in std::iter::once(&vb.digest).chain(&vb.chunk_ids) {
+            let bytes = self.blobs.get_bytes(*id).await?;
+            write_blob(&mut send, &bytes).await?;
         }
         send.finish()?;
         // Wait for the replica's ack so membership only records durable storage.
         let acked = read_u64(&mut recv).await?;
         ensure!(
-            acked == blobs.len() as u64,
-            "replica acked {acked} of {} blobs",
-            blobs.len()
+            acked == blob_count,
+            "replica acked {acked} of {blob_count} blobs"
         );
-        // §6: remember where this replica lives so the PoR loop can re-audit it by
-        // node id without a discovery round-trip. §9.3.4: a completed placement is also a
-        // live-reachability signal for this peer.
+        // §6: remember where this replica lives (PoR re-audit by node id) and mark it seen
+        // (§9.3.4 reachability signal).
         {
             let mut s = self.shared.write().expect("shared lock");
-            s.peer_addrs.insert(node, peer.clone());
+            if s.peer_addrs.contains_key(&node) || s.peer_addrs.len() < MAX_PEER_RECORDS {
+                s.peer_addrs.insert(node, peer.clone());
+            }
             s.peer_last_seen.insert(node, unix_now());
         }
         Ok(Some(node))
@@ -4020,24 +4742,12 @@ impl Daemon {
 
     // ---- PoR retention audit loop (§10.1) ------------------------------
 
-    /// Run one Proof-of-Retention audit round for `vid` over `members`
-    /// (`replica node id -> dialable address`), then repair on confirmed loss.
-    ///
-    /// For each member due at `now` (per the injected-clock [`AuditTracker`]) the
-    /// owner derives an unpredictable sample of chunks from `K_audit(vid)` (a key
-    /// only the owner holds), fetches exactly those chunks *from that replica* into
-    /// a throwaway store so the transfer genuinely comes off the peer, and BLAKE3-
-    /// verifies them against their ChunkIDs. A missing or wrong chunk fails the
-    /// round; [`DEFAULT_POR_FAIL_LIMIT`](carapace_replica::DEFAULT_POR_FAIL_LIMIT)
-    /// consecutive failures marks the replica lost, which is fed to
-    /// [`Daemon::repair_vault`] as [`Health::AuditLost`] (re-replicate onto a spare
-    /// from `candidates`, re-announce). Returns what happened this round.
-    ///
-    /// The caller ticks this (a `tokio::time::interval` in a real deployment, an
-    /// injected `now` in tests); the tracker's per-replica jittered schedule decides
-    /// which members are actually probed on any given tick (§10.1). No lock is held
-    /// across the network fetch: audits read a manifest/schedule snapshot, probe off
-    /// the lock, then record synchronously.
+    /// Run one Proof-of-Retention audit round for `vid` over `members` (`node id -> dialable
+    /// address`), then repair on confirmed loss. For each member due at `now` the owner
+    /// samples chunks from owner-only `K_audit(vid)`, fetches exactly those from that replica
+    /// into a throwaway store, and BLAKE3-verifies them; [`DEFAULT_POR_FAIL_LIMIT`] consecutive
+    /// failures marks it lost and feeds [`Daemon::repair_vault`] ([`Health::AuditLost`]). No
+    /// lock is held across the network fetch.
     pub async fn por_audit_round(
         &self,
         vid: [u8; 32],
@@ -4051,19 +4761,16 @@ impl Daemon {
             let epoch = *s.epochs.get(&vid).context("vault has no epoch")?;
             (vb.manifest.clone(), epoch)
         };
-        // K_audit(vid) = HKDF(K_vaultroot(vid), "por") - owner-only, so the sample
-        // set is unpredictable to the replica being probed.
+        // K_audit(vid) = HKDF(K_vaultroot(vid), "por") - owner-only, so the sample set is
+        // unpredictable to the probed replica.
         let vaultroot = kdf::k_vaultroot(&*self.k_root, &vid);
         let k_audit: [u8; 32] = *kdf::k_audit(&*vaultroot);
 
         let mut round = PorRound::default();
         for (node, addr) in members {
-            // Read the round to issue + the wide flag, then IMMEDIATELY advance and
-            // persist the round counter (a "challenge issued" mark) BEFORE building or
-            // revealing the challenge on the wire (§10.1 / audit #6). Otherwise a crash
-            // after the reveal but before the result is recorded would leave the round
-            // counter at `r`, and the next boot would re-issue the identical - now
-            // observed, hence predictable - challenge to the same replica.
+            // Advance and persist the round counter (a "challenge issued" mark) BEFORE
+            // revealing the challenge on the wire, so a crash after the reveal cannot re-issue
+            // the identical - now observed, hence predictable - challenge on the next boot.
             let (r, wide) = {
                 let mut s = self.shared.write().expect("shared lock");
                 if !s.por.due(*node, vid, now) {
@@ -4080,13 +4787,13 @@ impl Daemon {
             } else {
                 build_audit(&k_audit, vid, epoch, r, &manifest)
             };
-            // C1: an unreachable replica (connect failed) is a transport failure,
-            // not a retention answer - it must never advance the loss streak, or a
-            // transiently-offline friend would be evicted without grace. Only a peer
-            // that actually answered is judged on content via `record_outcome`. The
-            // round counter was already advanced + persisted at issue time above, so
-            // neither branch bumps it again.
-            let action = match self.fetch_audit_samples(addr, &audit).await {
+            // C1: an unreachable replica is a transport failure, not a retention answer - it
+            // must never advance the loss streak (else a transiently-offline friend is evicted
+            // without grace). Only a peer that answered is judged on content.
+            let started = std::time::Instant::now();
+            let fetched = self.fetch_audit_samples(addr, &audit).await;
+            let elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let action = match fetched {
                 None => {
                     let mut s = self.shared.write().expect("shared lock");
                     let a = s.por.record_unreachable(*node, vid, now);
@@ -4094,8 +4801,11 @@ impl Daemon {
                     a
                 }
                 Some(responses) => {
-                    let outcome = verify_audit_response(&audit, &responses);
+                    let outcome = verify_bao_range_responses(&audit, &responses);
                     let mut s = self.shared.write().expect("shared lock");
+                    if s.por.record_latency(*node, vid, elapsed_ms) {
+                        round.latency_anomalies += 1;
+                    }
                     let a = s.por.record_outcome(*node, vid, outcome, now);
                     self.persist_locked(&s);
                     a
@@ -4119,25 +4829,18 @@ impl Daemon {
         Ok(round)
     }
 
-    /// Probe `addr` for each sampled chunk of `audit`. Returns `Some(responses)`
-    /// (one `Option<Vec<u8>>` per sample: `Some` bytes if the chunk was served,
-    /// `None` if the connected peer did not produce it) when the replica answered,
-    /// or `None` when the replica could not be reached at all.
-    ///
-    /// C1: the connect-failure `None` is distinct from a per-sample `None`. An
-    /// unreachable peer is a transport failure and must not be scored as a retention
-    /// loss; only a peer that connected is judged on the content of its answers.
-    /// Fetches into a fresh empty store so a chunk the owner already holds is still
-    /// pulled from the replica; a per-sample timeout bounds a stalled/missing probe.
+    /// Probe `addr` for each sampled chunk of `audit`. `Some(responses)` (per-sample `Some`
+    /// bytes / `None` not served) when the replica answered, `None` when it could not be
+    /// reached at all. C1: the connect-failure `None` is distinct from a per-sample `None`.
+    /// Fetches into a fresh store so a chunk the owner holds is still pulled from the replica.
     async fn fetch_audit_samples(
         &self,
         addr: &EndpointAddr,
         audit: &Audit,
     ) -> Option<Vec<Option<Vec<u8>>>> {
         let scratch = IrohBlobStore::new();
-        // Unreachable replica: no content answer at all -> signal transport failure.
-        // The connect is time-bounded so a dead peer fails fast instead of hanging
-        // the round on the QUIC handshake timeout (C1).
+        // Time-bound the connect so a dead peer fails fast to the transport-failure path
+        // instead of hanging on the QUIC handshake timeout (C1).
         let conn = match tokio::time::timeout(
             POR_CONNECT_TIMEOUT,
             self.ep.connect(addr.clone(), iroh_blobs::ALPN),
@@ -4149,13 +4852,15 @@ impl Daemon {
         };
         let mut out = Vec::with_capacity(audit.samples.len());
         for s in &audit.samples {
-            let got =
-                match tokio::time::timeout(POR_FETCH_TIMEOUT, scratch.fetch(&conn, s.chunk_id))
-                    .await
-                {
-                    Ok(Ok(())) => scratch.get_bytes(s.chunk_id).await.ok(),
-                    _ => None,
-                };
+            let got = match tokio::time::timeout(
+                POR_FETCH_TIMEOUT,
+                scratch.fetch_verified_range(&conn, s.chunk_id, s.offset, s.len),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => Some(bytes),
+                _ => None,
+            };
             out.push(got);
         }
         Some(out)
@@ -4163,17 +4868,9 @@ impl Daemon {
 
     // ---- share-health cadence (§10.2) ----------------------------------
 
-    /// Register a recovery set this daemon owns, so [`Daemon::run_share_health_round`]
-    /// tracks its attested-live count and drift. `tracker` carries the set's `M`,
-    /// slack, lifetime issued-share count, and cadence (build it with
-    /// [`AttestTracker::new`] for defaults, or `with_params` to tune the round /
-    /// freshness intervals).
-    ///
-    /// NON-DURABLE TEST HELPER (audit #9): bypasses the write-through funnel, and
-    /// `share_sets` is a DERIVE category anyway (rebuilt from `granted` at load), so a
-    /// value set here does not survive a reboot. The production path populates
-    /// `share_sets` via `serve_grant`/`rebuild_share_sets`. Kept only for the
-    /// attestation-drift tests.
+    /// Register a recovery set this daemon owns, so [`Daemon::run_share_health_round`] tracks
+    /// its attested-live count and drift. NON-DURABLE TEST HELPER: bypasses the funnel, and
+    /// `share_sets` is DERIVE anyway; production populates it via `serve_grant`.
     #[doc(hidden)]
     pub fn register_recovery_set(&self, rsid: u64, tracker: AttestTracker) {
         self.shared
@@ -4183,14 +4880,8 @@ impl Daemon {
             .insert(rsid, tracker);
     }
 
-    /// Store a share this daemon holds as a trustee for another owner, enabling it
-    /// to answer that owner's `ShareAttestChallenge`s and to run continuous local
-    /// CRC self-validation (§10.2). Keyed by the share's recovery-set id.
-    ///
-    /// NON-DURABLE TEST HELPER (audit #9): bypasses the write-through funnel, so the
-    /// stored share is NOT persisted and does not survive a reboot. The production
-    /// trustee path stores + commits held shares in `ControlHandler::serve_grant`. Kept
-    /// only for the attestation-drift tests.
+    /// Store a share this daemon holds as a trustee, keyed by recovery-set id. NON-DURABLE
+    /// TEST HELPER: bypasses the funnel; production stores + commits in `serve_grant`.
     #[doc(hidden)]
     pub fn store_share(&self, share: Share) {
         let rsid = u64::from(share.recovery_set_id);
@@ -4211,16 +4902,10 @@ impl Daemon {
             .map(|(share, mon)| mon.poll(share, now))
     }
 
-    /// Owner-side share-health round (§10.2). If a round is due at `now`, challenge
-    /// every `trustee` (`dialable address`) for the set `rsid` over the control
-    /// stream, fold each verified attestation into the set's attested-live count,
-    /// then return the drift decision: [`ShareAction::Healthy`], an
-    /// [`ShareAction::Extend`] recommendation when live has drifted below `M + slack`
-    /// with cap headroom, or [`ShareAction::ResplitLargerM`] at the §8.3 cap. When no
-    /// round is due this just re-reads the current decision without probing.
-    ///
-    /// This SURFACES the recommendation; issuing the actual extend / re-split stays
-    /// in [`carapace_recovery`]. No lock is held across the network round-trips.
+    /// Owner-side share-health round (§10.2). If a round is due at `now`, challenge every
+    /// `trustee` for `rsid`, fold each verified attestation into the attested-live count, and
+    /// return the drift decision (Healthy / Extend / ResplitLargerM); else re-read the current
+    /// decision without probing. Surfaces the recommendation only; no lock held across the wire.
     pub async fn run_share_health_round(
         &self,
         rsid: u64,
@@ -4255,8 +4940,7 @@ impl Daemon {
                 .share_sets
                 .get_mut(&rsid)
                 .context("unknown recovery set")?;
-            // Fold only attestations that verify against this challenge; a bad or
-            // mismatched one changes nothing (it simply is not counted live).
+            // Fold only attestations that verify against this challenge; a bad one is not counted.
             for att in &atts {
                 let _ = t.record_attestation(att, &challenge, now);
             }
@@ -4312,6 +4996,13 @@ impl Daemon {
     pub async fn maintenance_round(&self, now: u64) -> MaintenanceReport {
         let mut report = MaintenanceReport::default();
 
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            if cleanup_ceremonies(&mut s, now) {
+                self.persist_locked(&s);
+            }
+        }
+
         let (owned_vaults, recovery_sets, held_rsids, peer_addrs) = {
             let s = self.shared.read().expect("shared lock");
             let owned: Vec<[u8; 32]> = s
@@ -4339,8 +5030,7 @@ impl Daemon {
                 .iter()
                 .filter_map(|n| resolve_peer(&peer_addrs, n).map(|a| (*n, a)))
                 .collect();
-            // Repair candidates: known peers that are not already members of this
-            // vault (repair itself re-checks friendship + deny-list per candidate).
+            // Repair candidates: known non-member peers (repair re-checks friendship + deny).
             let candidates: Vec<EndpointAddr> = peer_addrs
                 .iter()
                 .filter(|(n, _)| !member_ids.contains(n))
@@ -4354,8 +5044,7 @@ impl Daemon {
             }
         }
 
-        // 2) Owner attestation rounds + drift surfacing over owned recovery sets
-        //    (§10.2). The subject is this owner's user key.
+        // 2) Owner attestation rounds + drift surfacing over owned recovery sets (§10.2).
         let subject = self.user_id();
         for (rsid, trustee_ids) in recovery_sets {
             let trustees: Vec<EndpointAddr> = trustee_ids
@@ -4378,52 +5067,81 @@ impl Daemon {
             }
         }
 
-        // 4) Owner grant ref-refresh (W3, §10.2/§7.3): re-issue trustees' grants with
-        //    the latest announce refs whenever a vault epoch has advanced (or a prior
-        //    delivery is still outstanding), so trustees hold current manifest pointers.
+        // 4) Owner grant ref-refresh (W3): re-issue trustees' grants with the latest announce
+        //    refs whenever a vault epoch advanced (or a delivery is outstanding).
         report.refreshed_grants = self.refresh_grants_round().await;
 
-        // 5) §9.3 W5: re-place unfriended peers' replicas (treated as lost now) and drive
-        //    every open trustee re-split one step - deliver the new set's grants, collect
-        //    attestations, and (only once the new set is proven live) destroy the old
-        //    shares. Begins any re-split an inbound `FriendshipEnd` queued but could not
-        //    stand up itself (no `k_root` in the control handler).
+        // 5) §9.3: re-place unfriended peers' replicas (lost now) and drive every open
+        //    trustee re-split one step. Begins any re-split an inbound `FriendshipEnd` queued
+        //    but could not stand up itself (no `k_root` in the control handler).
         self.replace_unfriended_replicas().await;
         self.drive_pending_delete_sends().await;
         self.advance_resplits().await;
 
-        // 6) §6/W6 relay reachability lifecycle: probe the embedded relay's liveness
-        //    and advertise-on-success / withdraw-on-loss, re-issuing our own card
-        //    (version bumped) whenever the advertised relay URL changes. No-op when
-        //    we run no relay.
+        // 6) §6/W6 relay reachability: probe the embedded relay and advertise-on-success /
+        //    withdraw-on-loss, re-issuing our card when the URL changes. No-op with no relay.
         if self.relay.is_some() {
             let alive = self.probe_relay_alive().await;
             self.drive_relay_health(alive);
         }
 
+        // 7) Reconcile durable blob-retention tags. Authorization pruning commits before
+        // stale tags are removed, so a crash can leave extra ciphertext but cannot delete
+        // current, replica, or permanently disclosed data.
+        let gc_succeeded = if let Err(error) = self.garbage_collect_blobs().await {
+            report
+                .errors
+                .push(format!("blob garbage collection: {error:#}"));
+            false
+        } else {
+            true
+        };
+
+        {
+            let mut history = self
+                .operational_history
+                .lock()
+                .expect("operational history lock");
+            record_maintenance_history(&mut history, now, report.errors.len(), gc_succeeded);
+        }
+
         report
     }
 
-    /// Spawn the background maintenance loop (§10.1/§10.2) and return its handle.
-    ///
-    /// The loop wakes every `cfg.tick`, runs one [`Daemon::maintenance_round`] against
-    /// the wall clock, and self-gates each concern on its own cadence. It holds only a
-    /// [`Weak`] to the daemon (upgraded per round), so it never blocks shutdown; the
-    /// returned [`MaintenanceHandle`] tears it down on drop or
-    /// [`MaintenanceHandle::stop`]. Follows the same `Arc<Self>` + `Weak` pattern as
-    /// [`Daemon::watch_vault`]: the production entry point ([`carapace_api`]) already
-    /// holds an `Arc<Daemon>` and starts this once at boot.
-    ///
-    /// `cfg.por_interval` is stamped onto the audit schedule here (the loop owns the
-    /// PoR cadence), so a deployment or a bounded test tunes it through the config.
+    /// Reconcile current blob reachability and schedule superseded ciphertext for bounded GC.
+    pub async fn garbage_collect_blobs(&self) -> Result<GarbageCollectionReport> {
+        // Take the store mutation guard BEFORE reading roots. A publisher holds the same guard
+        // through its state commit, so this snapshot cannot predate a completed blob mutation.
+        let blob_mutation = self.blobs.begin_durable_mutation().await;
+        let (retained, removed_authorizations) = {
+            let mut s = self.shared.write().expect("shared lock");
+            let roots = blob_retention_set(&s)?;
+            let removed = prune_owned_authorizations(&mut s, &roots.owned);
+            if removed != 0 {
+                self.persist_locked(&s);
+            }
+            (roots.all, removed)
+        };
+
+        self.blobs
+            .garbage_collect_during(&retained, &blob_mutation)
+            .await?;
+        Ok(GarbageCollectionReport {
+            retained_blobs: retained.len(),
+            removed_authorizations,
+        })
+    }
+
+    /// Spawn the background maintenance loop (§10.1/§10.2) and return its handle. The loop
+    /// wakes every `cfg.tick`, runs one [`Daemon::maintenance_round`], and self-gates each
+    /// concern on its cadence. It holds only a [`Weak`] to the daemon so it never blocks
+    /// shutdown. `cfg.por_interval` is stamped onto the audit schedule here.
     pub fn run_maintenance(self: Arc<Self>, cfg: MaintenanceConfig) -> MaintenanceHandle {
         {
-            // The loop owns the PoR audit cadence: stamp it at start, before any audit
-            // runs, so no accumulated per-replica schedule is discarded mid-flight.
-            // `restamp` updates ONLY the cadence scalars and KEEPS the round/fail/schedule
-            // maps that `load_all` restored - a fresh `AuditTracker::new` here would wipe
-            // the per-(replica,vid) round counters and reopen the §10.1 PoR replay vector
-            // (audit #1).
+            // Stamp the PoR cadence before any audit runs. `restamp` updates ONLY the cadence
+            // scalars and KEEPS the round/fail/schedule maps `load_all` restored - a fresh
+            // `AuditTracker::new` here would wipe the round counters and reopen the PoR replay
+            // vector.
             let mut s = self.shared.write().expect("shared lock");
             s.por.restamp(
                 cfg.por_interval.as_secs(),
@@ -4445,8 +5163,7 @@ impl Daemon {
                     break;
                 };
                 let _ = daemon.maintenance_round(unix_now()).await;
-                // Drop the strong ref between ticks so a concurrent shutdown can
-                // reclaim the daemon; the loop ends once the last Arc is gone.
+                // Drop the strong ref between ticks so a concurrent shutdown can reclaim.
                 drop(daemon);
             }
         });
@@ -4458,6 +5175,36 @@ impl Daemon {
     /// the current wall clock.
     pub fn recovery_health(&self) -> Vec<RecoveryHealthReport> {
         self.recovery_health_at(unix_now())
+    }
+
+    /// Return identity-free capacity counters for the authenticated local metrics API.
+    pub fn operational_capacity(&self) -> OperationalCapacity {
+        let shared = self.shared.read().expect("shared lock");
+        OperationalCapacity {
+            replica_grant_bytes: shared
+                .friend_grants
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add),
+            replica_assignments: shared.members.values().map(Vec::len).sum(),
+            storage_refetch_needed: shared.needs_refetch.len(),
+            ceremony_active: shared.ceremonies.len(),
+            ceremony_tombstones: shared.ceremony_tombstones.len(),
+            ceremony_subject_rate_keys: shared.ceremony_subject_rate.len(),
+            ceremony_sponsor_rate_keys: shared.ceremony_sponsor_rate.len(),
+            ceremony_capacity: MAX_CEREMONY_RECORDS,
+            ceremony_per_subject_capacity: MAX_ACTIVE_CEREMONIES_PER_SUBJECT,
+            ceremony_tombstone_capacity: MAX_CEREMONY_TOMBSTONES,
+            ceremony_fanout_capacity: MAX_CEREMONY_FANOUT,
+        }
+    }
+
+    /// Return bounded, identity-free maintenance history.
+    pub fn operational_history(&self) -> OperationalHistory {
+        *self
+            .operational_history
+            .lock()
+            .expect("operational history lock")
     }
 
     /// [`Daemon::recovery_health`] evaluated at an explicit `now` (injected clock for
@@ -4483,19 +5230,14 @@ impl Daemon {
             .collect()
     }
 
-    /// The newest `VaultAnnounce` this daemon has learned for `vid` (its signer node
-    /// and epoch), from the rollback-guarded document store — including third-party
-    /// announces picked up via anti-entropy store-and-forward (§6/W7). `None` if none
-    /// is known.
+    /// The newest `VaultAnnounce` learned for `vid` (signer node + epoch), from the
+    /// rollback-guarded document store including store-and-forward announces. `None` if unknown.
     pub fn known_announce(&self, vid: &[u8; 32]) -> Option<([u8; 32], u64)> {
         let d = self.docs.lock().expect("docs lock");
         d.announce_for_vid(vid).map(|a| (a.by, a.epoch))
     }
 
-    /// Test-only: this daemon's own current announce digest (the manifest-envelope
-    /// ChunkID) for `vid`, or `None`. A `publish_merged` inserts this digest into
-    /// `owned_chunks`; used by the audit #4 reboot regression to probe the fetch gate on
-    /// a merge-unique chunk.
+    /// Test-only: this daemon's own current announce digest for `vid`, or `None`.
     #[doc(hidden)]
     pub fn own_announce_digest(&self, vid: &[u8; 32]) -> Option<[u8; 32]> {
         self.shared
@@ -4508,16 +5250,13 @@ impl Daemon {
     }
 
     /// Test-only: whether the served durable blob store holds `id` right now.
-    /// Lets the reboot/kill durability tests assert a blob is genuinely present
-    /// in the FsStore instead of inferring it from higher-level behavior.
     #[doc(hidden)]
     pub async fn blob_present(&self, id: [u8; 32]) -> bool {
         self.blobs.has(id).await.unwrap_or(false)
     }
 
-    /// Test-only: the published blob-source ids for `vid` — the manifest-envelope
-    /// digest plus every unique ChunkID — or `None` if the vault has no
-    /// (re-derived) blob source on this daemon.
+    /// Test-only: the published blob-source ids for `vid` (envelope digest + every unique
+    /// ChunkID), or `None`.
     #[doc(hidden)]
     pub fn vault_blob_ids(&self, vid: &[u8; 32]) -> Option<([u8; 32], Vec<[u8; 32]>)> {
         let s = self.shared.read().expect("shared lock");
@@ -4526,8 +5265,7 @@ impl Daemon {
             .map(|vb| (vb.digest, vb.chunk_ids.clone()))
     }
 
-    /// Test-only: the retained needs-refetch blob source for `vid` (§3.5) — the
-    /// `(digest, chunk_ids)` kept when the startup re-derive failed — or `None`.
+    /// Test-only: the retained needs-refetch blob source for `vid` (§3.5), or `None`.
     #[doc(hidden)]
     pub fn needs_refetch_ids(&self, vid: &[u8; 32]) -> Option<([u8; 32], Vec<[u8; 32]>)> {
         self.shared
@@ -4538,9 +5276,8 @@ impl Daemon {
             .cloned()
     }
 
-    /// Test-only: record `node` as a replica member of `vid` without pushing it the
-    /// blobs, modeling a replica that accepted a placement but has since lost its
-    /// stored copy. The PoR loop then detects the loss on audit.
+    /// Test-only: record `node` as a replica member of `vid` without pushing the blobs,
+    /// modeling a replica that accepted but lost its copy (PoR detects the loss on audit).
     #[doc(hidden)]
     pub fn inject_lost_member_for_test(&self, vid: [u8; 32], node: [u8; 32]) {
         let mut s = self.shared.write().expect("shared lock");
@@ -4550,23 +5287,14 @@ impl Daemon {
         }
     }
 
-    /// Graceful shutdown: stop accepting, cleanly shut down the served blob
-    /// store, then close the endpoint. The daemon serves nothing afterwards.
-    ///
-    /// `Router::shutdown` awaits every protocol handler's shutdown — including
-    /// `BlobsProtocol::shutdown`, which shuts down the FsStore cleanly
-    /// (committing its open write batch and persisting ephemeral state; the
-    /// iroh-blobs fs store otherwise loses writes from the last ~1 s on exit).
-    /// Closing only the endpoint, as this once did, dropped those writes even
-    /// on a "graceful" exit.
-    ///
-    /// Takes `&self` (idempotently: a second call is a no-op) so the binary's
-    /// signal path can always flush, even while the API server or a watcher
-    /// still holds `Arc<Daemon>` clones — a flush must never depend on being
-    /// the last reference.
+    /// Graceful shutdown: stop accepting, cleanly shut down the served blob store, then close
+    /// the endpoint. `Router::shutdown` awaits `BlobsProtocol::shutdown`, which commits the
+    /// FsStore's open write batch (closing only the endpoint would drop the last ~1 s of
+    /// writes). Takes `&self` idempotently so the signal path can flush even while other
+    /// `Arc<Daemon>` clones live.
     pub async fn shutdown(&self) {
-        if let Err(e) = self.router.shutdown().await {
-            eprintln!("carapaced: router shutdown: {e}");
+        if self.router.shutdown().await.is_err() {
+            ops::log("router.shutdown_failed", None);
         }
         self.ep.close().await;
     }
@@ -4591,11 +5319,9 @@ impl Daemon {
         let mut grant_id = [0u8; 16];
         getrandom::getrandom(&mut grant_id).map_err(|e| anyhow::anyhow!("grant id: {e}"))?;
 
-        // Prefix the encapsulated key onto the HPKE ciphertext (Sealed carries no
-        // separate encap field); split it back off on open. S7: the serialized
-        // body holds every chunk key in the clear, so scrub it after sealing. S2:
-        // bind the seal to this exact grant (vid, epoch, grant_id), matching
-        // `open_file_grant`.
+        // Prefix the encapsulated key onto the HPKE ciphertext (Sealed has no encap field),
+        // split back off on open. S7: the serialized body holds chunk keys in the clear, so
+        // scrub it after sealing. S2: bind the seal to this exact grant (vid, epoch, grant_id).
         let aad = disclose::grant_aad(&vid, epoch, &grant_id);
         let body_bytes = Zeroizing::new(body.to_bytes());
         let (enc, ct) = seal::seal(&disclose_pub, INFO_DISCLOSE, &aad, &body_bytes)
@@ -4621,18 +5347,11 @@ impl Daemon {
 
     // ---- selective disclosure to an audience (§7.4) --------------------
 
-    /// Disclose exactly `paths` from owned vault `vid` to `audience` (a list of
-    /// established-friend user pubkeys — "reveal to all my friends" simply names the
-    /// current friend list at issuance). Assembles a [`GrantBody`] from the retained
-    /// per-chunk secrets, HPKE-seals it to each friend's `enc_pub`, signs a
-    /// [`FileGrant`], and records the owner-side disclosure table so the blob gate
-    /// will serve exactly those chunks to exactly that audience. Returns the grant to
-    /// deliver directly to each member (§7.4).
-    ///
-    /// NORMATIVE (§7.4): the returned grant is a **snapshot** of the vault's current
-    /// epoch and is **irrevocable** for the content it discloses — a later edit makes
-    /// new chunk keys (hence a new grant), and "revoke" means only "issue no future
-    /// version." This API never implies recall of already-disclosed content.
+    /// Disclose exactly `paths` from owned vault `vid` to `audience` (established-friend user
+    /// pubkeys). Assembles a [`GrantBody`] from the retained per-chunk secrets, HPKE-seals it
+    /// to each friend, signs a [`FileGrant`], and records the disclosure table so the blob gate
+    /// serves exactly those chunks to exactly that audience. The grant is a snapshot of the
+    /// current epoch and irrevocable for what it discloses (§7.4).
     pub fn disclose_files(
         &self,
         vid: [u8; 32],
@@ -4695,11 +5414,9 @@ impl Daemon {
         grant
             .verify()
             .map_err(|e| anyhow::anyhow!("grant signature invalid: {e}"))?;
-        // W1: `grant.verify()` only proves self-consistency (signed by whatever
-        // `grant.by` claims). Authenticate the discloser too: `grant.by` must be a
-        // device our own user or an established friend currently delegates, so
-        // disclosed content carries verifiable provenance and an unknown party
-        // cannot push us a grant to reconstruct. Mirrors C1 on the sync path.
+        // W1: `grant.verify()` only proves self-consistency. Authenticate the discloser too:
+        // `grant.by` must be a device our user or an established friend currently delegates,
+        // so an unknown party cannot push us a grant to reconstruct. Mirrors C1 on the sync path.
         let now = unix_now();
         {
             let s = self.shared.read().expect("shared lock");
@@ -4715,15 +5432,12 @@ impl Daemon {
         let body = disclose::open_grant(grant, my_user, &disclose_priv)
             .map_err(|e| anyhow::anyhow!("open grant: {e}"))?;
 
-        // Authenticate on the owner's control stream first, so the owner's blob gate
-        // binds our node id to our (friend) identity before we open a raw blob
-        // connection and fetch (§7.4 / D3).
+        // Authenticate on the owner's control stream first so its blob gate binds our node id
+        // to our friend identity before we open a raw blob connection (§7.4/D3).
         self.present_card(&owner).await?;
 
-        // W8: fetch into a throwaway store, NOT `self.blobs`, which the router serves.
-        // Otherwise a friend that fetched disclosed files would re-serve the owner's
-        // ciphertext ungated from its own node, defeating disclosure revocation. We
-        // only need the bytes to write the granted plaintext to disk.
+        // W8: fetch into a throwaway store, NOT `self.blobs` (which the router serves), else a
+        // friend that fetched disclosed files would re-serve the ciphertext ungated.
         let scratch = IrohBlobStore::new();
         let bconn = self.ep.connect(owner, iroh_blobs::ALPN).await?;
         let mut chunks: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
@@ -4738,9 +5452,8 @@ impl Daemon {
             .map_err(|e| anyhow::anyhow!("reconstruct disclosed files: {e}"))
     }
 
-    /// Present our own card on `peer`'s control stream and drain the reply. Completes
-    /// the W5 authentication handshake so `peer` records our node id in its blob-read
-    /// allow-set before we open a raw blob connection (used by `fetch_disclosed`).
+    /// Present our own card on `peer`'s control stream and drain the reply (W5), so `peer`
+    /// records our node id in its blob-read allow-set before we open a raw blob connection.
     async fn present_card(&self, peer: &EndpointAddr) -> Result<()> {
         let conn = self.ep.connect(peer.clone(), ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -4754,9 +5467,8 @@ impl Daemon {
         Ok(())
     }
 
-    /// Test/diagnostic: open `grant` as this user and return the ChunkIDs it
-    /// discloses (empty if this user is not in the grant's audience or the open
-    /// fails). Lets a test learn a granted ChunkID to probe the fetch gate with.
+    /// Test: open `grant` as this user and return the ChunkIDs it discloses (empty if not in
+    /// the audience or the open fails).
     #[doc(hidden)]
     pub fn granted_chunk_ids(&self, grant: &FileGrant) -> Result<Vec<[u8; 32]>> {
         let (disclose_priv, _pub) = self.disclose_keypair();
@@ -4765,10 +5477,8 @@ impl Daemon {
         Ok(disclose::granted_chunk_ids(&body).into_iter().collect())
     }
 
-    /// Test-only: attempt a raw single-blob fetch of `chunk_id` from `peer` over the
-    /// blobs ALPN WITHOUT first authenticating on the control stream — modeling a
-    /// non-audience party (e.g. a leaked-grant holder) that already knows a ChunkID.
-    /// The §7.4/D3 gate must refuse it.
+    /// Test-only: raw single-blob fetch of `chunk_id` from `peer` WITHOUT authenticating on
+    /// the control stream, modeling a non-audience party that knows a ChunkID. The gate must refuse.
     #[doc(hidden)]
     pub async fn try_fetch_chunk(&self, peer: EndpointAddr, chunk_id: [u8; 32]) -> Result<Vec<u8>> {
         let conn = self.ep.connect(peer, iroh_blobs::ALPN).await?;
@@ -4798,6 +5508,54 @@ impl Daemon {
             .collect()
     }
 
+    /// Published vaults with stable local names for selector UIs.
+    pub fn vault_options(&self) -> Vec<VaultOption> {
+        let s = self.shared.read().expect("shared lock");
+        let mut values: Vec<VaultOption> = s
+            .vault_blobs
+            .keys()
+            .map(|vid| {
+                let epoch = s.epochs.get(vid).copied().unwrap_or(0);
+                let name = s
+                    .working_dirs
+                    .get(vid)
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("Vault {}", &hex32(vid)[..12]));
+                VaultOption {
+                    vid: *vid,
+                    epoch,
+                    name,
+                }
+            })
+            .collect();
+        values.sort_by(|a, b| a.name.cmp(&b.name).then(a.vid.cmp(&b.vid)));
+        values
+    }
+
+    /// Verified friend-card nodes and address hints for selector UIs.
+    pub fn peer_options(&self) -> Vec<PeerOption> {
+        let s = self.shared.read().expect("shared lock");
+        let mut values = Vec::new();
+        for card in s.friends.values() {
+            for node in &card.nodes {
+                let addrs = resolve_peer(&s.peer_addrs, &node.node_id)
+                    .map(|addr| addr.ip_addrs().map(ToString::to_string).collect())
+                    .unwrap_or_else(|| node.addrs.clone());
+                values.push(PeerOption {
+                    user: card.user,
+                    display: card.display.clone(),
+                    node: node.node_id,
+                    addrs,
+                });
+            }
+        }
+        values.sort_by(|a, b| a.display.cmp(&b.display).then(a.node.cmp(&b.node)));
+        values
+    }
+
     /// Every vault this daemon stores as a replica for some owner.
     pub fn held_replica_vids(&self) -> Vec<[u8; 32]> {
         self.shared
@@ -4819,10 +5577,8 @@ impl Daemon {
         }
     }
 
-    /// This node's own advertised relay URL as a string, iff it *currently*
-    /// advertises the embedded relay (§6/W6): `None` when it runs no relay or when
-    /// the relay is down/withdrawn. Surfaced on the status + ticket API so the
-    /// operator sees exactly what friends will use to reach this node right now.
+    /// This node's currently-advertised relay URL (§6/W6), or `None` when it runs no relay or
+    /// the relay is down/withdrawn.
     pub fn advertised_relay_url(&self) -> Option<String> {
         self.shared
             .read()
@@ -4832,11 +5588,8 @@ impl Daemon {
             .clone()
     }
 
-    /// W6/§6: the last time a friend was observed reaching us *through* our
-    /// advertised relay (peer-dialback), in unix seconds, or `None` if never. This
-    /// is external-reachability evidence surfaced for the operator; see
-    /// [`Daemon::drive_relay_health`] for why it confirms rather than gates
-    /// advertising.
+    /// W6/§6: the last time a friend was observed reaching us through our advertised relay
+    /// (peer-dialback), unix seconds, or `None`. Confirms rather than gates advertising.
     pub fn relay_verified_at(&self) -> Option<u64> {
         self.shared
             .read()
@@ -4845,19 +5598,9 @@ impl Daemon {
             .verified_at
     }
 
-    /// W4: number of distinct networks in this node's usable relay set (§6/§14) -
-    /// its own advertised relay plus every relay URL in an established friend's
-    /// newest card, deduplicated by host. §6 requires warning the user when this
-    /// drops below 2, since a single relay network is both a single point of
-    /// failure for reachability and a single metadata choke point.
-    ///
-    /// Only a *currently-advertised* own relay counts (W6): once the relay is
-    /// withdrawn on a health loss it stops contributing to diversity, exactly as a
-    /// friend would see it.
-    ///
-    /// ponytail: "distinct network" == distinct URL host (DNS name or IP literal),
-    /// lowercased. Upgrade to IP-subnet/ASN grouping if two friends behind the
-    /// same host must count as one network more precisely.
+    /// W4: number of distinct networks in this node's usable relay set (own advertised relay +
+    /// every friend-card relay URL, deduped by host). §6 warns the user below 2. Only a
+    /// currently-advertised own relay counts; "distinct network" == distinct lowercased host.
     pub fn relay_network_count(&self) -> usize {
         let mut urls: Vec<String> = Vec::new();
         let s = self.shared.read().expect("shared lock");
@@ -4880,9 +5623,8 @@ impl Daemon {
         self.relay_network_count() < 2
     }
 
-    /// W6/§6: probe whether our embedded relay's TCP listener is alive and
-    /// accepting. `false` when we run no relay. The result drives the
-    /// advertise/withdraw lifecycle via [`Daemon::drive_relay_health`].
+    /// W6/§6: probe whether our embedded relay's TCP listener is alive. `false` when we run no
+    /// relay. Drives the advertise/withdraw lifecycle via [`Daemon::drive_relay_health`].
     async fn probe_relay_alive(&self) -> bool {
         match &self.relay {
             Some(r) => r.is_alive().await,
@@ -4890,21 +5632,15 @@ impl Daemon {
         }
     }
 
-    /// W6/§6: the WAN relay URL to advertise to friends, or `None` if we run no
-    /// relay. Precedence: a configured relay host (the operator's stable DDNS/WAN
-    /// name) > the NAT port-mapper's mapped external address > the relay's local
-    /// (loopback/bound) URL. The last is only WAN-reachable on a public bind or for
-    /// same-host use; when a home node has no host override and no mapping yet, the
-    /// maintenance loop re-advertises with the mapped address once it resolves.
+    /// W6/§6: the WAN relay URL to advertise, or `None` if we run no relay. Precedence:
+    /// configured relay host > NAT-mapped external address > the relay's local URL (only
+    /// WAN-safe for an explicit loopback bind).
     fn advertised_url_for(&self) -> Option<String> {
         let relay = self.relay.as_ref()?;
-        // Pick a candidate WAN URL by precedence. The local_url fallback is only
-        // WAN-safe for an EXPLICIT loopback bind (same-host / test): with the
-        // default 0.0.0.0 home-relay bind, local_url folds a 127.0.0.1 (or a LAN
-        // 192.168/10.x) address into the signed card sent to friends, advertising
-        // an unreachable relay and inflating the diversity count. For a
-        // 0.0.0.0/unspecified or private-LAN bind we stay withdrawn until a
-        // globally-routable address exists (a relay host or a routable mapping).
+        // The local_url fallback is WAN-safe only for an explicit loopback bind: with the
+        // default 0.0.0.0 bind it would fold a 127.0.0.1/LAN address into the signed card,
+        // advertising an unreachable relay. For a 0.0.0.0/private-LAN bind stay withdrawn until
+        // a globally-routable address exists.
         let candidate = if let Some(host) = &self.relay_host {
             format!("http://{}:{}", host, relay.http_addr().port())
         } else if let Some(ext) = relay.external_addr() {
@@ -4914,9 +5650,8 @@ impl Daemon {
         } else {
             return None;
         };
-        // Only fold a URL iroh can actually parse as a RelayUrl into the card; a
-        // malformed relay_host would otherwise emit a signed card with a garbage
-        // relay_url. Treat an unparseable candidate as "no advertised relay".
+        // Only fold a URL iroh can parse as a RelayUrl into the card; an unparseable candidate
+        // (e.g. a malformed relay_host) is treated as "no advertised relay".
         if candidate.parse::<RelayUrl>().is_ok() {
             Some(candidate)
         } else {
@@ -4924,41 +5659,18 @@ impl Daemon {
         }
     }
 
-    /// W6/§6: reconcile the embedded relay's advertised state with a liveness
-    /// observation, re-issuing this node's own card whenever the advertised relay
-    /// URL changes.
-    ///
-    /// When `alive` the desired advertised URL is [`Daemon::advertised_url_for`];
-    /// when not, a withdraw is applied only after
-    /// [`RELAY_PROBE_FAILURE_THRESHOLD`] consecutive failed probes (hysteresis, so
-    /// a transient 2 s connect timeout under load does not flap a healthy relay);
-    /// a single success resets the streak and re-advertises. If the desired URL
-    /// differs from what the card currently
-    /// carries, the own card is re-issued with the new `relay_url` and its version
-    /// BUMPED (§6 rollback rule: a re-issue MUST advance the monotonic per-signer
-    /// version so peers accept it over the one they hold). The new card propagates
-    /// through the existing anti-entropy doc path (`serve_docs` re-serves
-    /// `shared.cards`, and the receiver's `DocStore` accepts the higher version).
-    ///
-    /// Advertising is gated on liveness, not on peer-dialback: gating the *initial*
-    /// advertise on dialback would deadlock (friends can only reach us via the relay
-    /// once they have learned it from our card), and dialback silence cannot be
-    /// distinguished from "no friend has dialed lately," so it must not withdraw a
-    /// live relay. Dialback (`relay_health.verified_at`) is therefore recorded and
-    /// surfaced as external-reachability confirmation, not used as a withdraw
-    /// trigger. Full active withdraw-on-unreachability needs a cooperating external
-    /// prober, which is out of scope (see docs/spec-errata.md, W6).
+    /// W6/§6: reconcile the embedded relay's advertised state with a liveness observation,
+    /// re-issuing this node's card (version BUMPED) whenever the advertised URL changes. When
+    /// `alive` the desired URL is [`Daemon::advertised_url_for`]; a withdraw applies only after
+    /// [`RELAY_PROBE_FAILURE_THRESHOLD`] consecutive failed probes (hysteresis). Advertising is
+    /// gated on liveness, not peer-dialback: gating the initial advertise on dialback would
+    /// deadlock, and dialback silence must not withdraw a live relay.
     #[doc(hidden)]
     pub fn drive_relay_health(&self, alive: bool) {
         let mut s = self.shared.write().expect("shared lock");
-        // W6 hysteresis: a single failed probe does not withdraw. A success
-        // resets the failure streak and (re-)advertises immediately; a failure
-        // increments the streak and only withdraws once it reaches the
-        // threshold. Below the threshold the desired URL is left equal to the
-        // current advertisement, so the tentative failure is a no-op (no
-        // re-issue, no version churn). `advertised_url_for` reads only
-        // `self.relay`/`self.relay_host`, never the `shared` lock, so calling it
-        // here while holding the write guard is safe.
+        // Hysteresis: a success resets the streak and re-advertises; a failure only withdraws
+        // at the threshold, else leaves the desired URL equal to the current one (a no-op).
+        // `advertised_url_for` reads only `self.relay`/`self.relay_host`, never `shared`.
         let want = if alive {
             s.relay_health.consecutive_failures = 0;
             self.advertised_url_for()
@@ -4989,9 +5701,8 @@ impl Daemon {
         *s.cards.first_mut().expect("own card present") = card;
     }
 
-    /// Wait until the endpoint has registered with at least one relay, so it is
-    /// reachable via relay fallback. Never completes with no relays configured;
-    /// guard with a timeout.
+    /// Wait until the endpoint has registered with at least one relay. Never completes with no
+    /// relays configured; guard with a timeout.
     pub async fn wait_online(&self) {
         self.ep.online().await;
     }
@@ -5004,9 +5715,19 @@ impl Daemon {
     }
 
     // ---- address-string wrappers (control-API friendly) ----------------
-    // These let the loopback control API drive the network paths with a node id
-    // (hex) plus dialable socket-address strings, so the API crate never has to
-    // depend on iroh's `EndpointAddr` directly.
+    // Let the loopback control API drive network paths with a node id + address strings, so
+    // the API crate never depends on iroh's `EndpointAddr` directly.
+
+    /// [`Daemon::sync_from`] against a peer named by node id and dialable addresses.
+    pub async fn sync_from_at(
+        &self,
+        node: [u8; 32],
+        addrs: &[String],
+        out_root: &Path,
+    ) -> Result<Vec<Reconstructed>> {
+        let peer = endpoint_addr(node, addrs)?;
+        self.sync_from(peer, out_root).await
+    }
 
     /// [`Daemon::befriend`] against a peer named by node id + dialable addresses.
     pub async fn befriend_at(
@@ -5065,6 +5786,8 @@ impl Daemon {
         n: u8,
         allow_over_cap: bool,
     ) -> Result<(Vec<String>, Vec<PolicyWarning>)> {
+        let mut s = self.shared.write().expect("shared lock");
+        ensure_root_split_available(&s, scope)?;
         let (shares, state, warnings) = match scope {
             RecoveryScope::Root => split_root(&self.k_root, m, Some(n), allow_over_cap),
             RecoveryScope::Vault(vid) => {
@@ -5073,13 +5796,9 @@ impl Daemon {
         }
         .map_err(|e| anyhow::anyhow!("recovery split failed: {e:?}"))?;
         let jsons = shares.iter().map(share_to_json).collect();
-        {
-            let mut s = self.shared.write().expect("shared lock");
-            s.split_states.insert(rsid, RecoverySet { scope, state });
-            // Persist the SEALed split-state so `recovery_extend` can extend the same
-            // polynomial after a restart (design §3.3).
-            self.persist_locked(&s);
-        }
+        s.split_states.insert(rsid, RecoverySet { scope, state });
+        // Persist the sealed split state before returning any shares.
+        self.persist_locked(&s);
         Ok((jsons, warnings))
     }
 
@@ -5106,30 +5825,20 @@ impl Daemon {
             extend_split(&mut set.state, &secret, count, allow_over_cap)
                 .map_err(|e| anyhow::anyhow!("recovery extend failed: {e:?}"))?
         };
-        // `split_states` is a SEAL category and `extend_split` advanced its issued-x
-        // counter. Persist BEFORE returning the new shares (mirroring `recovery_split`),
-        // so a crash cannot rewind the counter and re-issue a byte-identical share at the
-        // same x to a different trustee - which breaks M-of-N distinct-point accounting
-        // and the §9.3 stranding invariant (audit #2).
+        // `extend_split` advanced the SEALed split-state's issued-x counter. Persist BEFORE
+        // returning the shares, so a crash cannot rewind the counter and re-issue a
+        // byte-identical share at the same x to a different trustee (breaks M-of-N accounting).
         self.persist_locked(&s);
         Ok((shares.iter().map(share_to_json).collect(), warnings))
     }
 
-    /// Split a recovery secret `M`-of-`N` (N = `trustees.len()`) and mint + deliver one
-    /// signed [`ShareGrant`] per trustee over the `carapace/1` control stream (§8, W3).
-    /// Each grant wraps that trustee's `chela.share` JSON, the co-trustee roster (every
-    /// OTHER trustee's user + node + relay, from its established-friend card), the
-    /// owner's `recovery_delay` abort window (§8.5, default 72 h), and the latest
-    /// [`AnnounceRef`]s for this owner's published vaults - so a quorum can locate the
-    /// current manifest + a live replica at ceremony time without the owner present.
-    ///
-    /// Records the extendable split-state, an owner-side share-health tracker (§10.2),
-    /// and the grant set (for the maintenance refresh + status view), all under `rsid`
-    /// (overwriting any prior record - this is also the re-split path). Every trustee
-    /// MUST be an established friend whose card names a node; that is where the roster
-    /// identity and the delivery address come from. A trustee that is unreachable /
-    /// declines is recorded as undelivered and retried by the refresh round; it does
-    /// not abort the split (the words are already committed to the polynomial).
+    /// Split a recovery secret `M`-of-`N` and mint + deliver one signed [`ShareGrant`] per
+    /// trustee (§8, W3). Each grant wraps that trustee's share JSON, the co-trustee roster,
+    /// the owner's `recovery_delay` abort window, and the latest [`AnnounceRef`]s, so a quorum
+    /// can locate the current manifest + a live replica at ceremony time without the owner.
+    /// Records the extendable split-state, share-health tracker, and grant set under `rsid`
+    /// (overwriting any prior - the re-split path). Every trustee MUST be an established friend
+    /// whose card names a node; an unreachable one is recorded undelivered and retried.
     pub async fn recovery_split_grant(
         &self,
         rsid: u64,
@@ -5143,13 +5852,20 @@ impl Daemon {
             !trustees.is_empty(),
             "a recovery split needs at least one trustee"
         );
+        ensure!(
+            trustees.len() <= MAX_RECOVERY_TRUSTEES,
+            "a recovery split supports at most {MAX_RECOVERY_TRUSTEES} trustees"
+        );
+        ensure!(
+            recovery_delay >= MIN_RECOVERY_DELAY_SECS,
+            "recovery delay must be at least {MIN_RECOVERY_DELAY_SECS} seconds"
+        );
         let n = u8::try_from(trustees.len()).context("too many trustees (max 32)")?;
         let subject = self.user_id();
 
         // Resolve each trustee's roster identity (user + primary node + relay) from its
-        // established-friend card, plus a dialable address for delivery. A trustee that
-        // is not a friend, or whose card names no node, fails loudly - we cannot build
-        // a roster entry or deliver to it.
+        // established-friend card, plus a dialable address. A non-friend or node-less card
+        // fails loudly - we cannot build a roster entry or deliver to it.
         let resolved = {
             let s = self.shared.read().expect("shared lock");
             let mut out: Vec<(CoTrustee, Option<EndpointAddr>)> =
@@ -5187,8 +5903,16 @@ impl Daemon {
             resolved.len()
         );
 
-        // The latest announce refs over this owner's published vaults - the pointers a
-        // recovering quorum follows to the current manifest + a live replica (§7.3).
+        {
+            let mut s = self.shared.write().expect("shared lock");
+            ensure_root_split_available(&s, scope)?;
+            if matches!(scope, RecoveryScope::Root) {
+                s.root_split_pending = true;
+            }
+        }
+
+        // The latest announce refs - the pointers a recovering quorum follows to the current
+        // manifest + a live replica (§7.3).
         let refs = {
             let s = self.shared.read().expect("shared lock");
             current_announce_refs(&s)
@@ -5237,11 +5961,13 @@ impl Daemon {
             });
         }
 
-        // Record owner-side: the extendable split state, the share-health tracker
-        // (§10.2 attestation cadence), and the grant set (refresh + status).
+        // Record owner-side: extendable split state, share-health tracker, and grant set.
         {
             let mut s = self.shared.write().expect("shared lock");
             s.split_states.insert(rsid, RecoverySet { scope, state });
+            if matches!(scope, RecoveryScope::Root) {
+                s.root_split_pending = false;
+            }
             s.share_sets
                 .insert(rsid, AttestTracker::new(m, shares.len(), roster));
             s.granted.insert(
@@ -5253,21 +5979,16 @@ impl Daemon {
                     refs,
                 },
             );
-            // Persist the owner-side split record (SEALed split-state + granted shares)
-            // before returning; share_sets is rebuilt from `granted` on reload.
+            // Persist the owner-side split record (SEALed) before returning; share_sets is
+            // rebuilt from `granted` on reload.
             self.persist_locked(&s);
         }
         Ok(report)
     }
 
-    /// Dial `peer`'s control stream and send a `ShareGrant` (§8, W3). Returns `true`
-    /// iff the trustee acknowledged storing it (a verified + delegated grant). A
-    /// trustee that is unreachable, declines (bad delegation), or answers with no ack
-    /// frame yields `false` - the caller records it undelivered and the refresh round
-    /// retries. The dial is bounded so an offline trustee fails fast.
-    ///
-    /// Public so an owner (or a conformance test) can push a single grant directly; the
-    /// trustee independently re-verifies signature + delegation on receipt.
+    /// Dial `peer`'s control stream and send a `ShareGrant` (§8, W3). Returns `true` iff the
+    /// trustee acked storing it; unreachable/declined yields `false` (recorded undelivered,
+    /// retried by the refresh round). Bounded dial. The trustee re-verifies sig + delegation.
     pub async fn deliver_grant(&self, peer: &EndpointAddr, grant: &ShareGrant) -> Result<bool> {
         let conn = tokio::time::timeout(POR_CONNECT_TIMEOUT, self.ep.connect(peer.clone(), ALPN))
             .await
@@ -5275,21 +5996,18 @@ impl Daemon {
             .context("grant delivery dial failed")?;
         let (mut send, mut recv) = conn.open_bi().await?;
         write_msg(&mut send, grant).await?;
-        // The trustee acks with a single u64 (== 1) on success, or finishes the stream
-        // with no bytes (decline). A short read is therefore a decline, not an error.
+        // The trustee acks with u64 == 1 on success, or finishes with no bytes (decline); a
+        // short read is a decline, not an error.
         let acked = matches!(read_u64(&mut recv).await, Ok(1));
         let _ = send.finish();
         Ok(acked)
     }
 
-    /// Owner-side refresh round (§10.2 attestation cycle, §7.3): for each recovery set
-    /// this owner minted grants for, if the current announce refs over its published
-    /// vaults differ from what the trustees last received (a new epoch published),
-    /// re-mint each trustee's grant with the fresh refs and re-deliver it, so trustees
-    /// always hold current manifest pointers. A trustee that was previously
-    /// undelivered is retried every round regardless. No lock is held across a dial.
-    ///
-    /// Returns the rsids whose grants were refreshed this round (for the report/tests).
+    /// Owner-side refresh round (§10.2/§7.3): for each recovery set this owner minted grants
+    /// for, if the current announce refs differ from what trustees last received, re-mint and
+    /// re-deliver each grant so trustees hold current manifest pointers. A previously
+    /// undelivered trustee is retried every round. No lock held across a dial. Returns the
+    /// refreshed rsids.
     pub async fn refresh_grants_round(&self) -> Vec<u64> {
         // Snapshot the work set + current refs under a read lock, act off-lock.
         let jobs: Vec<RefreshJob> = {
@@ -5354,8 +6072,7 @@ impl Daemon {
                     delivered,
                 });
             }
-            // Commit the refreshed refs + delivery flags for this set. §9.3.4: a trustee
-            // that acked a delivery answered us, so it is online now (liveness signal).
+            // Commit the refreshed refs + delivery flags. §9.3.4: an acking trustee is online now.
             let seen = unix_now();
             let mut s = self.shared.write().expect("shared lock");
             for r in &new_records {
@@ -5371,8 +6088,7 @@ impl Daemon {
                 false
             };
             if updated {
-                // Persist the refreshed grant set (SEALed) so the advanced announce refs
-                // + delivery flags survive a restart mid-refresh.
+                // Persist the refreshed grant set (SEALed) so it survives a restart mid-refresh.
                 self.persist_locked(&s);
             }
             refreshed.push(rsid);
@@ -5396,24 +6112,124 @@ impl Daemon {
             .collect()
     }
 
-    /// W15 (§8, §10.2): render the printable paper cards for one owned recovery set -
-    /// one page per share, recoverable from the words alone, offline, with no Carapace
-    /// software (the §10.2 backstop that never goes offline). Pulls the shares this owner
-    /// already retains for `rsid` from the same `granted` map the maintenance loop
-    /// re-signs from; no regeneration, no re-split, no change to the issued count. Errors
-    /// if no such recovery set is owned. Per-rsid when the owner holds several sets.
-    ///
-    /// SECURITY: the returned HTML embeds the share WORDS (a bearer secret). It is never
-    /// logged or persisted here - it is handed straight back over the loopback API to the
-    /// owner's own authenticated GUI, the same trust boundary as every recovery endpoint.
+    /// Return complete durable recovery-set facts for API and GUI status.
+    pub fn recovery_sets(&self) -> Vec<RecoverySetReport> {
+        let s = self.shared.read().expect("shared lock");
+        let mut reports = s
+            .split_states
+            .iter()
+            .map(|(rsid, set)| {
+                let threshold = usize::from(set.state.threshold());
+                let issued = set.state.issued_count();
+                let mut warnings = Vec::new();
+                if issued == threshold {
+                    warnings.push(PolicyWarning::ZeroSlack);
+                }
+                if issued > 3 * threshold - 1 {
+                    warnings.push(PolicyWarning::OverSoftCap);
+                }
+                let trustees = s
+                    .granted
+                    .get(rsid)
+                    .map(|grant| {
+                        grant
+                            .trustees
+                            .iter()
+                            .map(|trustee| (trustee.user, trustee.delivered))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                RecoverySetReport {
+                    rsid: *rsid,
+                    scope: set.scope,
+                    threshold,
+                    issued,
+                    trustees,
+                    warnings,
+                }
+            })
+            .collect::<Vec<_>>();
+        reports.sort_by_key(|report| report.rsid);
+        reports
+    }
+
+    /// Return established friends and their durable local storage grants.
+    pub fn friend_grants(&self) -> Vec<FriendGrantReport> {
+        let s = self.shared.read().expect("shared lock");
+        let mut reports = s
+            .friendships
+            .keys()
+            .map(|user| FriendGrantReport {
+                user: *user,
+                grant_bytes: s.friend_grants.get(user).copied().unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        reports.sort_by_key(|report| report.user);
+        reports
+    }
+
+    /// Return the verified roster and current address hints from a held recovery grant.
+    /// The grant signature is checked before any values are returned.
+    pub fn claimant_trustee_hints(&self, subject: &[u8; 32]) -> Result<Vec<ClaimantTrusteeHint>> {
+        let grant = self
+            .held_grant(subject)
+            .context("no verified recovery grant for claimant subject")?;
+        verify_share_grant(&grant)
+            .map_err(|error| anyhow::anyhow!("held grant failed verification: {error:?}"))?;
+        let own_card = self.own_device_card();
+        let own = own_card
+            .nodes
+            .iter()
+            .find(|node| node.node_id == self.node_id())
+            .context("own contact card has no local node")?;
+        let s = self.shared.read().expect("shared lock");
+        let mut rows = vec![ClaimantTrusteeHint {
+            user: self.user_id(),
+            node: self.node_id(),
+            addrs: own.addrs.clone(),
+            relay_url: own.relay_url.clone(),
+        }];
+        for trustee in &grant.cotrustees {
+            let address = resolve_peer(&s.peer_addrs, &trustee.node);
+            rows.push(ClaimantTrusteeHint {
+                user: trustee.user,
+                node: trustee.node,
+                addrs: address
+                    .as_ref()
+                    .map(|a| a.ip_addrs().map(ToString::to_string).collect())
+                    .unwrap_or_default(),
+                relay_url: address
+                    .as_ref()
+                    .and_then(|a| a.relay_urls().next().map(ToString::to_string))
+                    .or_else(|| trustee.relay_url.clone()),
+            });
+        }
+        rows.sort_by_key(|row| row.user);
+        rows.dedup_by_key(|row| row.user);
+        Ok(rows)
+    }
+
+    /// Return verified recovery announce references for a claimant restart handoff.
+    pub fn claimant_announce_refs(&self, subject: &[u8; 32]) -> Result<Vec<AnnounceRef>> {
+        let grant = self
+            .held_grant(subject)
+            .context("no verified recovery grant for claimant subject")?;
+        verify_share_grant(&grant)
+            .map_err(|error| anyhow::anyhow!("held grant failed verification: {error:?}"))?;
+        Ok(max_epoch_refs(&grant.refs))
+    }
+
+    /// W15 (§8, §10.2): render the printable paper cards for owned recovery set `rsid` - one
+    /// page per share, recoverable from the words alone offline. Pulls the retained shares from
+    /// `granted`; no regeneration or re-split. SECURITY: the HTML embeds share WORDS (a bearer
+    /// secret), never logged or persisted here - handed straight back over the loopback API.
     pub fn paper_cards(&self, rsid: u64) -> Result<String> {
         let s = self.shared.read().expect("shared lock");
         render_paper_cards(&s, rsid)
     }
 
-    /// Trustee-side: the full [`ShareGrant`] this daemon holds for `subject` (the owner
-    /// whose secret was split), if any (§8, W3). Carries the co-trustee roster, the
-    /// recovery delay, and the latest announce refs - what a ceremony needs.
+    /// Trustee-side: the full [`ShareGrant`] this daemon holds for `subject`, if any (§8, W3):
+    /// co-trustee roster, recovery delay, and latest announce refs - what a ceremony needs.
     pub fn held_grant(&self, subject: &[u8; 32]) -> Option<ShareGrant> {
         self.shared
             .read()
@@ -5454,19 +6270,20 @@ impl Daemon {
         reason: String,
         now: u64,
     ) -> Result<(RecoveryOpen, [u8; 16])> {
+        ensure!(
+            claimant_display.len() <= MAX_CEREMONY_TEXT_BYTES,
+            "claimant display exceeds {MAX_CEREMONY_TEXT_BYTES} bytes"
+        );
+        ensure!(
+            reason.len() <= MAX_CEREMONY_TEXT_BYTES,
+            "recovery reason exceeds {MAX_CEREMONY_TEXT_BYTES} bytes"
+        );
         let grant = self.held_grant(&subject).context(
             "cannot open a recovery ceremony for a subject we hold no grant for (only a trustee may sponsor, §8.5)",
         )?;
         let share = verify_share_grant(&grant)
             .map_err(|e| anyhow::anyhow!("held grant failed verification: {e:?}"))?;
         let rsid = u64::from(share.recovery_set_id);
-        // Per-subject rate limit (§8.5): a trustee cannot spam opens for one subject.
-        {
-            let mut limiter = self.recovery_limiter.lock().expect("recovery limiter lock");
-            limiter
-                .check_and_record(subject, now)
-                .map_err(|e| anyhow::anyhow!("recovery open rate limited: {e:?}"))?;
-        }
         let mut ceremony_id = [0u8; 16];
         getrandom::getrandom(&mut ceremony_id)
             .map_err(|e| anyhow::anyhow!("generate ceremony id: {e}"))?;
@@ -5483,10 +6300,43 @@ impl Daemon {
         );
         // Track our own participation (roster = {us} ∪ the grant's co-trustees).
         let self_user = self.user_id();
-        let state = track_from_grant(&self_user, &open, &grant, now)
-            .map_err(|e| anyhow::anyhow!("sponsor cannot track its own ceremony: {e:?}"))?;
+        let state = match validated_recovery_open(&self_user, &open, &grant, now) {
+            Ok(state) => state,
+            Err(error) => {
+                let mut s = self.shared.write().expect("shared lock");
+                if finish_ceremony(
+                    &mut s,
+                    ceremony_id,
+                    subject,
+                    self_user,
+                    now,
+                    CeremonyTerminal::Failed,
+                ) {
+                    self.persist_locked(&s);
+                }
+                return Err(error).context("sponsor cannot track its own ceremony");
+            }
+        };
         {
             let mut s = self.shared.write().expect("shared lock");
+            if let Err(error) = admit_new_ceremony(&mut s, subject, self_user, now) {
+                if finish_ceremony(
+                    &mut s,
+                    ceremony_id,
+                    subject,
+                    self_user,
+                    now,
+                    CeremonyTerminal::Rejected,
+                ) {
+                    self.persist_locked(&s);
+                }
+                return Err(error).context("recovery open rate limited");
+            }
+            ensure!(
+                s.ceremony_alarms.contains_key(&ceremony_id)
+                    || s.ceremony_alarms.len() < MAX_CEREMONY_RECORDS,
+                "too many active recovery ceremony records"
+            );
             s.ceremony_alarms.insert(
                 ceremony_id,
                 AlarmRecord {
@@ -5507,25 +6357,23 @@ impl Daemon {
                     takeover: false,
                 },
             );
-            // §8.5 (audit #7): ceremonies + ceremony_alarms are persisted. Commit our own
-            // opened ceremony so the E4 delay anchor and alarm survive a reboot mid-flight
-            // (the sponsor's own card qualifies the alarm for durability, C1).
+            // Commit our own opened ceremony so the E4 delay anchor and alarm survive a
+            // reboot (the sponsor's own card qualifies the alarm for durability).
             self.persist_locked(&s);
         }
         Ok((open, ceremony_id))
     }
 
-    /// Fan a signed `RecoveryOpen` out to every co-trustee named in our grant for the
-    /// subject, plus the subject's own devices and our friends we can reach (§8.5 step
-    /// 2): the anti-silent-takeover broadcast. Best-effort - an unreachable target is
-    /// skipped (the open is a re-sendable signed alarm). Returns the number reached.
+    /// Fan a signed `RecoveryOpen` out to every co-trustee in our grant, the subject's own
+    /// devices, and reachable friends (§8.5 step 2 anti-silent-takeover broadcast).
+    /// Best-effort. Returns the number reached.
     pub async fn ceremony_fanout(&self, open: &RecoveryOpen) -> Result<usize> {
         let targets = {
             let s = self.shared.read().expect("shared lock");
             resolve_ceremony_peers(&s, self.node_id(), &open.subject)
         };
         let mut reached = 0;
-        for addr in targets {
+        for addr in targets.into_iter().take(MAX_CEREMONY_FANOUT) {
             if self.deliver_recovery_open(&addr, open).await.is_ok() {
                 reached += 1;
             }
@@ -5533,11 +6381,9 @@ impl Daemon {
         Ok(reached)
     }
 
-    /// Relay a `RecoveryOpen` to one peer's control stream (§8.5 step 2 fan-out). The
-    /// receiver records the alarm and, if it is a trustee, tracks the ceremony. Any
-    /// sealed-share reply is discarded here (fan-out precedes the release gate); the
-    /// claimant collects shares via [`ClaimantDevice::recover`]. Bounded by the connect
-    /// timeout so an offline target fails fast.
+    /// Relay a `RecoveryOpen` to one peer's control stream (§8.5 step 2 fan-out). Any
+    /// sealed-share reply is discarded here (fan-out precedes the release gate); the claimant
+    /// collects shares via [`ClaimantDevice::recover`]. Bounded by the connect timeout.
     pub async fn deliver_recovery_open(
         &self,
         addr: &EndpointAddr,
@@ -5567,12 +6413,9 @@ impl Daemon {
         Ok(reply)
     }
 
-    /// Approve a tracked ceremony as this trustee (§8.5 step 4). Call this ONLY after
-    /// verifying the claimant out of band (video, in person). Records our signed
-    /// approval locally - so we will release our share once the gate opens - and returns
-    /// the `CeremonyApprove` to broadcast to the co-trustees (via
-    /// [`Daemon::ceremony_broadcast_approve`] or [`Daemon::send_ceremony_approve`]).
-    /// Errors if we do not track the ceremony (we never received the open).
+    /// Approve a tracked ceremony as this trustee (§8.5 step 4), ONLY after verifying the
+    /// claimant out of band. Records our signed approval locally and returns the
+    /// `CeremonyApprove` to broadcast. Errors if we do not track the ceremony.
     pub fn ceremony_approve(&self, ceremony_id: [u8; 16], now: u64) -> Result<CeremonyApprove> {
         let mut ap = CeremonyApprove {
             ceremony_id,
@@ -5592,8 +6435,7 @@ impl Daemon {
                 .map_err(|e| anyhow::anyhow!("ceremony approve rejected: {e:?}"))?;
             tc.approved = true;
         }
-        // §8.5 (audit #7): persist our recorded approval so the release gate's approval
-        // count survives a reboot mid-ceremony.
+        // Persist our approval so the release gate's count survives a reboot mid-ceremony.
         self.persist_locked(&s);
         Ok(ap)
     }
@@ -5627,13 +6469,10 @@ impl Daemon {
         Ok(reached)
     }
 
-    /// Sign a `CeremonyAbort` for `ceremony_id` with THIS device's user key (§8.5 step
-    /// 3) and apply it locally. The abort is *authoritative* only if this device's user
-    /// key IS the ceremony's subject: every trustee checks `abort.by == subject`, so an
-    /// abort signed by a non-subject is inert (and `state.abort` rejects it as
-    /// `NotSubject`, leaving the ceremony untouched). Broadcast the returned message to
-    /// the trustees with [`Daemon::ceremony_broadcast_abort`] /
-    /// [`Daemon::send_ceremony_abort`].
+    /// Sign a `CeremonyAbort` for `ceremony_id` with THIS device's user key (§8.5 step 3) and
+    /// apply it locally. Authoritative only if this device's user key IS the subject: every
+    /// trustee checks `abort.by == subject`, so a non-subject abort is inert. Broadcast the
+    /// returned message to the trustees.
     pub fn ceremony_abort(&self, ceremony_id: [u8; 16]) -> Result<CeremonyAbort> {
         let mut ab = CeremonyAbort {
             ceremony_id,
@@ -5653,8 +6492,7 @@ impl Daemon {
                 al.takeover = true;
             }
         }
-        // §8.5 abort durability (audit #7): persist the takeover/abort flags so a reboot
-        // cannot un-wedge an in-flight recovery this device aborted.
+        // Persist the takeover/abort flags so a reboot cannot un-wedge a recovery we aborted.
         self.persist_locked(&s);
         Ok(ab)
     }
@@ -5682,10 +6520,8 @@ impl Daemon {
         Ok(reached)
     }
 
-    /// Dial `addr` on the control stream, send one signed message, drain the (optional)
-    /// reply, and finish. The general one-shot control-frame primitive behind the
-    /// approve/abort send paths; also used by tests to exercise inbound handlers with a
-    /// crafted frame. Bounded by the connect timeout.
+    /// Dial `addr`, send one signed message, drain the optional reply, and finish. The
+    /// one-shot control-frame primitive behind the approve/abort sends. Bounded dial.
     #[doc(hidden)]
     pub async fn send_control_frame<M: carapace_wire::messages::Message>(
         &self,
@@ -5703,11 +6539,9 @@ impl Daemon {
         Ok(())
     }
 
-    /// The recovery-ceremony status surface for `/api/recovery/ceremony` (§8.5 step
-    /// 2/6): one row per ceremony this device has seen (an alarm, and - if it is a
-    /// trustee - the tracked phase and approval count), so a client can raise the
-    /// anti-silent-takeover signal and show progress. Evaluated against the (injectable)
-    /// ceremony clock.
+    /// The recovery-ceremony status surface (§8.5 step 2/6): one row per ceremony this device
+    /// has seen (the alarm, plus tracked phase + approval count if a trustee). Evaluated
+    /// against the injectable ceremony clock.
     pub fn ceremony_statuses(&self) -> Vec<CeremonyStatus> {
         let s = self.shared.read().expect("shared lock");
         let now = ceremony_now(&s);
@@ -5741,7 +6575,15 @@ impl Daemon {
                     sponsor: al.sponsor,
                     claimant_display: al.claimant_display.clone(),
                     reason: al.reason.clone(),
-                    phase: if al.aborted { "aborted" } else { "open" },
+                    phase: match s.ceremony_tombstones.get(id).map(|value| value.terminal) {
+                        Some(CeremonyTerminal::Completed) => "completed",
+                        Some(CeremonyTerminal::Aborted) => "aborted",
+                        Some(CeremonyTerminal::Expired) => "expired",
+                        Some(CeremonyTerminal::Rejected) => "rejected",
+                        Some(CeremonyTerminal::Failed) => "failed",
+                        None if al.aborted => "aborted",
+                        None => "open",
+                    },
                     approvals: 0,
                     threshold: 0,
                     is_self_subject: al.is_self_subject,
@@ -5753,19 +6595,52 @@ impl Daemon {
             .collect()
     }
 
-    /// Test-only: pin the ceremony delay clock to `now` (0 restores real time). Lets a
-    /// bounded test advance past the 72 h abort delay instantly instead of sleeping;
-    /// only the ceremony `first_seen`/release paths read it.
+    /// Test-only: pin the ceremony delay clock to `now` (0 restores real time), so a test can
+    /// advance past the 72 h abort delay without sleeping.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn set_test_clock(&self, now: u64) {
         self.shared.write().expect("shared lock").test_now = now;
     }
+
+    /// Test-only count of bounded ceremony collections.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn ceremony_record_counts(&self) -> (usize, usize, usize) {
+        let s = self.shared.read().expect("shared lock");
+        (
+            s.ceremonies.len(),
+            s.ceremony_alarms.len(),
+            s.aborted_ceremonies.len(),
+        )
+    }
 }
 
-/// Build a `GrantBody` disclosing exactly the manifest files named in `paths`,
-/// pulling each chunk's retained secret from `keys`. Errors if any requested path
-/// is absent from (or deleted in) the vault, so a partial/typo'd disclosure fails
-/// loudly rather than silently under-disclosing.
+fn ceremony_text_is_valid(open: &RecoveryOpen) -> bool {
+    open.claimant_display.len() <= MAX_CEREMONY_TEXT_BYTES
+        && open.reason.len() <= MAX_CEREMONY_TEXT_BYTES
+}
+
+/// A party whose control messages can create bounded ceremony state.
+fn signer_qualifies(
+    signer: &[u8; 32],
+    held_grants: &HashMap<[u8; 32], ShareGrant>,
+    friends: &HashMap<[u8; 32], ContactCard>,
+    docs: &DocStore,
+) -> bool {
+    held_grants.contains_key(signer)
+        || held_grants.values().any(|grant| {
+            grant
+                .cotrustees
+                .iter()
+                .any(|trustee| trustee.user == *signer)
+        })
+        || friends.contains_key(signer)
+        || docs.card(signer).is_some()
+}
+
+/// Build a `GrantBody` disclosing exactly the manifest files named in `paths`. Errors if any
+/// path is absent/deleted, so a typo'd disclosure fails loudly rather than under-disclosing.
 fn select_grant_body(manifest: &Manifest, keys: &ChunkKeys, paths: &[&str]) -> Result<GrantBody> {
     let want: HashSet<&str> = paths.iter().copied().collect();
     let mut files = Vec::with_capacity(want.len());
@@ -5801,28 +6676,67 @@ fn select_grant_body(manifest: &Manifest, keys: &ChunkKeys, paths: &[&str]) -> R
     Ok(GrantBody { files })
 }
 
-/// §7.4 / D3 blob-read gate: whether `node` (the dialer's authenticated iroh node
-/// id) may fetch `chunk_id` from this daemon.
-///
-/// For a chunk of a vault we OWN, release it only to (a) our own delegated devices,
-/// (b) this vault's replica-set members (repair), or (c) a friend authenticated on
-/// our control stream whose identity an owner-signed grant names in the audience
-/// covering that chunk. A dialer that never authenticated, or an authenticated
-/// friend outside the audience, is refused — a leaked grant document alone (from a
-/// non-audience party) authorizes nothing.
-///
-/// "A chunk of a vault we OWN" is any ChunkID in `owned_chunks` — every chunk ever
-/// published for an owned vault, retained across epoch bumps — so a superseded
-/// chunk keeps its owner gate (W2), not just the current epoch's.
-///
-/// A chunk we hold AS A REPLICA for another owner (any hash in `replica_chunks`,
-/// envelope or ciphertext) is gated by §7.4 (a)/(b) (W8): released only to that
-/// vault owner's delegated devices (proved by the card the dialer presents on our
-/// control stream) or a current replica-set member from the owner's announce. Any
-/// other blob (a truly foreign chunk) stays on the inherited residual.
+/// §7.4/D3 blob-read gate: whether `node` (the dialer's authenticated node id) may fetch
+/// `chunk_id`. An OWNED chunk (any ChunkID in `owned_chunks`, retained across epoch bumps)
+/// goes only to (a) our own devices, (b) this vault's replica-set members, or (c) a friend
+/// in a grant's audience covering the chunk. A REPLICA-held chunk (`replica_chunks`) goes
+/// only to that owner's devices or a current replica-set member (W8). Everything else is
+/// default-denied.
+struct BlobRetentionSet {
+    all: HashSet<[u8; 32]>,
+    owned: HashSet<[u8; 32]>,
+}
+
+fn blob_retention_set(s: &Shared) -> Result<BlobRetentionSet> {
+    let mut retained = HashSet::new();
+    let mut owned = HashSet::new();
+    let mut insert = |id: [u8; 32], is_owned: bool| -> Result<()> {
+        retained.insert(id);
+        if is_owned {
+            owned.insert(id);
+        }
+        ensure!(
+            retained.len() <= MAX_GC_LIVE_BLOBS,
+            "blob GC live set exceeds {MAX_GC_LIVE_BLOBS} entries"
+        );
+        Ok(())
+    };
+
+    for vault in s.vault_blobs.values() {
+        insert(vault.digest, true)?;
+        for chunk in &vault.chunk_ids {
+            insert(*chunk, true)?;
+        }
+    }
+    for (digest, chunks) in s.needs_refetch.values() {
+        insert(*digest, true)?;
+        for chunk in chunks {
+            insert(*chunk, true)?;
+        }
+    }
+    for chunk in s.replica_chunks.keys() {
+        insert(*chunk, false)?;
+    }
+    // Disclosure is permanent in v1. Its ciphertext and owner-side gate row stay live even
+    // after the source vault advances to a new epoch.
+    for chunk in s.disclosure.chunk_ids() {
+        insert(chunk, true)?;
+    }
+    Ok(BlobRetentionSet {
+        all: retained,
+        owned,
+    })
+}
+
+fn prune_owned_authorizations(s: &mut Shared, retained: &HashSet<[u8; 32]>) -> usize {
+    let before = s.owned_chunks.len();
+    s.owned_chunks.retain(|chunk, _| retained.contains(chunk));
+    before.saturating_sub(s.owned_chunks.len())
+}
+
 fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
-    // Consult the RETAINED owned-chunk set, not the current-epoch `vault_blobs`, so
-    // a superseded chunk stays gated instead of regressing to the residual (W2).
+    // Consult the RETAINED owned-chunk set, not current-epoch `vault_blobs`, so a superseded
+    // chunk stays gated instead of regressing to the residual (W2).
     if let Some(vid) = s.owned_chunks.get(chunk_id).copied() {
         return match s.blob_auth.get(node) {
             // (a) our own delegated device.
@@ -5841,15 +6755,12 @@ fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
         };
     }
 
-    // W8/§7.4: a blob we hold AS A REPLICA for another owner. Serve it only to (a)
-    // that vault owner's delegated devices, or (b) a current replica-set member (for
-    // repair) - never to an arbitrary dialer, which the old residual `return true`
-    // let through.
+    // W8/§7.4: a REPLICA-held blob. Serve only to (a) the owner's delegated devices or (b) a
+    // current replica-set member, never an arbitrary dialer.
     if let Some(vid) = s.replica_chunks.get(chunk_id).copied() {
         let owner = s.replica_owner.get(&vid).copied();
-        // (a) the owner's delegated device: either the owner's own node that is our
-        // friend (Friend), or one of the owner's other devices proven by the card it
-        // presented (ReplicaDevice).
+        // (a) the owner's device: its friend node (Friend), or another device proven by the
+        // card it presented (ReplicaDevice).
         let owner_device = owner.is_some_and(|o| match s.blob_auth.get(node) {
             Some(BlobAuth::Friend(u)) | Some(BlobAuth::ReplicaDevice(u)) => *u == o,
             _ => false,
@@ -5862,19 +6773,15 @@ fn authorize_fetch(s: &Shared, node: &[u8; 32], chunk_id: &[u8; 32]) -> bool {
         return owner_device || member;
     }
 
-    // F1 (design §3.5) DEFAULT-DENY: a blob in neither the owner-gated set
-    // (`owned_chunks`, incl. each vault's manifest-envelope digest) nor the
-    // replica-held set (`replica_chunks`) is served to NO ONE. With a durable blob
-    // store, the old residual `return true` would re-open every owned blob to any
-    // dialer after a reboot; default-deny turns any future gate-map omission from a
-    // silent public leak into a visible availability failure instead.
+    // F1 DEFAULT-DENY: a blob in neither the owned nor replica-held set is served to no one.
+    // With a durable store a residual `return true` would re-open every owned blob to any
+    // dialer after a reboot; default-deny turns any gate-map omission into a visible failure.
     false
 }
 
-/// Resolve `node` to the *user* pubkey that delegates it: our own user (if one of
-/// our cards delegates it) or an established friend whose newest card does (§4). The
-/// owner-user a replica records for a placement so it can later admit that owner's
-/// delegated devices (W8).
+/// Resolve `node` to the *user* pubkey that delegates it: our own user or an established
+/// friend whose newest card does (§4). Recorded at placement so a replica can later admit
+/// that owner's devices (W8).
 fn owner_user_of_node(
     s: &Shared,
     self_user: &[u8; 32],
@@ -5893,13 +6800,9 @@ fn owner_user_of_node(
         .map(|(user, _)| *user)
 }
 
-/// W8/§7.4 a: if the self-consistent `card` a dialer presented belongs to a vault
-/// OWNER this daemon holds replicas for and delegates the dialer's `remote` node,
-/// the owner-user it authenticates as. Lets an owner's device this replica does not
-/// otherwise know (not enumerated in the stored friend card) fetch that owner's
-/// replica-held chunks. ponytail (like the self-device gate): this trusts the
-/// presented card's delegation, so a device the owner has since revoked could still
-/// present an old card until a rollback-guarded owner-card store lands.
+/// W8/§7.4 a: if the self-consistent `card` a dialer presented belongs to a vault OWNER this
+/// daemon replicates for and delegates `remote`, the owner-user it authenticates as. Lets an
+/// owner's device this replica does not otherwise know fetch that owner's replica-held chunks.
 fn replica_owner_device(
     s: &Shared,
     card: &ContactCard,
@@ -5916,24 +6819,23 @@ fn replica_owner_device(
     card_delegates_node(card, remote, now).then_some(owner)
 }
 
-/// Choose which vaults to reconstruct from a pulled document batch, applying the
-/// two §6 MUSTs: (C1) the announce/grant signer node must be delegated by the
-/// vault-owning user in that user's newest verified `ContactCard`, and (W2) the
-/// announce epoch must exceed the highest ever seen from that signer for the vid.
-///
-/// Phase 1 is same-user two-device sync, so the vault owner is bound to *our own*
-/// user key: an announce signed by a node not delegated by our user is refused.
-/// Whether a manifest-supplied relative path is safe to delete under an out dir:
-/// no absolute root, no `..` escape, no backslash. Mirrors `carapace_vault`'s
-/// `safe_join` guard for the tombstone-deletion path (a manifest may be hostile;
-/// Phase 1 manifests are same-user-trusted, so this matches that crate's stance).
-fn manifest_rel_is_safe(rel: &str) -> bool {
-    if rel.is_empty() {
-        return false;
-    }
-    rel.split('/').all(|p| p != ".." && !p.contains('\\'))
+/// Admit a newly recovered device to a trustee's document feed only while this trustee
+/// tracks a non-aborted ceremony for that subject. The presented card must be self-signed
+/// by the recovered user and delegate the authenticated remote node.
+fn recovery_claimant_device(s: &Shared, card: &ContactCard, remote: &[u8; 32], now: u64) -> bool {
+    card.verify().is_ok()
+        && card_delegates_node(card, remote, now)
+        && s.ceremonies.iter().any(|(id, ceremony)| {
+            ceremony.state.subject == card.user
+                && !ceremony.takeover
+                && !ceremony_is_expired(ceremony, now)
+                && s.ceremony_released.get(id) == Some(remote)
+        })
 }
 
+/// Choose which vaults to reconstruct from a pulled document batch, applying the two §6 MUSTs:
+/// (C1) the announce signer node must be delegated by the vault-owning user's newest verified
+/// card, and (W2) the announce epoch must exceed the highest ever seen from that signer.
 fn select_targets(
     docs: &mut DocStore,
     self_user: &[u8; 32],
@@ -5941,16 +6843,10 @@ fn select_targets(
     announces: &[VaultAnnounce],
     now: u64,
 ) -> Vec<([u8; 32], VaultAnnounce)> {
-    // The set of node ids our user delegates. The `DocStore` keeps only ONE card per
-    // user, so with 3+ same-user devices that stored card alone names a single
-    // sibling and every other sibling's announce would be refused - silently
-    // dropping that device's edits (a §11 multi-device propagation gap). So also
-    // honor the delegation carried by each card presented in THIS batch: every
-    // announcing device presents its own user-signed card, and a forged card cannot
-    // fake a self_user delegation (it fails `card.verify()`), so trusting any node
-    // our own user validly delegates is safe. This matches the self-branch stance in
-    // `classify_dialer` (own-device revocation remains a separate documented TODO).
-    // Built fully before the rollback offer below borrows `docs` mutably.
+    // Node ids our user delegates. The `DocStore` keeps only ONE card per user, so with 3+
+    // same-user devices also honor the delegation in each card presented in THIS batch (a
+    // forged card cannot fake a self_user delegation - it fails `card.verify()`), else every
+    // other sibling's announce would be refused. Built before the rollback offer borrows `docs`.
     let mut delegated: HashSet<[u8; 32]> = HashSet::new();
     if let Some(card) = docs.card(self_user) {
         for n in &card.nodes {
@@ -5974,21 +6870,15 @@ fn select_targets(
     for ann in announces {
         // C1: the announce signer must be a delegated node of the vault owner.
         if !delegated.contains(&ann.by) {
-            // W7 store-and-forward (§6): an announce for a vault we do not own is not
-            // a reconstruction target, but store the signed doc (rollback-guarded per
-            // (signer, vid)) so this node re-serves it to its own friends — an owner's
-            // announce reaches a trustee through any mutual friend. A bad signature or
-            // a stale epoch is simply not stored; it never aborts the batch.
+            // W7 store-and-forward (§6): store an announce for a vault we do not own
+            // (rollback-guarded per (signer, vid)) so this node re-serves it to its friends.
+            // A bad sig or stale epoch is simply not stored; it never aborts the batch.
             let _ = docs.offer_announce(ann);
             continue;
         }
-        // Option B (§4): a delegated-signer announce is a full reconstruction target
-        // on its own - `reconstruct_one` re-derives per-chunk keys from the manifest
-        // `pt_hash` (holder of `K_root`), so no matching FileGrant is required. This is
-        // what lets a `K_root`-recovering claimant reconstruct off a replica that
-        // serves only the announce + owner card, never a grant.
-        // W2: persistent rollback — accept only an epoch strictly newer than the
-        // highest ever seen from this signer for this vid (also re-verifies sig).
+        // Option B (§4): a delegated-signer announce is a full reconstruction target on its
+        // own (keys re-derived from the manifest pt_hash), no FileGrant required. W2: accept
+        // only an epoch strictly newer than the highest ever seen from this signer.
         if matches!(docs.offer_announce(ann), Ok(true)) {
             out.push((ann.vid, ann.clone()));
         }
@@ -6024,24 +6914,13 @@ fn card_delegates_node(card: &ContactCard, node_id: &[u8; 32], now: u64) -> bool
     false
 }
 
-/// W5/W2 gate for a document pull: authorize the connection's authenticated remote
-/// node id. The presented `card` must be validly self-signed and name this
-/// daemon's own user or an established friend. Delegation is then checked as
-/// follows:
-///
-/// - Self branch (`card.user == self_user`, W7 `6-newest-card-delegations`): once a
-///   strictly-newer self-card is known (`newest_self`, the rollback-guarded newest
-///   card this user has signed, learned via anti-entropy into the [`DocStore`]), it is
-///   authoritative — a node absent from it (a revoked own device presenting an old
-///   self-card) is refused, per §6 "MUST NOT honor node delegations absent from the
-///   signer's newest card." Until a newer self-card exists (the same-version
-///   sibling-card case this build's one-node-per-device cards produce during normal
-///   multi-device sync), the presented self-card's own delegation is trusted, so a
-///   first-seen sibling device still authorizes.
-/// - Friend branch (W2): authorization uses the STORED newest friend card
-///   (`s.friends`), never the delegations in the card the dialer presents. Once a
-///   friend publishes a newer card dropping a device, a dialer presenting an old
-///   card that still delegates that device is refused.
+/// W5/W2 gate for a document pull: authorize the authenticated remote node id. The presented
+/// `card` must be validly self-signed and name our own user or an established friend.
+/// - Self branch: a strictly-newer known self-card (`newest_self`) is authoritative, so a
+///   node absent from it (a revoked own device presenting an old card) is refused; until one
+///   exists the presented self-card's delegation is trusted (first-seen sibling authorizes).
+/// - Friend branch (W2): authorization uses the STORED newest friend card, never the
+///   presented card, so a dropped device presenting an old card is refused.
 fn classify_dialer(
     s: &Shared,
     self_user: &[u8; 32],
@@ -6054,9 +6933,8 @@ fn classify_dialer(
         return None;
     }
     if card.user == *self_user {
-        // A strictly-newer known self-card supersedes the presented one: honor only
-        // the nodes it still delegates (revocation takes effect). Otherwise fall back
-        // to the presented card, preserving same-version multi-device authorization.
+        // A strictly-newer known self-card supersedes the presented one (revocation takes
+        // effect); else fall back to the presented card, preserving multi-device auth.
         return match newest_self {
             Some(newest) if newest.version > card.version => {
                 card_delegates_node(newest, remote, now).then_some(BlobAuth::OwnDevice)
@@ -6072,10 +6950,8 @@ fn classify_dialer(
     }
 }
 
-/// S3: whether a `FriendAccept` genuinely comes from the issuer of the ticket the
-/// requester redeemed. The accept's embedded card must name `ticket_user`, and the
-/// completed friendship must bind that same party. Signature validity is proven
-/// separately by `verify_friend_accept`; this binds identity to the ticket.
+/// S3: whether a `FriendAccept` comes from the ticket issuer. The accept's card must name
+/// `ticket_user` and the friendship must bind that party (signature is checked separately).
 fn accept_binds_ticket(accept: &FriendAccept, ticket_user: &[u8; 32], fr: &Friendship) -> bool {
     accept.card.user == *ticket_user && (fr.a == *ticket_user || fr.b == *ticket_user)
 }
@@ -6095,14 +6971,10 @@ fn node_is_authorized(s: &Shared, self_user: &[u8; 32], node: &[u8; 32], now: u6
         .any(|c| card_delegates_node(c, node, now))
 }
 
-/// C1: friend-gate for the embedded relay (§6/§14). Admits only this node itself,
-/// its own delegated devices, and nodes delegated by an established friend's
-/// newest card - never arbitrary internet peers. Reads the live friend set on
-/// every connection, so a peer befriended after the relay started is admitted
-/// and an unfriended one stops being admitted, with no relay restart.
-///
-/// The endpoint id is authenticated by the relay handshake before this runs
-/// (iroh-relay), so a non-friend cannot forge a friend's id to pass the gate.
+/// C1: friend-gate for the embedded relay (§6/§14). Admits only this node, its own devices,
+/// and nodes delegated by an established friend's newest card - never arbitrary peers. Reads
+/// the live friend set per connection. The endpoint id is relay-handshake-authenticated before
+/// this runs, so a non-friend cannot forge a friend's id.
 struct FriendRelayGate {
     shared: Arc<RwLock<Shared>>,
     self_user: [u8; 32],
@@ -6120,8 +6992,7 @@ impl std::fmt::Debug for FriendRelayGate {
 impl RelayAccessPolicy for FriendRelayGate {
     fn allows(&self, endpoint_id: &EndpointId, auth_token: Option<&str>) -> bool {
         let node = *endpoint_id.as_bytes();
-        // Always admit ourselves: we register on our own relay as home relay,
-        // independent of when our own card lands in `shared`.
+        // Always admit ourselves: we register on our own relay as home relay.
         if node == self.self_node {
             return true;
         }
@@ -6130,10 +7001,8 @@ impl RelayAccessPolicy for FriendRelayGate {
         if node_is_authorized(&s, &self.self_user, &node, now) {
             return true;
         }
-        // Invite bootstrap (§6): a not-yet-friend that presents a live invite
-        // ticket we issued (as its relay auth token) is admitted so it can reach
-        // us to complete the friendship handshake. Without this, a friend-only
-        // gate would make the very first, ticketed contact impossible over relay.
+        // Invite bootstrap (§6): a not-yet-friend presenting a live invite ticket we issued
+        // (as its relay auth token) is admitted so it can complete the friendship handshake.
         auth_token
             .and_then(parse_ticket_auth_token)
             .is_some_and(|tok| s.tickets.admits(&tok, now))
@@ -6189,11 +7058,9 @@ struct UnfriendTeardown {
 }
 
 /// §9.3 (local half of steps 1-3): drop `ex_user` from the friend graph, delete every
-/// replica/share/grant we HOLD of them, queue the vaults they replicated for us for
-/// immediate re-placement (`unfriended_nodes`), and record a pending re-split for every
-/// recovery set they were a trustee of (`pending_resplits`). Pure state mutation - no
-/// network, no `k_root` - so both the initiating [`Daemon::unfriend`] and the inbound
-/// `FriendshipEnd` handler share it. Returns the initiator's follow-through inputs.
+/// replica/share/grant we HOLD of them, queue their replicas of our vaults for re-placement,
+/// and record a pending re-split per recovery set they were a trustee of. Pure state mutation
+/// (no network, no `k_root`), shared by [`Daemon::unfriend`] and the `FriendshipEnd` handler.
 fn teardown_unfriended_state(s: &mut Shared, ex_user: [u8; 32]) -> UnfriendTeardown {
     // Their delegated nodes + last-known addresses, captured before we drop the card.
     let ex_nodes: Vec<[u8; 32]> = s
@@ -6206,8 +7073,8 @@ fn teardown_unfriended_state(s: &mut Shared, ex_user: [u8; 32]) -> UnfriendTeard
         .filter_map(|n| s.peer_addrs.get(n).cloned())
         .collect();
 
-    // What we PLACED on them (DeleteRequest inputs): (a) our vaults they hold a replica
-    // of (their node is a member), and (b) whether they hold a share of ours.
+    // What we PLACED on them (DeleteRequest inputs): our vaults they replicate, and whether
+    // they hold a share of ours.
     let replica_vids: Vec<[u8; 32]> = s
         .members
         .iter()
@@ -6277,9 +7144,8 @@ fn teardown_unfriended_state(s: &mut Shared, ex_user: [u8; 32]) -> UnfriendTeard
     }
 }
 
-/// Drop all bookkeeping for a vault we hold as a replica (§9.3 delete side + unfriend
-/// teardown). The blobs themselves are left to store GC (a separate resource concern,
-/// like the W2-gc note); this closes the §7.4/W8 read gate for that vault immediately.
+/// Drop all bookkeeping for a vault we hold as a replica, closing the §7.4/W8 read gate for
+/// it immediately. The blobs are left to store GC.
 fn drop_replica_vid(s: &mut Shared, vid: &[u8; 32]) {
     s.held.remove(vid);
     s.replica_owner.remove(vid);
@@ -6300,13 +7166,12 @@ fn drop_held_share_of(s: &mut Shared, owner: &[u8; 32]) {
     }
 }
 
-/// Apply a verified [`DeleteRequest`] from `owner_user` (§9.3 step 1): delete what that
-/// owner placed on us, per scope. Bookkeeping deletion - the bytes were ciphertext and
-/// any share is neutralized by the re-split, so this is compliance, not proof.
+/// Apply a verified [`DeleteRequest`] from `owner_user` (§9.3 step 1): delete what that owner
+/// placed on us, per scope. Bookkeeping deletion (compliance, not proof).
 fn apply_delete_request(s: &mut Shared, req: &DeleteRequest, owner_user: &[u8; 32]) {
     match req.scope {
         SCOPE_REPLICAS => {
-            // Delete only a replica we actually hold FOR this owner.
+            // Delete only a replica we hold FOR this owner.
             if let Some(vid) = req.vid {
                 if s.replica_owner.get(&vid) == Some(owner_user) {
                     drop_replica_vid(s, &vid);
@@ -6330,28 +7195,13 @@ fn apply_delete_request(s: &mut Shared, req: &DeleteRequest, owner_user: &[u8; 3
     }
 }
 
-/// Stand up the §9.3 step-3 re-split for `old_rsid`, whose trustee `ex_user` was just
-/// unfriended, into an [`OpenResplit`]. Re-splits the SAME secret (a fresh
-/// recovery-set id) among `new_trustee_users`, keeping the old threshold `M`; the
-/// ex-friend is excluded from the OLD honest set that is told to destroy, so once the new
-/// set is live and the old honest shares are destroyed the ex-friend's retained old share
-/// is stranded below `M`.
-///
-/// `new_trustee_users` is the chosen new set (§9.3.4: the user's choice, defaulting to the
-/// old honest set). Each must be a still-known trustee or an established friend so its
-/// roster identity + dial node resolve; a stranger fails loudly. `N_new = len` must be
-/// `>= M`, and `M >= 2` (a 1-of-N trustee is a full key holder no re-split can
-/// neutralize); slack is 1 when there is room else 0. It errors otherwise - surfaced for a
-/// manual re-split rather than a silently broken set.
-///
-/// §8: each new grant carries the co-trustee roster (pubkeys + node hints, the recipient
-/// excluded) and the latest announce refs, mirroring the original split's grants
-/// ([`Daemon::recovery_split_grant`]). The destroy of the old set is gated by
-/// [`Resplit::share_destroy`] regardless.
-///
-/// ponytail: re-split only supports Root-scoped sets (the inner circle) - [`Resplit::begin`]
-/// splits `k_root`. A Vault-scoped old set errors here rather than silently splitting the
-/// wrong secret; wire `K_vaultroot` through `begin` to lift this.
+/// Stand up the §9.3 step-3 re-split for `old_rsid` (whose trustee `ex_user` was unfriended)
+/// into an [`OpenResplit`]. Re-splits the SAME secret at a fresh recovery-set id among
+/// `new_trustee_users`, keeping threshold `M`; the ex-friend is excluded from the OLD honest
+/// set told to destroy, so once the new set is live the ex-friend's retained share is stranded
+/// below `M`. Each new trustee must be a known trustee or established friend (a stranger fails
+/// loudly); `N_new >= M`, `M >= 2`. Root-scoped only ([`Resplit::begin`] splits `k_root`); a
+/// Vault-scoped set errors rather than split the wrong secret.
 fn build_resplit(
     node_key: &SigningKey,
     k_root: &[u8; 32],
@@ -6376,9 +7226,8 @@ fn build_resplit(
         "cannot neutralize a {m}-of-N trustee by re-split: one share already recovers"
     );
 
-    // Root-only: the re-split splits `k_root`. Refuse a Vault-scoped set rather than split
-    // the wrong secret. Absent split-state (e.g. a re-split-of-a-re-split before extend is
-    // wired) defaults to Root, which is what `begin` produces anyway.
+    // Root-only: refuse a Vault-scoped set rather than split the wrong secret. Absent
+    // split-state defaults to Root, which is what `begin` produces anyway.
     let scope = s
         .split_states
         .get(&old_rsid)
@@ -6389,15 +7238,13 @@ fn build_resplit(
         "re-split of a vault-scoped recovery set is not supported; recruit new trustees and split manually"
     );
 
-    // §9.3: the unfriended ex-trustee must NEVER be a member of the new set - re-granting
-    // them a fresh valid share would defeat the re-split's whole point (strand them below M).
-    // The default/suggested set already excludes them; this guards an operator-supplied set.
+    // §9.3: the unfriended ex-trustee must NEVER be in the new set - re-granting them a valid
+    // share would defeat the re-split. Guards an operator-supplied set (the default excludes them).
     ensure!(
         !new_trustee_users.contains(&ex_user),
         "the unfriended trustee cannot be a member of the new re-split set"
     );
-    // Reject duplicate new-trustee pubkeys: duplicates inflate issuance and desync the
-    // attestation tracker's N from the deduped roster (n <= 32, so the scan is cheap).
+    // Reject duplicate new-trustee pubkeys: they inflate issuance and desync the tracker's N.
     for (i, u) in new_trustee_users.iter().enumerate() {
         ensure!(
             !new_trustee_users[i + 1..].contains(u),
@@ -6406,8 +7253,7 @@ fn build_resplit(
         );
     }
 
-    // The OLD honest trustees (told to destroy) are always the old set minus the ex-friend,
-    // independent of the chosen NEW set.
+    // The OLD honest trustees (told to destroy): the old set minus the ex-friend.
     let old_honest: Vec<[u8; 32]> = g
         .trustees
         .iter()
@@ -6415,9 +7261,8 @@ fn build_resplit(
         .map(|t| t.node)
         .collect();
 
-    // Resolve each chosen new trustee's roster identity (user + node + relay). Prefer the
-    // old grant record (still knows the node), else the current friend card; a user that is
-    // neither fails loudly - we cannot build a roster entry or deliver to it.
+    // Resolve each chosen new trustee's roster identity (user + node + relay): prefer the old
+    // grant record, else the current friend card; a user that is neither fails loudly.
     let mut new_roster: Vec<CoTrustee> = Vec::with_capacity(new_trustee_users.len());
     for user in new_trustee_users {
         let ct = if let Some(t) = g.trustees.iter().find(|t| t.user == *user) {
@@ -6468,9 +7313,8 @@ fn build_resplit(
     .map_err(|e| anyhow::anyhow!("re-split begin failed: {e:?}"))?;
     let new_rsid = rs.new_rsid();
 
-    // §8: mint each new grant with the co-trustee roster (recipient excluded) + latest
-    // announce refs, using the fresh shares `begin` produced. The empty-roster grants
-    // `begin` also returned are discarded - `begin` has no roster context, this does.
+    // §8: mint each new grant with the co-trustee roster (recipient excluded) + latest announce
+    // refs, using `begin`'s fresh shares. `begin`'s empty-roster grants are discarded.
     let refs = current_announce_refs(s);
     let mut new_peers = Vec::with_capacity(new_nodes.len());
     let mut new_records = Vec::with_capacity(new_nodes.len());
@@ -6567,7 +7411,7 @@ fn render_paper_cards(s: &Shared, rsid: u64) -> Result<String> {
 
 fn register_completed_resplit(s: &mut Shared, old_rsid: u64) {
     // Snapshot the registration data and mark it done, dropping the `&mut o` borrow before
-    // mutating the sibling maps (`granted`/`share_sets`/`split_states`).
+    // mutating the sibling maps.
     let snap = {
         let Some(o) = s.resplits.get_mut(&old_rsid) else {
             return;
@@ -6614,10 +7458,8 @@ fn register_completed_resplit(s: &mut Shared, old_rsid: u64) {
     s.granted.remove(&old_rsid);
     s.share_sets.remove(&old_rsid);
     s.split_states.remove(&old_rsid);
-    // Retire the completed OpenResplit itself: its `new_records` hold a duplicate in-memory
-    // copy of the new shares (already in `granted[new_rsid]`) that would otherwise accumulate
-    // unbounded across re-splits and never drop; removing it also stops drive_resplit from
-    // no-op-driving a finished re-split every maintenance tick.
+    // Retire the completed OpenResplit: it holds a duplicate copy of the new shares that would
+    // accumulate unbounded, and removing it stops drive_resplit no-op-driving it every tick.
     s.resplits.remove(&old_rsid);
 }
 
@@ -6669,9 +7511,7 @@ fn resplit_status_of(s: &Shared, o: &OpenResplit) -> ResplitStatus {
     }
 }
 
-/// The wall clock the ceremony delay gate reads: the injected `test_now` when set
-/// (bounded tests advance it past the 72 h delay instantly), else real time. Only the
-/// network-triggered ceremony paths (track `first_seen`, `can_release`, status) use it.
+/// The wall clock the ceremony delay gate reads: injected `test_now` when set, else real time.
 fn ceremony_now(s: &Shared) -> u64 {
     if s.test_now == 0 {
         unix_now()
@@ -6680,25 +7520,170 @@ fn ceremony_now(s: &Shared) -> u64 {
     }
 }
 
-/// Track an inbound `RecoveryOpen` against a held `ShareGrant` (§8.5): verify the
-/// grant + open, bind the open to the grant's subject/rsid, derive the FULL trustee
-/// roster as `{this trustee} ∪ the grant's co-trustees`, and build the delay-anchored
-/// [`CeremonyState`] (`first_seen = now`).
-///
-/// The roster is reconstructed here rather than via the ceremony crate's
-/// `open_from_grant`, because a W3 owner-minted grant is signed by the OWNER (not the
-/// holding trustee) and lists only the OTHER co-trustees - so `grant.by` is the owner,
-/// not a roster member. The holder is this device (`self_user`), which is exactly the
-/// missing roster entry.
-fn track_from_grant(
+fn record_maintenance_history(
+    history: &mut OperationalHistory,
+    now: u64,
+    failure_count: usize,
+    gc_succeeded: bool,
+) {
+    history.last_maintenance_at = now;
+    history.last_gc_succeeded = gc_succeeded;
+    history.last_failure_count = failure_count.min(MAX_OPERATION_FAILURE_COUNT);
+    if failure_count == 0 {
+        history.consecutive_failed_rounds = 0;
+    } else {
+        history.last_failure_at = now;
+        history.consecutive_failed_rounds = history.consecutive_failed_rounds.saturating_add(1);
+    }
+}
+
+fn record_rate(history: &mut HashMap<[u8; 32], Vec<u64>>, key: [u8; 32], now: u64) -> Result<()> {
+    for events in history.values_mut() {
+        events.retain(|time| now.saturating_sub(*time) < RECOVERY_RATE_WINDOW_SECS);
+    }
+    history.retain(|_, events| !events.is_empty());
+    ensure!(
+        history.contains_key(&key) || history.len() < MAX_RECOVERY_RATE_KEYS,
+        "recovery rate history is full"
+    );
+    let events = history.entry(key).or_default();
+    ensure!(
+        events.len() < MAX_RECOVERY_OPENS_PER_WINDOW,
+        "recovery open rate limit exceeded"
+    );
+    events.push(now);
+    Ok(())
+}
+
+fn record_ceremony_rates(
+    s: &mut Shared,
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    now: u64,
+) -> Result<()> {
+    // Apply to copies first so failure cannot charge only one of the two budgets.
+    let mut subjects = s.ceremony_subject_rate.clone();
+    let mut sponsors = s.ceremony_sponsor_rate.clone();
+    record_rate(&mut subjects, subject, now)?;
+    record_rate(&mut sponsors, sponsor, now)?;
+    s.ceremony_subject_rate = subjects;
+    s.ceremony_sponsor_rate = sponsors;
+    Ok(())
+}
+
+fn can_start_ceremony(s: &Shared, subject: &[u8; 32]) -> bool {
+    s.ceremonies.len() < MAX_CEREMONY_RECORDS
+        && s.ceremonies
+            .values()
+            .filter(|tracked| &tracked.state.subject == subject)
+            .count()
+            < MAX_ACTIVE_CEREMONIES_PER_SUBJECT
+}
+
+/// Apply the shared local and inbound admission policy for one new ceremony.
+/// Signature, grant, and role checks happen before this function because those inputs differ.
+fn admit_new_ceremony(
+    s: &mut Shared,
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    now: u64,
+) -> Result<()> {
+    ensure!(
+        can_start_ceremony(s, &subject),
+        "active recovery ceremony limit reached for this subject"
+    );
+    record_ceremony_rates(s, subject, sponsor, now)
+}
+
+fn finish_ceremony(
+    s: &mut Shared,
+    id: [u8; 16],
+    subject: [u8; 32],
+    sponsor: [u8; 32],
+    now: u64,
+    terminal: CeremonyTerminal,
+) -> bool {
+    if !s.ceremony_tombstones.contains_key(&id)
+        && s.ceremony_tombstones.len() >= MAX_CEREMONY_TOMBSTONES
+    {
+        return false;
+    }
+    s.ceremony_tombstones
+        .entry(id)
+        .or_insert(CeremonyTombstone {
+            subject,
+            sponsor,
+            terminal_at: now,
+            terminal,
+        });
+    s.ceremonies.remove(&id);
+    s.ceremony_released.remove(&id);
+    true
+}
+
+fn ceremony_is_expired(tracked: &TrackedCeremony, now: u64) -> bool {
+    let anchor = tracked.state.opened_at.max(tracked.state.first_seen);
+    now >= anchor
+        .saturating_add(tracked.state.recovery_delay)
+        .saturating_add(CEREMONY_COMPLETION_GRACE_SECS)
+}
+
+fn cleanup_ceremonies(s: &mut Shared, now: u64) -> bool {
+    let expired: Vec<([u8; 16], [u8; 32], [u8; 32])> = s
+        .ceremonies
+        .iter()
+        .filter(|(_, tracked)| ceremony_is_expired(tracked, now))
+        .map(|(id, tracked)| {
+            let sponsor = s
+                .ceremony_alarms
+                .get(id)
+                .map_or([0; 32], |alarm| alarm.sponsor);
+            (*id, tracked.state.subject, sponsor)
+        })
+        .collect();
+    let mut dirty = !expired.is_empty();
+    for (id, subject, sponsor) in expired {
+        let terminal = if s.ceremony_released.contains_key(&id) {
+            CeremonyTerminal::Completed
+        } else {
+            CeremonyTerminal::Expired
+        };
+        finish_ceremony(s, id, subject, sponsor, now, terminal);
+    }
+    let terminal_ids: Vec<[u8; 16]> = s.ceremony_tombstones.keys().copied().collect();
+    for id in terminal_ids {
+        dirty |= s.ceremony_alarms.remove(&id).is_some();
+        dirty |= s.aborted_ceremonies.remove(&id).is_some();
+    }
+    for history in [&mut s.ceremony_subject_rate, &mut s.ceremony_sponsor_rate] {
+        let before = history.len();
+        for events in history.values_mut() {
+            events.retain(|time| now.saturating_sub(*time) < RECOVERY_RATE_WINDOW_SECS);
+        }
+        history.retain(|_, events| !events.is_empty());
+        dirty |= history.len() != before;
+    }
+    dirty
+}
+
+/// Track an inbound `RecoveryOpen` against a held `ShareGrant` (§8.5): verify grant + open,
+/// bind the open to the grant's subject/rsid, derive the roster as `{this trustee} ∪ the
+/// grant's co-trustees`, and build the delay-anchored [`CeremonyState`] (`first_seen = now`).
+/// The roster is reconstructed here because a W3 grant is OWNER-signed and lists only the
+/// OTHER co-trustees, so the holder (`self_user`) is the missing entry.
+fn validated_recovery_open(
     self_user: &[u8; 32],
     open: &RecoveryOpen,
     grant: &ShareGrant,
     now: u64,
-) -> Result<CeremonyState, carapace_recovery::RecoveryError> {
-    let share = verify_share_grant(grant)?;
+) -> Result<CeremonyState> {
+    open.verify()
+        .map_err(|error| anyhow::anyhow!("invalid recovery open signature: {error:?}"))?;
+    ensure!(ceremony_text_is_valid(open), "invalid recovery open text");
+    let share = verify_share_grant(grant)
+        .map_err(|error| anyhow::anyhow!("invalid held recovery grant: {error:?}"))?;
     if open.subject != grant.subject || open.rsid != u64::from(share.recovery_set_id) {
-        return Err(carapace_recovery::RecoveryError::GrantMismatch);
+        anyhow::bail!("recovery open does not match the held grant");
     }
     let mut roster: Vec<[u8; 32]> = Vec::with_capacity(1 + grant.cotrustees.len());
     roster.push(*self_user);
@@ -6708,12 +7693,12 @@ fn track_from_grant(
         }
     }
     CeremonyState::open(open, roster, share.threshold, grant.recovery_delay, now)
+        .map_err(|error| anyhow::anyhow!("invalid recovery-open transition: {error:?}"))
 }
 
-/// Resolve dialable addresses of the recovery participants for `subject` we can reach
-/// (§8.5 step 2 fan-out audience): the co-trustees named in our held grant (node
-/// hints), the subject's own devices (from the subject's friend card), and our
-/// friends' devices - deduped, excluding this node, best-effort address resolution.
+/// Resolve reachable recovery participants for `subject` (§8.5 step 2 fan-out audience): the
+/// co-trustees in our held grant, the subject's own devices, and our friends' devices -
+/// deduped, excluding this node.
 fn resolve_ceremony_peers(
     s: &Shared,
     self_node: [u8; 32],
@@ -6763,16 +7748,11 @@ pub fn max_epoch_refs(refs: &[AnnounceRef]) -> Vec<AnnounceRef> {
     out
 }
 
-/// A key-less recovery claimant (§8.4/§8.5 step 6): a fresh device with NO user key
-/// and NO `K_root` (that is what it is recovering), holding only a fresh ceremony HPKE
-/// keypair and a fresh node key. It hands its `ceremony_enc` pubkey to a sponsoring
-/// trustee (which builds the `RecoveryOpen`), then collects `M` HPKE-sealed
-/// `CeremonyShare`s from the approving trustees, recovers `K_root` locally, and
-/// re-derives its identity so the recovered device is usable (existing friendships and
-/// cards stay valid).
-///
-/// It cannot be a full [`Daemon`] (that needs `K_root` to build its card), so it binds
-/// a bare endpoint from its node key just long enough to collect shares.
+/// A key-less recovery claimant (§8.4/§8.5 step 6): a fresh device with no user key and no
+/// `K_root` (what it is recovering), holding only a fresh ceremony HPKE keypair and node key.
+/// It hands its `ceremony_enc` pubkey to a sponsoring trustee, collects `M` HPKE-sealed
+/// `CeremonyShare`s, recovers `K_root`, and re-derives its identity. Not a full [`Daemon`]
+/// (that needs `K_root`); it binds a bare endpoint just long enough to collect shares.
 pub struct ClaimantDevice {
     node_key: SigningKey,
     ceremony_sk: HpkePrivateKey,
@@ -6796,14 +7776,37 @@ pub struct Recovered {
 }
 
 impl ClaimantDevice {
+    /// Resume the claimant's OS-credential-backed keys across process restarts.
+    pub fn load_or_create(dir: &Path) -> Result<Self> {
+        Self::persisted(dir, false)
+    }
+
+    /// Explicit cancellation rotates the persisted claimant keys.
+    pub fn reset_persisted(dir: &Path) -> Result<Self> {
+        Self::persisted(dir, true)
+    }
+
+    fn persisted(dir: &Path, reset: bool) -> Result<Self> {
+        let (node_seed, ikm) = State::claimant_seeds(dir, reset)?;
+        let (sk, pk) = seal::derive_keypair(&*ikm);
+        Ok(Self {
+            node_key: SigningKey::from_bytes(&node_seed),
+            ceremony_sk: sk,
+            ceremony_pub: pk
+                .to_bytes()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("ceremony public key has invalid length"))?,
+        })
+    }
+
     /// Generate a fresh claimant device: a new node key plus a fresh ceremony HPKE
     /// keypair (the key the trustees seal their shares to).
     pub fn new() -> Result<Self> {
-        let mut node_seed = [0u8; 32];
-        getrandom::getrandom(&mut node_seed).map_err(|e| anyhow::anyhow!("node seed: {e}"))?;
-        let mut ikm = [0u8; 32];
-        getrandom::getrandom(&mut ikm).map_err(|e| anyhow::anyhow!("ceremony ikm: {e}"))?;
-        let (sk, pk) = seal::derive_keypair(&ikm);
+        let mut node_seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *node_seed).map_err(|e| anyhow::anyhow!("node seed: {e}"))?;
+        let mut ikm = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut *ikm).map_err(|e| anyhow::anyhow!("ceremony ikm: {e}"))?;
+        let (sk, pk) = seal::derive_keypair(&*ikm);
         let ceremony_pub: [u8; 32] = pk
             .to_bytes()
             .try_into()
@@ -6828,34 +7831,43 @@ impl ClaimantDevice {
         self.node_key.verifying_key().to_bytes()
     }
 
-    /// The node signing seed for this device (§8.4): after [`recover`](Self::recover)
-    /// yields `K_root`, `State::from_seeds(claimant.node_seed(), *recovered.k_root)`
-    /// stands the recovered device up as a full [`Daemon`] on the exact node identity
-    /// this claimant delegated in [`Recovered::node_deleg`], so it can then fetch and
-    /// reconstruct its vaults from a surviving replica.
+    /// The node signing seed for this device (§8.4): after recover yields `K_root`,
+    /// `State::from_seeds(claimant.node_seed(), *recovered.k_root)` stands the recovered device
+    /// up as a full [`Daemon`] on the node identity delegated in [`Recovered::node_deleg`].
     #[must_use]
     pub fn node_seed(&self) -> [u8; 32] {
         self.node_key.to_bytes()
     }
 
-    /// Collect the raw sealed `CeremonyShare`s the approving trustees release (§8.5
-    /// step 5). Dials each trustee with the signed `open`; a trustee whose gate is not
-    /// open (delay not elapsed, sub-`M` approvals, aborted, or it did not approve)
-    /// replies with nothing. The returned shares are still HPKE-sealed to the ceremony
-    /// key - no trustee saw another's, and nothing crosses the wire in the clear.
-    /// Bounded by the connect timeout per trustee.
+    /// Collect the raw sealed `CeremonyShare`s the approving trustees release (§8.5 step 5).
+    /// Dials each trustee with the signed `open`; a trustee whose gate is not open replies with
+    /// nothing. The returned shares are still HPKE-sealed to the ceremony key. Bounded dial.
     pub async fn collect_raw(
         &self,
         open: &RecoveryOpen,
         trustees: &[EndpointAddr],
     ) -> Result<Vec<CeremonyShare>> {
-        let ep = CarapaceEndpoint::bind(&self.node_key)
-            .await
-            .context("bind claimant endpoint")?;
+        ensure!(trustees.len() <= 64, "too many claimant trustee endpoints");
+        let relays: Vec<_> = trustees
+            .iter()
+            .flat_map(|peer| peer.relay_urls().cloned())
+            .collect();
+        let ep = CarapaceEndpoint::bind_on(
+            &self.node_key,
+            std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+            &relays,
+        )
+        .await
+        .context("bind claimant endpoint")?;
         let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         for addr in trustees {
-            match self.request_share(&ep, addr, open).await {
-                Ok(Some(cs)) => out.push(cs),
+            let request_deadline =
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(15));
+            match tokio::time::timeout_at(request_deadline, self.request_share(&ep, addr, open))
+                .await
+            {
+                Ok(Ok(Some(cs))) => out.push(cs),
                 _ => continue,
             }
         }
@@ -6863,19 +7875,17 @@ impl ClaimantDevice {
         Ok(out)
     }
 
-    /// Open `M` collected shares with the ceremony key and recover `K_root` (§8.5 step
-    /// 6, §8.4). Each share is authenticated against `roster` (a sender not in the
-    /// trustee roster, or a tampered signature, is refused) before decryption; Chela's
-    /// integrity tag + CRC then guarantee recovery never silently yields a wrong secret.
-    /// The recovered user key re-signs a delegation for this new device.
-    ///
-    /// `roster` is the trustee user pubkeys (the sponsor provides it out of band, from
-    /// its grant). Errors if fewer than `M` valid shares open (recovery needs a quorum).
+    /// Open `M` collected shares with the ceremony key and recover `K_root` (§8.5 step 6/§8.4).
+    /// Each share is authenticated against `roster` before decryption; Chela's integrity tag +
+    /// CRC guarantee recovery never silently yields a wrong secret. The recovered user key
+    /// re-signs a delegation for this new device. Errors if fewer than `M` valid shares open.
     pub fn recover_from(&self, shares: &[CeremonyShare], roster: &[[u8; 32]]) -> Result<Recovered> {
         let mut parsed: Vec<Share> = Vec::new();
         for cs in shares {
-            let json = open_ceremony_share(&self.ceremony_sk, cs, roster)
-                .map_err(|e| anyhow::anyhow!("open ceremony share: {e:?}"))?;
+            let json = Zeroizing::new(
+                open_ceremony_share(&self.ceremony_sk, cs, roster)
+                    .map_err(|e| anyhow::anyhow!("open ceremony share: {e:?}"))?,
+            );
             parsed.push(
                 share_from_json(&json).map_err(|e| anyhow::anyhow!("parse share json: {e:?}"))?,
             );
@@ -6887,8 +7897,8 @@ impl ClaimantDevice {
         let k_root = recover_key_from_shares(&parsed).map_err(|e| {
             anyhow::anyhow!("recover K_root failed (need >= M valid shares): {e:?}")
         })?;
-        // Re-derive the identity and re-delegate this new device (§8.4). Identical user
-        // key to the original owner's, so existing friendships and cards stay valid.
+        // Re-derive the identity and re-delegate this new device (§8.4): same user key as the
+        // original owner, so existing friendships and cards stay valid.
         let user_key = carapace_crypto::identity::user_key_from_seed(&kdf::k_userid(&*k_root));
         let user_id = user_key.verifying_key().to_bytes();
         let new_node = self.new_node();
@@ -6909,8 +7919,73 @@ impl ClaimantDevice {
         roster: &[[u8; 32]],
         trustees: &[EndpointAddr],
     ) -> Result<Recovered> {
+        carapace_recovery::verify_recovery_open(open, roster)
+            .map_err(|error| anyhow::anyhow!("invalid recovery open: {error:?}"))?;
+        ensure!(
+            open.new_node == self.new_node() && open.ceremony_enc == self.ceremony_enc(),
+            "recovery open belongs to another claimant"
+        );
         let shares = self.collect_raw(open, trustees).await?;
-        self.recover_from(&shares, roster)
+        for share in &shares {
+            ensure!(
+                share.ceremony_id == open.ceremony_id,
+                "share belongs to another ceremony"
+            );
+            let json = Zeroizing::new(
+                open_ceremony_share(&self.ceremony_sk, share, roster)
+                    .map_err(|error| anyhow::anyhow!("invalid ceremony share: {error:?}"))?,
+            );
+            let parsed = share_from_json(&json)
+                .map_err(|error| anyhow::anyhow!("invalid share: {error:?}"))?;
+            ensure!(
+                u64::from(parsed.recovery_set_id) == open.rsid,
+                "share belongs to another recovery set"
+            );
+        }
+        let recovered = self.recover_from(&shares, roster)?;
+        ensure!(
+            recovered.user_id == open.subject,
+            "recovered root does not match the intended subject"
+        );
+        Ok(recovered)
+    }
+
+    /// Collect and recover from trustee addresses supplied by a local control client.
+    ///
+    /// This wrapper keeps the iroh address type out of the claimant control API. The
+    /// caller supplies each trustee node id and its direct socket-address hints. Empty
+    /// hints are valid when discovery or a relay can resolve the node id.
+    pub async fn recover_at(
+        &self,
+        open: &RecoveryOpen,
+        roster: &[[u8; 32]],
+        trustees: &[([u8; 32], Vec<String>)],
+    ) -> Result<Recovered> {
+        let addresses = trustees
+            .iter()
+            .map(|(node, addrs)| endpoint_addr(*node, addrs))
+            .collect::<Result<Vec<_>>>()?;
+        self.recover(open, roster, &addresses).await
+    }
+
+    /// Direct and relay hints from the public claimant package.
+    pub async fn recover_at_with_relays(
+        &self,
+        open: &RecoveryOpen,
+        roster: &[[u8; 32]],
+        trustees: &[([u8; 32], Vec<String>, Option<String>)],
+    ) -> Result<Recovered> {
+        let addresses = trustees
+            .iter()
+            .map(|(node, addrs, relay)| {
+                let mut address = endpoint_addr(*node, addrs)?;
+                if let Some(relay) = relay {
+                    address = address.with_relay_url(relay.parse()?);
+                }
+                Ok(address)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.recover(open, roster, &addresses).await
     }
 
     /// Dial one trustee, send the `open` request, and read its optional sealed share.
@@ -7006,28 +8081,163 @@ async fn write_blob(send: &mut SendStream, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn read_blob(recv: &mut RecvStream) -> Result<Vec<u8>> {
-    let len = read_u64(recv).await? as usize;
-    ensure!(
-        len <= MAX_REPLICA_BLOB,
-        "replica blob length {len} exceeds cap"
-    );
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("read blob: {e}"))?;
-    Ok(buf)
+fn cleanup_replica_ingress(root: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "replica ingress staging root is not a real directory"
+            );
+            std::fs::remove_dir_all(root).context("remove stale replica ingress staging")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect replica ingress staging"),
+    }
+    Ok(())
 }
 
-/// Build a dialable [`EndpointAddr`] from a node id and zero or more socket-address
-/// strings (e.g. `"127.0.0.1:52345"`). An empty `addrs` yields an id-only address
-/// (usable only with a discovery service). A malformed node id or socket string is a
-/// hard error rather than a silently-dropped address.
-/// Resolve a peer node id to a dialable [`EndpointAddr`] for the maintenance loop:
-/// the last-known address if this node recorded one (from a prior befriend/placement
-/// dial), else a node-id-only addr that iroh resolves through injected hints and relay
-/// fallback (§6 "addresses are hints, not identities"). Returns `None` only if the
-/// node id is not a valid endpoint key.
+struct ReplicaIngressStage {
+    directory: PathBuf,
+    expected_count: u64,
+    advertised_total: u64,
+    received_total: u64,
+    announce: VaultAnnounce,
+    files: Vec<(PathBuf, [u8; 32])>,
+}
+
+impl ReplicaIngressStage {
+    fn create(
+        root: &Path,
+        count: u64,
+        advertised_total: u64,
+        announce: &VaultAnnounce,
+    ) -> Result<Self> {
+        let mut random = [0u8; 16];
+        getrandom::getrandom(&mut random)
+            .map_err(|error| anyhow::anyhow!("create ingress id: {error}"))?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let directory = root.join(format!("push-{name}"));
+        state::ensure_private_directory(&directory)?;
+        Ok(Self {
+            directory,
+            expected_count: count,
+            advertised_total,
+            received_total: 0,
+            announce: announce.clone(),
+            files: Vec::new(),
+        })
+    }
+
+    async fn receive(&mut self, recv: &mut RecvStream, index: u64) -> Result<()> {
+        ensure!(index < self.expected_count, "replica blob count exceeded");
+        let len = read_u64(recv).await?;
+        self.validate_length(len)?;
+        let path = self.directory.join(format!("blob-{index:05}"));
+        self.receive_content(recv, index, len, path).await
+    }
+
+    fn validate_length(&mut self, len: u64) -> Result<()> {
+        ensure!(
+            len <= MAX_REPLICA_BLOB as u64,
+            "replica blob length {len} exceeds cap"
+        );
+        self.received_total = self
+            .received_total
+            .checked_add(len)
+            .context("replica byte total overflow")?;
+        ensure!(
+            self.received_total <= self.advertised_total,
+            "replica push exceeded its advertised {} bytes",
+            self.advertised_total
+        );
+        Ok(())
+    }
+
+    async fn receive_content(
+        &mut self,
+        recv: &mut RecvStream,
+        index: u64,
+        len: u64,
+        path: PathBuf,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = len;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining != 0 {
+            let take = usize::try_from(remaining.min(buffer.len() as u64)).expect("bounded read");
+            recv.read_exact(&mut buffer[..take])
+                .await
+                .map_err(|error| anyhow::anyhow!("read blob: {error}"))?;
+            use std::io::Write;
+            file.write_all(&buffer[..take])?;
+            hasher.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        Self::validate_content_length(len, file.metadata()?.len())?;
+        file.sync_all()?;
+        let hash = *hasher.finalize().as_bytes();
+        self.validate_file(index, &path, hash)?;
+        self.files.push((path, hash));
+        Ok(())
+    }
+
+    fn validate_content_length(declared: u64, actual: u64) -> Result<()> {
+        ensure!(declared == actual, "replica blob content is truncated");
+        Ok(())
+    }
+
+    fn validate_file(&self, index: u64, path: &Path, hash: [u8; 32]) -> Result<()> {
+        if index == 0 {
+            ensure!(
+                hash == self.announce.digest,
+                "replica envelope hash does not match announce"
+            );
+            let bytes = std::fs::read(path)?;
+            let envelope = ManifestEnvelope::from_bytes(&bytes)
+                .map_err(|error| anyhow::anyhow!("replica envelope decode: {error}"))?;
+            envelope
+                .verify()
+                .map_err(|error| anyhow::anyhow!("replica envelope bad sig: {error}"))?;
+            ensure!(
+                envelope.vid == self.announce.vid
+                    && envelope.epoch == self.announce.epoch
+                    && envelope.by == self.announce.by,
+                "replica envelope does not bind to announce"
+            );
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        ensure!(
+            self.files.len() as u64 == self.expected_count,
+            "replica blob count is truncated"
+        );
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn files(&self) -> &[(PathBuf, [u8; 32])] {
+        &self.files
+    }
+}
+
+impl Drop for ReplicaIngressStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Resolve a peer node id to a dialable [`EndpointAddr`]: the last-known address if recorded,
+/// else a node-id-only addr iroh resolves through injected hints and relay fallback (§6
+/// "addresses are hints"). `None` only if the node id is not a valid endpoint key.
 fn resolve_peer(
     peer_addrs: &HashMap<[u8; 32], EndpointAddr>,
     node: &[u8; 32],
@@ -7038,6 +8248,8 @@ fn resolve_peer(
     EndpointId::from_bytes(node).ok().map(EndpointAddr::new)
 }
 
+/// Build a dialable [`EndpointAddr`] from a node id and socket-address strings. Empty `addrs`
+/// yields an id-only address; a malformed node id or socket string is a hard error.
 fn endpoint_addr(node: [u8; 32], addrs: &[String]) -> Result<EndpointAddr> {
     let id = EndpointId::from_bytes(&node)
         .map_err(|e| anyhow::anyhow!("bad node id {}: {e}", hex32(&node)))?;
@@ -7051,39 +8263,26 @@ fn endpoint_addr(node: [u8; 32], addrs: &[String]) -> Result<EndpointAddr> {
     Ok(ea)
 }
 
-/// Feed a friend's ContactCard addressing hints into the live endpoint (§6): for
-/// each node entry, inject an `EndpointAddr` (id + direct addrs + relay url) so it
-/// can be dialed by node id, and add its relay to our usable relay set. A
-/// malformed entry is skipped rather than failing the whole learn.
+/// Feed a friend's ContactCard addressing hints into the live endpoint (§6): inject each node
+/// entry's `EndpointAddr` so it can be dialed by node id, and add its relay to our usable set.
 async fn learn_card_hints(hints: &PeerHints, card: &ContactCard) {
     let now = unix_now();
     for n in &card.nodes {
-        // W1: only inject a hint for a node the card's user actually delegates,
-        // with a delegation that has not expired. `card.verify()` at the call
-        // sites covers only the card's self-signature, not the per-node
-        // user->node delegations, so without this gate a card could inject an
-        // address hint for a node_id it never delegated.
-        //
-        // ponytail (known ceiling): this enforces the card's own trust model but
-        // does not fully stop cross-friend hint poisoning - delegations are
-        // user-signed only, so a malicious friend can self-delegate an arbitrary
-        // node_id (including a third friend's) with attacker-chosen addrs. That
-        // residual is bounded (no impersonation; QUIC is node-id-authenticated;
-        // hints merge, not replace) and closing it needs source-keyed hints, out
-        // of scope here.
+        // W1: only inject a hint for a node the card's user actually delegates (unexpired).
+        // `card.verify()` covers only the self-signature, not the per-node delegations, so
+        // without this gate a card could inject an address hint for a node it never delegated.
+        // Residual cross-friend hint poisoning is bounded (QUIC is node-id-authenticated,
+        // hints merge not replace) and needs source-keyed hints to fully close.
         if card_delegates_node(card, &n.node_id, now) {
-            // No relay auth token: an established friend's relay admits us via the
-            // friend branch of its gate, not via an invite ticket.
+            // No relay auth token: a friend's relay admits us via the friend branch of its gate.
             inject_hint(hints, n.node_id, &n.addrs, n.relay_url.as_deref(), None).await;
         }
     }
 }
 
-/// Like [`learn_card_hints`] but from an [`InviteTicket`] (issuer node id + direct
-/// addrs + advertised relay URLs). "Your usable relay set = relays advertised by
-/// your friends" (§6). The ticket's token is attached to the issuer's relays as
-/// the relay auth token so the issuer's friend-gated relay admits us for the
-/// (not-yet-friend) bootstrap handshake.
+/// Like [`learn_card_hints`] but from an [`InviteTicket`]. The ticket's token is attached to
+/// the issuer's relays as the auth token so its friend-gated relay admits us for the
+/// not-yet-friend bootstrap handshake (§6).
 async fn learn_ticket_hints(hints: &PeerHints, ticket: &InviteTicket) {
     let auth = ticket_auth_token(&ticket.token);
     inject_hint(
@@ -7102,10 +8301,9 @@ async fn learn_ticket_hints(hints: &PeerHints, ticket: &InviteTicket) {
     }
 }
 
-/// Inject one peer's `{node_id, direct addrs, relay}` hint into the endpoint.
-/// Unparseable node ids, socket strings, or relay URLs are dropped (best effort:
-/// addresses are hints, §6). When `auth_token` is set, the relay is added with
-/// that client auth token (the invite bootstrap, §6); otherwise it is added plain.
+/// Inject one peer's `{node_id, direct addrs, relay}` hint into the endpoint (unparseable
+/// parts are dropped, best-effort). `auth_token` adds the relay with that client token (the
+/// invite bootstrap); else it is added plain.
 async fn inject_hint(
     hints: &PeerHints,
     node: [u8; 32],
@@ -7170,9 +8368,8 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build a `GrantBody` carrying every non-deleted chunk's secret. Errors (rather
-/// than panicking — S3) if a manifest chunk id is absent from `keys`; both come
-/// from the same ingest, so this is an owner-local invariant, but fail loudly.
+/// Build a `GrantBody` carrying every non-deleted chunk's secret. Errors (not panics, S3) if a
+/// manifest chunk id is absent from `keys` - an owner-local invariant, but fail loudly.
 fn grant_body(manifest: &Manifest, keys: &ChunkKeys) -> Result<GrantBody> {
     let mut files = Vec::new();
     for f in &manifest.files {
@@ -7271,6 +8468,96 @@ fn hex32(b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn authenticated_malformed_blob_transport_is_atomic_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let announce = VaultAnnounce {
+            vid: [1; 32],
+            epoch: 1,
+            replicas: vec![],
+            digest: [2; 32],
+            by: [3; 32],
+            sig: [0; 64],
+        };
+        let mut stage = ReplicaIngressStage::create(root.path(), 2, 8, &announce).unwrap();
+        assert!(stage
+            .validate_length((MAX_REPLICA_BLOB as u64) + 1)
+            .is_err());
+        stage.validate_length(5).unwrap();
+        assert!(
+            stage.validate_length(4).is_err(),
+            "advertised total is enforced"
+        );
+        assert!(ReplicaIngressStage::validate_content_length(5, 4).is_err());
+        let wrong = stage.directory.join("blob-00000");
+        std::fs::write(&wrong, b"wrong envelope").unwrap();
+        assert!(stage
+            .validate_file(0, &wrong, *blake3::hash(b"wrong envelope").as_bytes())
+            .is_err());
+        assert!(stage.files.is_empty(), "rejected files are never activated");
+
+        // Model only the served-store I/O result. Validation above is the exact production
+        // validator. Authorization is published later, after every add and the sync barrier.
+        let authorization_before = HashSet::<[u8; 32]>::new();
+        let mut untagged_physical = HashSet::new();
+        let activation = (|| -> Result<()> {
+            for (index, hash) in [[7u8; 32], [8u8; 32]].iter().enumerate() {
+                untagged_physical.insert(*hash);
+                if index == 1 {
+                    anyhow::bail!("injected served-store failure");
+                }
+            }
+            Ok(())
+        })();
+        assert!(activation.is_err());
+        assert_eq!(authorization_before, HashSet::new());
+        assert!(
+            untagged_physical.len() <= 2,
+            "leftovers are bounded by the batch"
+        );
+    }
+
+    #[test]
+    fn replica_ingress_startup_removes_only_exact_stale_staging_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join(".replica-ingress");
+        state::ensure_private_directory(&root).unwrap();
+        std::fs::write(root.join("stale"), b"partial").unwrap();
+        let neighbor = parent.path().join("keep");
+        std::fs::write(&neighbor, b"keep").unwrap();
+        cleanup_replica_ingress(&root).unwrap();
+        assert!(!root.exists());
+        assert_eq!(std::fs::read(neighbor).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_copy_is_private_and_refuses_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("copy");
+        std::fs::write(&source, b"database bytes").unwrap();
+        copy_private_database(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"database bytes");
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let linked_source = directory.path().join("linked-source");
+        symlink(&source, &linked_source).unwrap();
+        assert!(copy_private_database(&linked_source, &directory.path().join("copy-2")).is_err());
+        let linked_destination = directory.path().join("linked-copy");
+        symlink(&source, &linked_destination).unwrap();
+        assert!(copy_private_database(&source, &linked_destination).is_err());
+    }
+
     const NOW: u64 = 1_800_000_000; // well before DELEG_NOT_AFTER
 
     fn kp(seed: u8) -> SigningKey {
@@ -7290,8 +8577,223 @@ mod tests {
         a
     }
 
-    // C1: an announce is honored only if its signer node is delegated by the
-    // vault-owning user's newest card; a rogue/undelegated node is refused.
+    #[test]
+    fn ceremony_rates_are_bounded_atomic_and_idempotent_cleanup_is_fail_closed() {
+        let subject = [0x61; 32];
+        let sponsor = [0x62; 32];
+        let mut shared = Shared::default();
+        for now in 1..=MAX_RECOVERY_OPENS_PER_WINDOW as u64 {
+            record_ceremony_rates(&mut shared, subject, sponsor, now).unwrap();
+        }
+        let subjects_before = shared.ceremony_subject_rate.clone();
+        let sponsors_before = shared.ceremony_sponsor_rate.clone();
+        assert!(record_ceremony_rates(&mut shared, subject, sponsor, 6).is_err());
+        assert_eq!(shared.ceremony_subject_rate, subjects_before);
+        assert_eq!(shared.ceremony_sponsor_rate, sponsors_before);
+
+        let id = [0x71; 16];
+        assert!(finish_ceremony(
+            &mut shared,
+            id,
+            subject,
+            sponsor,
+            10,
+            CeremonyTerminal::Aborted,
+        ));
+        assert!(finish_ceremony(
+            &mut shared,
+            id,
+            subject,
+            sponsor,
+            20,
+            CeremonyTerminal::Completed,
+        ));
+        let terminal = shared.ceremony_tombstones[&id];
+        assert_eq!(terminal.terminal, CeremonyTerminal::Aborted);
+        assert_eq!(terminal.terminal_at, 10);
+
+        for (id, terminal) in [
+            ([0x72; 16], CeremonyTerminal::Rejected),
+            ([0x73; 16], CeremonyTerminal::Failed),
+        ] {
+            assert!(finish_ceremony(
+                &mut shared,
+                id,
+                subject,
+                sponsor,
+                21,
+                terminal,
+            ));
+            assert_eq!(shared.ceremony_tombstones[&id].terminal, terminal);
+        }
+
+        shared.ceremony_tombstones.clear();
+        for value in 0..MAX_CEREMONY_TOMBSTONES {
+            let mut key = [0u8; 16];
+            key[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            shared.ceremony_tombstones.insert(
+                key,
+                CeremonyTombstone {
+                    subject,
+                    sponsor,
+                    terminal_at: value as u64,
+                    terminal: CeremonyTerminal::Expired,
+                },
+            );
+        }
+        assert!(!finish_ceremony(
+            &mut shared,
+            [0xFF; 16],
+            subject,
+            sponsor,
+            30,
+            CeremonyTerminal::Expired,
+        ));
+        assert_eq!(shared.ceremony_tombstones.len(), MAX_CEREMONY_TOMBSTONES);
+    }
+
+    #[test]
+    fn ceremony_active_subject_cap_is_independent_for_each_subject() {
+        let signer = kp(0x59);
+        let sponsor = signer.verifying_key().to_bytes();
+        let subject = [0x5A; 32];
+        let other_subject = [0x5B; 32];
+        let mut shared = Shared::default();
+
+        for value in 0..MAX_ACTIVE_CEREMONIES_PER_SUBJECT {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            let open = open_recovery(
+                &signer,
+                id,
+                subject,
+                1,
+                "claimant".into(),
+                [0x5C; 32],
+                [0x5D; 32],
+                "recovery".into(),
+                100,
+            );
+            let state = CeremonyState::open(&open, vec![sponsor], 1, 100, 100).unwrap();
+            shared.ceremonies.insert(
+                id,
+                TrackedCeremony {
+                    state,
+                    approved: false,
+                    takeover: false,
+                },
+            );
+        }
+
+        assert!(!can_start_ceremony(&shared, &subject));
+        assert!(can_start_ceremony(&shared, &other_subject));
+    }
+
+    #[test]
+    fn maintenance_history_is_bounded_and_clears_the_failure_streak() {
+        let mut history = OperationalHistory::default();
+        record_maintenance_history(&mut history, 10, usize::MAX, false);
+        assert_eq!(history.last_maintenance_at, 10);
+        assert_eq!(history.last_failure_at, 10);
+        assert_eq!(history.last_failure_count, MAX_OPERATION_FAILURE_COUNT);
+        assert_eq!(history.consecutive_failed_rounds, 1);
+        assert!(!history.last_gc_succeeded);
+
+        record_maintenance_history(&mut history, 20, 1, false);
+        assert_eq!(history.consecutive_failed_rounds, 2);
+        record_maintenance_history(&mut history, 30, 0, true);
+        assert_eq!(history.last_maintenance_at, 30);
+        assert_eq!(history.last_failure_at, 20);
+        assert_eq!(history.last_failure_count, 0);
+        assert_eq!(history.consecutive_failed_rounds, 0);
+        assert!(history.last_gc_succeeded);
+    }
+
+    #[test]
+    fn ceremony_cleanup_classifies_released_state_and_blocks_reopen() {
+        let signer = kp(0x63);
+        let sponsor = signer.verifying_key().to_bytes();
+        let subject = [0x64; 32];
+        let id = [0x65; 16];
+        let open = open_recovery(
+            &signer,
+            id,
+            subject,
+            1,
+            "claimant".into(),
+            [0x66; 32],
+            [0x67; 32],
+            "lost device".into(),
+            100,
+        );
+        let state = CeremonyState::open(&open, vec![sponsor], 1, 10, 100).unwrap();
+        let mut shared = Shared::default();
+        shared.ceremonies.insert(
+            id,
+            TrackedCeremony {
+                state,
+                approved: true,
+                takeover: false,
+            },
+        );
+        shared.ceremony_alarms.insert(
+            id,
+            AlarmRecord {
+                subject,
+                sponsor,
+                claimant_display: "claimant".into(),
+                reason: "lost device".into(),
+                is_self_subject: false,
+                aborted: false,
+                takeover: false,
+            },
+        );
+        shared.ceremony_released.insert(id, open.new_node);
+
+        assert!(cleanup_ceremonies(
+            &mut shared,
+            100 + 10 + CEREMONY_COMPLETION_GRACE_SECS
+        ));
+        assert!(!shared.ceremonies.contains_key(&id));
+        assert!(!shared.ceremony_alarms.contains_key(&id));
+        assert!(!shared.ceremony_released.contains_key(&id));
+        assert_eq!(
+            shared.ceremony_tombstones[&id].terminal,
+            CeremonyTerminal::Completed
+        );
+        assert!(shared.ceremony_tombstones.contains_key(&open.ceremony_id));
+    }
+
+    #[test]
+    fn gc_retains_recoverable_and_replica_blobs_and_prunes_superseded_access() {
+        let vid = [0x10; 32];
+        let digest = [0x20; 32];
+        let current_chunk = [0x21; 32];
+        let replica_chunk = [0x30; 32];
+        let superseded_chunk = [0x40; 32];
+        let mut shared = Shared::default();
+        shared
+            .needs_refetch
+            .insert(vid, (digest, vec![current_chunk]));
+        shared.replica_chunks.insert(replica_chunk, [0x11; 32]);
+        shared.owned_chunks.insert(digest, vid);
+        shared.owned_chunks.insert(current_chunk, vid);
+        shared.owned_chunks.insert(superseded_chunk, vid);
+
+        let roots = blob_retention_set(&shared).expect("retention set");
+        assert_eq!(
+            roots.all,
+            HashSet::from([digest, current_chunk, replica_chunk])
+        );
+        assert_eq!(roots.owned, HashSet::from([digest, current_chunk]));
+
+        let removed = prune_owned_authorizations(&mut shared, &roots.owned);
+        assert_eq!(removed, 1);
+        assert!(!shared.owned_chunks.contains_key(&superseded_chunk));
+        assert!(shared.owned_chunks.contains_key(&current_chunk));
+    }
+
+    // C1: an announce is honored only if its signer node is delegated by the owner's newest card.
     #[test]
     fn c1_only_delegated_signer_is_accepted() {
         let user = kp(1);
@@ -7316,10 +8818,8 @@ mod tests {
             "undelegated signer must be refused (C1)"
         );
 
-        // 3+ device propagation: a second sibling node our SAME user delegates -
-        // proven by the card that sibling presents in this batch - is accepted even
-        // though the stored card names only `node`. This is what lets a third
-        // device's edits reach us instead of being silently dropped.
+        // 3+ device propagation: a sibling our SAME user delegates (proven by the card in
+        // this batch) is accepted even though the stored card names only `node`.
         let node2 = kp(0x77);
         let card2 = build_card(&user, &node2, &[9; 32], None);
         let mut docs = DocStore::new();
@@ -7337,8 +8837,7 @@ mod tests {
             "a sibling our own user delegates (card in batch) must be accepted"
         );
 
-        // A card signed by a DIFFERENT user cannot smuggle a delegation into our set
-        // (its user != self_user), so a rogue presenting one stays refused.
+        // A card signed by a DIFFERENT user cannot smuggle a delegation into our set.
         let rogue_user = kp(0x99);
         let rogue_card = build_card(&rogue_user, &rogue, &[9; 32], None);
         let mut docs = DocStore::new();
@@ -7356,8 +8855,7 @@ mod tests {
         );
     }
 
-    // C1: a valid announce survives even when a poison undelegated announce is in
-    // the same batch (this is also the selection half of W3's isolation).
+    // C1: a valid announce survives a poison undelegated announce in the same batch.
     #[test]
     fn c1_poison_announce_does_not_starve_valid_vault() {
         let user = kp(1);
@@ -7398,6 +8896,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_claimant_admission_requires_exact_completed_ceremony() {
+        let sponsor_key = kp(0x21);
+        let subject_key = kp(0x22);
+        let recovered_node_key = kp(0x23);
+        let other_node_key = kp(0x24);
+        let wrong_subject_key = kp(0x25);
+        let id = [0x26; 16];
+        let subject = subject_key.verifying_key().to_bytes();
+        let recovered_node = recovered_node_key.verifying_key().to_bytes();
+        let open = open_recovery(
+            &sponsor_key,
+            id,
+            subject,
+            1,
+            "claimant".into(),
+            [0x27; 32],
+            recovered_node,
+            "lost device".into(),
+            100,
+        );
+        let state = CeremonyState::open(
+            &open,
+            vec![sponsor_key.verifying_key().to_bytes()],
+            1,
+            10,
+            100,
+        )
+        .unwrap();
+        let mut shared = Shared::default();
+        shared.ceremonies.insert(
+            id,
+            TrackedCeremony {
+                state,
+                approved: true,
+                takeover: false,
+            },
+        );
+        let card = card_with(&subject_key, &recovered_node_key, 1);
+
+        assert!(
+            !recovery_claimant_device(&shared, &card, &recovered_node, 110),
+            "a ceremony that did not release a share is not complete"
+        );
+
+        shared.ceremony_released.insert(id, recovered_node);
+        assert!(recovery_claimant_device(
+            &shared,
+            &card,
+            &recovered_node,
+            110
+        ));
+        assert!(
+            !recovery_claimant_device(
+                &shared,
+                &card,
+                &other_node_key.verifying_key().to_bytes(),
+                110,
+            ),
+            "the authenticated node must match RecoveryOpen.new_node"
+        );
+
+        let wrong_subject_card = card_with(&wrong_subject_key, &recovered_node_key, 1);
+        assert!(
+            !recovery_claimant_device(&shared, &wrong_subject_card, &recovered_node, 110),
+            "the card user must match the ceremony subject"
+        );
+        assert!(
+            !recovery_claimant_device(
+                &shared,
+                &card,
+                &recovered_node,
+                100 + 10 + CEREMONY_COMPLETION_GRACE_SECS,
+            ),
+            "an expired ceremony cannot admit a recovered node"
+        );
+    }
+
     /// A self-signed card for `user` delegating exactly `node`, at `version`.
     fn card_with(user: &SigningKey, node: &SigningKey, version: u64) -> ContactCard {
         let node_pub = node.verifying_key();
@@ -7427,10 +9003,8 @@ mod tests {
         card
     }
 
-    // W2: friend-device revocation takes effect. A friend delegates node N in card
-    // v1, then publishes v2 dropping N. Once v2 is the stored newest card, a dialer
-    // presenting the old v1 card for node N is refused - authorization uses the
-    // stored card, not the presented one.
+    // W2: friend-device revocation takes effect. Authorization uses the stored newest card,
+    // so a dialer presenting an old card for a dropped node N is refused.
     #[test]
     fn w2_friend_revocation_refused_after_newer_card() {
         let friend_user = kp(0x50);
@@ -7456,13 +9030,9 @@ mod tests {
         );
     }
 
-    // W7 (6-newest-card-delegations): own-device revocation takes effect once a newer
-    // self-card is known. This user's device X is delegated by self-card v1; the user
-    // then publishes v2 (a newer self-card) that drops X. Once v2 is the newest known
-    // self-card, X presenting its old v1 self-card is refused — §6 "MUST NOT honor
-    // node delegations absent from the signer's newest card." A device still present
-    // in v2 authorizes, and before any newer card exists the presented card is
-    // trusted (preserving same-version multi-device sync).
+    // W7: own-device revocation takes effect once a newer self-card is known. X (dropped in
+    // v2) presenting its old v1 self-card is refused; a device still in v2 authorizes, and
+    // before any newer card exists the presented card is trusted.
     #[test]
     fn w7_own_device_revocation_refused_after_newer_self_card() {
         let self_user = kp(0x01);
@@ -7476,15 +9046,13 @@ mod tests {
         let v2 = card_with(&self_user, &device_y, 2); // newer self-card: drops X, adds Y
 
         let s = Shared::default();
-        // No newer self-card known yet: X presenting its own valid self-card is trusted
-        // (the same-version multi-device path this build relies on).
+        // No newer self-card known yet: X presenting its own valid self-card is trusted.
         assert!(
             classify_dialer(&s, &self_uid, &v1, &x_id, NOW, None).is_some(),
             "own device authorizes on its own self-card before any newer card exists"
         );
 
-        // Once v2 is the newest known self-card, X (absent from v2) is refused even
-        // though its old v1 card still delegates it.
+        // Once v2 is newest, X (absent from v2) is refused despite its old v1 delegation.
         assert!(
             classify_dialer(&s, &self_uid, &v1, &x_id, NOW, Some(&v2)).is_none(),
             "a revoked own device presenting an old self-card must NOT authorize (W7)"
@@ -7496,11 +9064,8 @@ mod tests {
         );
     }
 
-    // W1: `fetch_disclosed` authenticates the discloser (its `grant.by`) via
-    // `node_is_authorized` before reconstructing. A device of our own user or of an
-    // established friend passes; an unknown node (the `grant.by` of an unsolicited
-    // grant sealed to us by a stranger) is refused, so only established friends can
-    // push us disclosed content.
+    // W1: `fetch_disclosed` authenticates the discloser via `node_is_authorized`; a self or
+    // friend device passes, an unknown node (stranger-sealed grant) is refused.
     #[test]
     fn w1_discloser_must_be_self_or_friend() {
         let self_user = kp(0x01);
@@ -7532,10 +9097,8 @@ mod tests {
         );
     }
 
-    // W2: a superseded-epoch chunk keeps its §7.4 owner gate. Once a republish drops
-    // the old chunk from `vault_blobs`, `owned_chunks` still holds it, so an
-    // unauthenticated dialer and a non-audience friend are both refused, while the
-    // grant's audience is still served - the chunk never regresses to the residual.
+    // W2: a superseded-epoch chunk keeps its §7.4 owner gate via `owned_chunks` - unauthed
+    // dialer and non-audience friend refused, grant audience still served.
     #[test]
     fn w2_superseded_chunk_stays_owner_gated() {
         let vid = [0x55; 32];
@@ -7544,8 +9107,7 @@ mod tests {
         let friend_node = [0xCC; 32];
 
         let mut s = Shared::default();
-        // Published under an old epoch, then superseded: gone from vault_blobs but
-        // retained in owned_chunks.
+        // Superseded: gone from vault_blobs but retained in owned_chunks.
         s.owned_chunks.insert(old_chunk, vid);
 
         // Record a grant that disclosed this old chunk to `audience_user`.
@@ -7575,8 +9137,7 @@ mod tests {
         };
         s.disclosure.record(&fg, &body);
 
-        // Unauthenticated dialer: refused (pre-fix this fell through to the residual
-        // `return true` because the chunk was no longer in any current vault_blobs).
+        // Unauthenticated dialer: refused.
         assert!(
             !authorize_fetch(&s, &[0x99; 32], &old_chunk),
             "unauthenticated dialer refused a superseded owned chunk (W2)"
@@ -7595,18 +9156,15 @@ mod tests {
             authorize_fetch(&s, &friend_node, &old_chunk),
             "the audience of a grant covering the chunk is still served"
         );
-        // F1 (design §3.5) default-deny: a chunk in neither the owned nor replica set
-        // is served to NO ONE. With a durable blob store the old residual `return true`
-        // was a post-reboot public leak of every owned blob; now it is a hard refusal.
+        // F1 default-deny: a chunk in neither the owned nor replica set is served to no one.
         assert!(
             !authorize_fetch(&s, &[0x99; 32], &[0xAB; 32]),
             "an unknown chunk is refused under default-deny (F1)"
         );
     }
 
-    // W8/§7.4: a chunk held AS A REPLICA is served only to the vault owner's
-    // delegated devices or a current replica-set member - never to an arbitrary
-    // dialer, which the old residual `return true` let through.
+    // W8/§7.4: a REPLICA-held chunk is served only to the owner's devices or a current
+    // replica-set member, never an arbitrary dialer.
     #[test]
     fn w8_replica_held_chunk_is_gated() {
         let vid = [0x77; 32];
@@ -7634,23 +9192,20 @@ mod tests {
             build_card(&owner_user, &owner_dev1, &[0x50; 32], None),
         );
 
-        // Unauthorized dialer (never authenticated, not a member): refused. This is
-        // exactly the leak the pre-W8 residual `return true` allowed.
+        // Unauthorized dialer (never authenticated, not a member): refused.
         assert!(
             !authorize_fetch(&s, &stranger, &chunk),
             "an arbitrary dialer is refused a replica-held chunk (W8)"
         );
 
-        // (a) the owner's known device, classified Friend(owner) via the control
-        // stream: served.
+        // (a) the owner's known device, classified Friend(owner): served.
         s.blob_auth.insert(dev1, BlobAuth::Friend(owner_uid));
         assert!(
             authorize_fetch(&s, &dev1, &chunk),
             "the owner's delegated device is served (§7.4 a)"
         );
 
-        // (a) the owner's OTHER device, authenticated by the card it presented
-        // (replica_owner_device -> ReplicaDevice): served.
+        // (a) the owner's OTHER device, authenticated by its presented card (ReplicaDevice): served.
         let dev2_card = build_card(&owner_user, &owner_dev2, &[0x50; 32], None);
         assert_eq!(
             replica_owner_device(&s, &dev2_card, &dev2, NOW),
@@ -7663,8 +9218,7 @@ mod tests {
             "the owner's other delegated device is served (§7.4 a)"
         );
 
-        // (b) a current replica-set member, by TLS-authenticated node id: served for
-        // repair, no control-stream handshake required.
+        // (b) a current replica-set member, by node id: served for repair, no handshake.
         assert!(
             authorize_fetch(&s, &member, &chunk),
             "a current replica-set member is served for repair (§7.4 b)"
@@ -7697,8 +9251,7 @@ mod tests {
         );
     }
 
-    // S3: a friend accept is bound to the ticket's issuer - both the accept's card
-    // user and the friendship's parties must match the ticket user.
+    // S3: a friend accept is bound to the ticket issuer (card user + friendship parties match).
     #[test]
     fn s3_accept_must_bind_ticket_issuer() {
         let issuer_key = kp(0x60);
@@ -7732,8 +9285,7 @@ mod tests {
         assert!(!accept_binds_ticket(&accept, &issuer, &mismatched));
     }
 
-    // W2: the highest-seen epoch persists across sync calls (shared DocStore), so
-    // a genuinely-signed but older/equal announce is refused on a later sync.
+    // W2: the highest-seen epoch persists across syncs, so a signed older/equal announce is refused.
     #[test]
     fn w2_rollback_persists_across_syncs() {
         let user = kp(1);
@@ -7759,10 +9311,8 @@ mod tests {
         assert!(t.is_empty(), "equal epoch is refused");
     }
 
-    // C1: the embedded relay's friend-gate admits only this node itself and nodes
-    // delegated by an established friend's newest card - never arbitrary peers -
-    // and it tracks the live friend set (a peer befriended after start is
-    // admitted with no relay restart).
+    // C1: the relay friend-gate admits only this node and nodes delegated by a friend's
+    // newest card, tracking the live friend set (befriend-after-start is admitted).
     #[test]
     fn c1_relay_gate_admits_only_self_and_friends() {
         let self_user_key = kp(1);
@@ -7786,14 +9336,12 @@ mod tests {
 
         // Self is always admitted (it registers on its own relay as home relay).
         assert!(gate.allows(&eid(&self_node_key), None));
-        // Before the friendship exists, the friend's node and any stranger are
-        // denied - the relay is not an open forwarder.
+        // Before the friendship exists, the friend's node and any stranger are denied.
         assert!(!gate.allows(&eid(&friend_node), None));
         assert!(!gate.allows(&eid(&kp(99)), None));
 
-        // Invite bootstrap: a stranger presenting a live invite-ticket token we
-        // issued (as its relay auth token) is admitted so it can reach us to
-        // complete the handshake; a bogus/unknown token is not.
+        // Invite bootstrap: a stranger presenting a live issued ticket token is admitted; a
+        // bogus/unknown token is not.
         let ticket = build_ticket(&self_user_key, self_node, vec![], vec![], NOW + 3600).unwrap();
         let good = ticket_auth_token(&ticket.token);
         shared.write().unwrap().tickets.issue(&ticket);
@@ -7824,10 +9372,8 @@ mod tests {
         assert!(!gate.allows(&eid(&kp(99)), None));
     }
 
-    // W1: a card injects an addressing hint only for a node it validly delegates.
-    // `card.verify()` covers the card self-signature but not the per-node
-    // user->node delegations, so an entry carrying an invalid delegation must not
-    // be injected even when the card itself is validly signed.
+    // W1: a card injects an addressing hint only for a node it validly delegates; a bogus
+    // delegation entry is rejected even when the card's self-signature is valid.
     #[test]
     fn w1_hint_gate_rejects_undelegated_node() {
         let user = kp(5);
@@ -7839,9 +9385,8 @@ mod tests {
             NOW
         ));
 
-        // Append a third party's node_id with a bogus (all-zero) delegation, then
-        // re-sign the card so its self-signature is valid (a malicious friend
-        // controls their own card). The bogus entry must be rejected by the gate.
+        // Append a third party's node_id with a bogus delegation, re-sign the card (a friend
+        // controls their own card): the bogus entry must be rejected.
         let victim = kp(7);
         card.nodes.push(NodeEntry {
             node_id: victim.verifying_key().to_bytes(),
@@ -7858,8 +9403,7 @@ mod tests {
         );
     }
 
-    // W4: distinct relay networks are counted by host, so a diversity warning
-    // (set < 2 networks) reflects real redundancy, not just relay-URL count.
+    // W4: distinct relay networks are counted by host, not raw relay-URL count.
     #[test]
     fn w4_distinct_relay_networks_dedup_by_host() {
         // Same host, different ports = one network.
@@ -7915,8 +9459,7 @@ mod tests {
         )
     }
 
-    // W15 (§8, §10.2): the paper-card backstop renders one printable page per retained
-    // share of an owned set, and refuses an unknown set.
+    // W15: the paper-card backstop renders one page per retained share, and refuses an unknown set.
     #[test]
     fn w15_paper_cards_render_one_card_per_share() {
         let a = kp(0x71);
@@ -7948,10 +9491,9 @@ mod tests {
         assert!(err.to_string().contains("no owned recovery set"), "{err}");
     }
 
-    // §9.3 steps 1-3 (local half): the teardown drops the ex-friend from the graph,
-    // deletes everything we HOLD of them, queues their replicas of our vault for
-    // re-placement, and records a pending re-split (they were a trustee), while
-    // reporting what we PLACED on them for the outbound DeleteRequests.
+    // §9.3 steps 1-3 (local half): the teardown drops the ex-friend, deletes what we HOLD of
+    // them, queues their replicas for re-placement, records a pending re-split, and reports
+    // what we PLACED on them for the outbound DeleteRequests.
     #[test]
     fn w5_teardown_removes_all_ex_friend_state() {
         let ex_user_key = kp(0x50);
@@ -8029,8 +9571,8 @@ mod tests {
         assert!(!s.held_grants.contains_key(&ex_user));
         assert!(!s.held_shares.contains_key(&their_rsid));
 
-        // Their node is queued for replica re-placement; a re-split is pending (NOT
-        // started - §9.3.4 prompt), with the suggested new set = the old honest trustees.
+        // Their node is queued for re-placement; a re-split is pending (not started), with
+        // the suggested new set = the old honest trustees.
         assert!(s.unfriended_nodes.contains(&ex_node));
         let pend = s
             .pending_resplits
@@ -8057,10 +9599,9 @@ mod tests {
         assert_eq!(out.ex_addrs.len(), 1);
     }
 
-    // §9.3 step 3 (the critical invariant): the re-split stands up a new set, REFUSES to
-    // destroy the old shares until the new set is proven live (>= M + slack), then - once
-    // live - destroys them, stranding the ex-friend's retained old share below M. The
-    // destroy is only ever produced through the guard.
+    // §9.3 step 3 (critical invariant): the re-split REFUSES to destroy old shares until the
+    // new set is proven live (>= M + slack), then destroys them, stranding the ex-friend's
+    // old share below M. The destroy is only ever produced through the guard.
     #[test]
     fn w5_resplit_guards_destroy_until_new_set_live() {
         let owner_node = kp(0x30); // signs grants + challenges (the daemon node key)
@@ -8090,8 +9631,7 @@ mod tests {
         )
         .expect("re-split stands up among the remaining trustees");
         assert_eq!(open.new_peers.len(), 2, "new set is B + C (A excluded)");
-        // §8 gap 3: each new grant carries the co-trustee roster (the OTHER new trustee)
-        // AND the latest announce refs - mirroring the original split's grants.
+        // §8: each new grant carries the co-trustee roster + the latest announce refs.
         for p in &open.new_peers {
             let g = p.grant.as_ref().unwrap();
             assert_eq!(g.cotrustees.len(), 1, "roster excludes the recipient");
@@ -8107,8 +9647,7 @@ mod tests {
             Err(carapace_friend::FriendError::NewSetNotLive)
         ));
 
-        // Collect attestations from the new set until it goes live. Each trustee's fresh
-        // share rides in its grant; answer with the trustee's own node key.
+        // Collect attestations until the new set goes live (each trustee's share rides in its grant).
         let node_key_for = |node: &[u8; 32]| -> SigningKey {
             for k in [&b, &c] {
                 if k.verifying_key().to_bytes() == *node {
@@ -8144,9 +9683,8 @@ mod tests {
         assert_eq!(open.rs.phase(), ResplitPhase::Complete);
     }
 
-    // A set with too few remaining honest trustees cannot form a new working set: a
-    // 2-of-2 with one trustee unfriended leaves a single node, below M - it surfaces as
-    // an error rather than a silently broken re-split.
+    // Too few remaining honest trustees to form a new set (2-of-2 minus one = 1 < M) surfaces
+    // as an error, not a silently broken re-split.
     #[test]
     fn w5_resplit_refuses_impossible_sets() {
         let owner_node = kp(0x30);
@@ -8171,9 +9709,8 @@ mod tests {
         .is_err());
     }
 
-    // §9.3.4 liveness window: a peer counts as online iff it answered within
-    // RESPLIT_ONLINE_WINDOW_SECS. The boundary is inclusive; a bare None (never seen) is
-    // never online.
+    // §9.3.4 liveness window: online iff answered within RESPLIT_ONLINE_WINDOW_SECS (inclusive
+    // boundary); None (never seen) is never online.
     #[test]
     fn w5_online_within_window_boundary() {
         let now = 1_800_000_000u64;
@@ -8192,11 +9729,9 @@ mod tests {
         );
     }
 
-    // §9.3 step 4: registering a COMPLETED re-split makes the new set the active one -
-    // its id takes over grant-refresh (`granted`), attestation cadence (`share_sets`), and
-    // extend bookkeeping (`split_states`) - and retires the old set. It is a one-shot
-    // (guarded by `OpenResplit::registered`) and refuses to fire before the re-split is
-    // Complete (old shares destroyed).
+    // §9.3 step 4: registering a COMPLETED re-split makes the new set active (granted,
+    // share_sets, split_states) and retires the old set. One-shot (guarded by `registered`),
+    // refuses to fire before the re-split is Complete.
     #[test]
     fn w5_register_completed_resplit_activates_new_set() {
         let owner_node = kp(0x30);
@@ -8213,8 +9748,7 @@ mod tests {
         s.announces.push(announce(&owner_node, vid, 1));
         let suggested = vec![b.verifying_key().to_bytes(), c.verifying_key().to_bytes()];
 
-        // (1) An OPEN but not-yet-Complete re-split is not registered: the old set stays
-        // active (nothing else has a working set yet).
+        // (1) An OPEN but not-yet-Complete re-split is not registered: the old set stays active.
         let fresh = build_resplit(
             &owner_node,
             &k_root,
@@ -8311,9 +9845,8 @@ mod tests {
         assert!(!s.granted.contains_key(&old_rsid));
     }
 
-    // §9.3 (audit follow-up): build_resplit must refuse an operator-supplied new set that
-    // includes the unfriended ex-trustee (re-granting them a live share would defeat the
-    // re-split) or contains duplicate pubkeys; the clean suggested set still builds.
+    // build_resplit refuses a new set that includes the ex-trustee or has duplicate pubkeys;
+    // the clean suggested set still builds.
     #[test]
     fn w5_build_resplit_rejects_ex_trustee_and_dupes() {
         let owner_node = kp(0x30);
@@ -8412,12 +9945,9 @@ mod tests {
             .clone()
     }
 
-    /// W6/§6: a node running the embedded relay elects it only after a liveness
-    /// check (never unconditionally at startup), withdraws it from its card on a
-    /// health loss and re-advertises on recovery, and BUMPS the monotonic card
-    /// version on every such re-issue so peers accept the new card over the one they
-    /// hold (rollback rule). The W4 diversity count tracks the current advertise
-    /// state throughout.
+    // W6/§6: the embedded relay is elected only after a liveness check, withdrawn on health
+    // loss and re-advertised on recovery, BUMPING the monotonic card version on every re-issue.
+    // The W4 diversity count tracks the current advertise state.
     #[tokio::test]
     async fn w6_relay_advertise_withdraw_reissues_card_monotonically() -> Result<()> {
         let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
@@ -8432,10 +9962,8 @@ mod tests {
         )
         .await?;
 
-        // Startup: the relay-less card is built at a wall-clock version floor
-        // (unix seconds, for rollback survival across restarts, W6); the initial
-        // health check then elected the live relay, re-issuing WITH the URL at the
-        // next version. We assert monotonicity and a sane floor, not exact values.
+        // Startup builds a relay-less card at a wall-clock version floor, then the health
+        // check elected the live relay, re-issuing WITH the URL. Assert monotonicity, not values.
         let (v_adv, url_adv) = own_card_relay(&daemon);
         assert!(
             v_adv >= 2,
@@ -8455,10 +9983,8 @@ mod tests {
         daemon.drive_relay_health(true);
         assert_eq!(own_card_relay(&daemon).0, v_adv, "no bump without a change");
 
-        // Withdraw on loss requires N consecutive failed probes (W6 hysteresis):
-        // the first two failures are tentative and do NOT re-issue the card; only
-        // the third withdraws the relay URL, bumps the version, and drops it from
-        // the diversity count.
+        // Withdraw requires 3 consecutive failed probes (hysteresis): the first two are
+        // tentative, the third withdraws the URL, bumps the version, and drops the diversity count.
         daemon.drive_relay_health(false);
         assert_eq!(
             own_card_relay(&daemon).0,
@@ -8501,8 +10027,8 @@ mod tests {
         // Strictly monotonic across the whole advertise/withdraw/re-advertise cycle.
         assert!(v_adv < v_wd && v_wd < v_re, "versions strictly increase");
 
-        // §6 rollback rule end-to-end: a friend's DocStore accepts each successive
-        // re-issue as newer, and rejects a replay of an earlier one as a rollback.
+        // §6 rollback rule end-to-end: a friend's DocStore accepts each re-issue as newer and
+        // rejects a replay of an earlier one.
         let mut store = DocStore::new();
         assert!(store.offer_card(&card_adv).is_ok());
         assert!(
@@ -8522,10 +10048,8 @@ mod tests {
         Ok(())
     }
 
-    /// W6 probe hysteresis: a transient probe failure must not flap a healthy
-    /// relay. Two consecutive failed probes leave the advertised card untouched;
-    /// the third withdraws (one version bump). A success anywhere in a streak
-    /// resets the counter, so a later pair of failures is again tentative.
+    // W6 probe hysteresis: two failed probes leave the card untouched; the third withdraws
+    // (one bump). A success anywhere resets the counter.
     #[tokio::test]
     async fn w6_relay_probe_hysteresis() -> Result<()> {
         let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));

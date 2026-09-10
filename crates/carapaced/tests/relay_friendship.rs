@@ -1,18 +1,8 @@
-//! §6 acceptance: NAT-blind connectivity over self-hosted relays only.
-//!
-//! Two daemons `A` and `B`, each running its own embedded self-hosted relay and
-//! bound loopback. Neither is ever told the other's direct socket address: A's
-//! relay URL reaches B via A's issued ticket, and B's relay URL reaches A via the
-//! ContactCard B presents during the handshake. From only those relay hints they
-//! complete a friendship and A places a small vault replica on B - the entire
-//! bootstrap traverses the relay path.
-//!
-//! Structural relay proof (same caveat as `carapace-net`'s relay test): both peers
-//! run on loopback, so iroh *may* background-upgrade to a direct loopback path
-//! after the relay bootstraps the connection. The relay-only guarantee is
-//! structural: neither peer is given a direct address and there is no discovery
-//! service, so the embedded relays are the only thing that can bootstrap the
-//! connection at all.
+//! §6 acceptance: NAT-blind connectivity over self-hosted relays only. Two daemons, each
+//! running its own embedded relay bound loopback, neither told the other's direct address:
+//! relay URLs travel via A's ticket and B's card. From only those hints they befriend and A
+//! places a replica on B. The relay-only guarantee is structural (no direct address, no
+//! discovery), though iroh may background-upgrade to a direct loopback path afterward.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -81,8 +71,7 @@ async fn relay_only_friendship_and_replica() -> Result<()> {
     }
 
     // ---- friendship, NAT-blind: B dials A by node id only ----
-    // The ticket A issues carries A's relay URL (and no direct address); B injects
-    // that hint and dials A's bare node id over the relay.
+    // A's ticket carries A's relay URL (no direct address); B injects it and dials A's node id.
     let ticket = a.issue_ticket()?;
     assert!(
         ticket.relay_urls.contains(&a_relay),
@@ -101,8 +90,7 @@ async fn relay_only_friendship_and_replica() -> Result<()> {
     assert!(a.is_friend(&b.user_id()) && b.is_friend(&a.user_id()));
 
     // ---- small vault replica, NAT-blind: A places on B by node id only ----
-    // A learned B's relay from the ContactCard B presented during the handshake,
-    // so A can reach B's bare node id over the relay with no direct address.
+    // A learned B's relay from B's handshake card, so it reaches B's node id over the relay.
     let (src, expected) = make_tree();
     let (vid, _nonce) = a.new_vid();
     a.publish_vault(src.path(), vid).await?;

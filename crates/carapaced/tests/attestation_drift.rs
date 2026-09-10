@@ -1,9 +1,6 @@
-//! W4 owner attestation cadence (§10.2): a trustee that stops attesting drops the
-//! attested-live count below `M + slack`, and the maintenance round surfaces an
-//! `extend` recommendation on the status surface.
-//!
-//! BOUNDED (§11 lesson): the attestation cadence + freshness window run against an
-//! injected clock (tiny intervals, an advancing `now`), never a real daily cadence.
+//! W4 owner attestation cadence (§10.2): a trustee that stops attesting drops attested-live
+//! below `M + slack`, and the maintenance round surfaces an `extend` recommendation. Bounded:
+//! the cadence + freshness window run against an injected clock, never a real daily cadence.
 
 use std::collections::HashMap;
 
@@ -28,9 +25,8 @@ async fn a_befriends(a: &Daemon, peer: &Daemon) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn stalled_trustee_drops_live_below_target_and_surfaces_extend() -> Result<()> {
-    // Owner A and three trustees. M = 2, slack = 1 => live target 3, one share of
-    // headroom under the §8.3 soft cap (3*2 - 1 = 5), so a single drop recommends
-    // EXTEND (not re-split).
+    // M = 2, slack = 1 => live target 3, with headroom under the §8.3 soft cap, so a single
+    // drop recommends EXTEND (not re-split).
     let a = Daemon::start(seeds(0x01, 0xA0)).await?;
     let b = Daemon::start(seeds(0x11, 0xB0)).await?;
     let c = Daemon::start(seeds(0x21, 0xC0)).await?;
