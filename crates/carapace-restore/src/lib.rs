@@ -614,7 +614,7 @@ where
     }
     let secured = portable_destination(root, relative)?;
     let (parent, destination) = (&secured.parent, &secured.destination);
-    let mut temporary = tempfile::NamedTempFile::new_in(&parent).map_err(Error::from)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(Error::from)?;
     let mut hasher = blake3::Hasher::new();
     let mut written = 0u64;
     let mut count = 0usize;
@@ -647,7 +647,7 @@ where
         .set_modified(modified)
         .map_err(Error::from)?;
     temporary.as_file().sync_all().map_err(Error::from)?;
-    persist_replace(temporary.into_temp_path(), &destination)?;
+    persist_replace(temporary.into_temp_path(), destination)?;
     Ok(destination.clone())
 }
 
@@ -719,7 +719,7 @@ fn write_atomic_portable(
             .checked_add(std::time::Duration::from_secs(mtime))
             .ok_or_else(|| Error::InvalidLayout(relative.display().to_string()))?;
         file.set_modified(modified)?;
-        persist_replace(temporary.into_temp_path(), &destination)?;
+        persist_replace(temporary.into_temp_path(), destination)?;
         Ok(destination.clone())
     })();
     result
@@ -900,6 +900,8 @@ fn persist_replace(temporary: tempfile::TempPath, destination: &Path) -> Result<
             if metadata.permissions().readonly() {
                 let permissions = metadata.permissions();
                 let mut writable = permissions.clone();
+                // Windows changes only the readonly attribute; Unix mode bits are not involved.
+                #[allow(clippy::permissions_set_readonly_false)]
                 writable.set_readonly(false);
                 file.set_permissions(writable)?;
                 Some((file, permissions))
