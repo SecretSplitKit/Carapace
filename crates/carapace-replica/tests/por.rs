@@ -12,6 +12,37 @@ use carapace_replica::{
     AuditAction, AuditFailure, AuditOutcome, AuditTracker, Health, PlacementCtx, Policy,
     ReplicaPeer, ReplicaSet, AUDIT_CODE_RETENTION_LOST, DEFAULT_POR_FAIL_LIMIT,
 };
+
+#[test]
+fn bao_verified_ranges_reject_short_overlong_and_missing_answers() {
+    let audit = Audit {
+        vid: [1; 32],
+        epoch: 1,
+        round: 1,
+        wide: false,
+        samples: vec![carapace_replica::AuditSample {
+            chunk_id: [2; 32],
+            offset: 16_383,
+            len: 2,
+        }],
+    };
+    assert_eq!(
+        carapace_replica::verify_bao_range_responses(&audit, &[Some(vec![0; 2])]),
+        AuditOutcome::Pass
+    );
+    assert!(matches!(
+        carapace_replica::verify_bao_range_responses(&audit, &[Some(vec![0; 1])]),
+        AuditOutcome::Fail(AuditFailure::ShortRange { .. })
+    ));
+    assert!(matches!(
+        carapace_replica::verify_bao_range_responses(&audit, &[Some(vec![0; 3])]),
+        AuditOutcome::Fail(AuditFailure::ShortRange { .. })
+    ));
+    assert!(matches!(
+        carapace_replica::verify_bao_range_responses(&audit, &[None]),
+        AuditOutcome::Fail(AuditFailure::Missing(_))
+    ));
+}
 use carapace_vault::{ChunkStore, MemoryStore};
 use carapace_wire::{Manifest, ManifestEnvelope, Signed};
 use ed25519_dalek::SigningKey;

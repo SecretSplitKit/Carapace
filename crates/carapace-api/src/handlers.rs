@@ -10,15 +10,16 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{header, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
 use carapace_wire::messages::Message as _;
 use carapace_wire::{FileGrant, InviteTicket};
 use carapaced::{Daemon, PendingResplitStatus, RecoveryScope, ResplitStatus};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{auth, AppState};
 
@@ -40,7 +41,7 @@ pub async fn static_asset(State(st): State<AppState>, uri: Uri) -> Response {
     // An unmatched `/api/*` path is a missing endpoint, not a client route: 404 JSON,
     // never the token-injected shell. Only non-`/api` paths get the SPA fallback.
     if path == "api" || path.starts_with("api/") {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))).into_response();
+        return error_response(StatusCode::NOT_FOUND, "not found");
     }
     // `index.html` must always route through injection, never be served raw.
     if path.is_empty() || path == "index.html" {
@@ -120,12 +121,14 @@ fn serve_index(token: &str) -> Response {
          base-uri 'none'; \
          frame-ancestors 'none'"
     );
+    let cookie = format!("carapace_session={token}; HttpOnly; SameSite=Strict; Path=/api/events");
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CONTENT_SECURITY_POLICY, csp.as_str()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::CACHE_CONTROL, "no-store"),
+            (header::SET_COOKIE, cookie.as_str()),
         ],
         rendered,
     )
@@ -134,24 +137,92 @@ fn serve_index(token: &str) -> Response {
 
 // ---- error type --------------------------------------------------------
 
+/// Sequence for references that connect a safe client error to the server log.
+static ERROR_REFERENCE: AtomicU64 = AtomicU64::new(1);
+
 /// A handler error rendered as a JSON body with an HTTP status.
-pub struct ApiError(StatusCode, String);
+pub struct ApiError {
+    status: StatusCode,
+    client_message: String,
+    internal: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApiErrorCode {
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    Conflict,
+    UpstreamFailure,
+    Internal,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ApiErrorBody {
+    pub(crate) code: ApiErrorCode,
+    pub(crate) error: String,
+}
+
+pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let code = match status {
+        StatusCode::BAD_REQUEST => ApiErrorCode::BadRequest,
+        StatusCode::UNAUTHORIZED => ApiErrorCode::Unauthorized,
+        StatusCode::FORBIDDEN => ApiErrorCode::Forbidden,
+        StatusCode::NOT_FOUND => ApiErrorCode::NotFound,
+        StatusCode::CONFLICT => ApiErrorCode::Conflict,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => ApiErrorCode::UpstreamFailure,
+        _ => ApiErrorCode::Internal,
+    };
+    (
+        status,
+        Json(ApiErrorBody {
+            code,
+            error: message.into(),
+        }),
+    )
+        .into_response()
+}
+
+impl ApiError {
+    fn client(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            client_message: message.into(),
+            internal: None,
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        let message = match self.internal {
+            Some(detail) => {
+                let reference = ERROR_REFERENCE.fetch_add(1, Ordering::Relaxed);
+                let _ = detail;
+                crate::ops::log("api.internal_error", Some(reference));
+                format!("internal server error; reference {reference}")
+            }
+            None => self.client_message,
+        };
+        error_response(self.status, message)
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            client_message: "internal server error".to_string(),
+            internal: Some(format!("{e:#}")),
+        }
     }
 }
 
 /// A 400 from a bad-input message.
 fn bad(msg: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, msg.into())
+    ApiError::client(StatusCode::BAD_REQUEST, msg)
 }
 
 fn hexs(b: &[u8]) -> String {
@@ -184,47 +255,257 @@ pub async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerOptionResponse {
+    user: String,
+    display: String,
+    node: String,
+    addrs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PublishedVaultResponse {
+    vid: String,
+    epoch: u64,
+    name: String,
+    dir: String,
+    watching: bool,
+    syncing: bool,
+    last_error: Option<String>,
+    last_success: Option<u64>,
+    recovery_backup: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FriendGrantResponse {
+    user: String,
+    grant_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+struct FriendsResponse {
+    count: usize,
+    list: Vec<String>,
+    grants: Vec<FriendGrantResponse>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct VaultsResponse {
+    published: Vec<PublishedVaultResponse>,
+    held_replicas: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RecoveryScopeResponse {
+    Root,
+    Vault { vid: String },
+}
+#[derive(Clone, Debug, Serialize)]
+struct TrusteeDeliveryResponse {
+    user: String,
+    delivered: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+struct RecoverySetResponse {
+    rsid: u64,
+    scope: RecoveryScopeResponse,
+    threshold: usize,
+    issued: usize,
+    trustees: Vec<TrusteeDeliveryResponse>,
+    warnings: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct RecoveryHealthResponse {
+    rsid: u64,
+    live: usize,
+    target: usize,
+    recommendation: String,
+    needed: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+struct ShareHealthResponse {
+    recovery_sets_owned: usize,
+    shares_held: usize,
+    sets: Vec<RecoverySetResponse>,
+    recovery: Vec<RecoveryHealthResponse>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct AnnounceRefResponse {
+    vid: String,
+    epoch: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+struct MintedGrantResponse {
+    rsid: u64,
+    subject: String,
+    trustees: Vec<TrusteeDeliveryResponse>,
+    refs: Vec<AnnounceRefResponse>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct RecoveryGrantsResponse {
+    minted: Vec<MintedGrantResponse>,
+    held: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct CeremonyResponse {
+    ceremony_id: String,
+    subject: String,
+    sponsor: String,
+    claimant_display: String,
+    reason: String,
+    phase: String,
+    approvals: usize,
+    threshold: usize,
+    is_self_subject: bool,
+    takeover: bool,
+    trustee: bool,
+    approved: bool,
+    alarm: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+struct ResplitFriendResponse {
+    node: String,
+    role: String,
+    online: bool,
+    done: bool,
+    status: &'static str,
+}
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ResplitResponse {
+    old_rsid: u64,
+    new_rsid: u64,
+    ex_trustee: String,
+    phase: String,
+    new_attested: usize,
+    new_total: usize,
+    new_set_live: bool,
+    old_destroyed: usize,
+    old_total: usize,
+    remaining: Vec<ResplitFriendResponse>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct PendingTrusteeResponse {
+    user: String,
+    node: Option<String>,
+    online: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+struct PendingResplitResponse {
+    old_rsid: u64,
+    ex_trustee: String,
+    suggested: Vec<PendingTrusteeResponse>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StatusSnapshot {
+    user_id: String,
+    identity_storage: String,
+    sync_errors: Vec<Value>,
+    node_id: String,
+    addr: Vec<String>,
+    relay_url: Option<String>,
+    friends: FriendsResponse,
+    peers: Vec<PeerOptionResponse>,
+    vaults: VaultsResponse,
+    share_health: ShareHealthResponse,
+    recovery_grants: RecoveryGrantsResponse,
+    ceremonies: Vec<CeremonyResponse>,
+    resplits: Vec<ResplitResponse>,
+    pending_resplits: Vec<PendingResplitResponse>,
+    reachability: &'static str,
+    relay_networks: usize,
+    relay_diversity_warning: bool,
+    por_latency_anomaly_count: usize,
+}
+
 /// Build the status snapshot pushed over WS and returned by `GET /api/status`.
-fn status_snapshot(d: &Daemon) -> Value {
+fn status_snapshot(d: &Daemon) -> StatusSnapshot {
     let friends: Vec<String> = d.friend_ids().iter().map(|f| hexs(f)).collect();
-    let vaults: Vec<Value> = d
-        .published_vaults()
+    let friend_grants: Vec<FriendGrantResponse> = d
+        .friend_grants()
         .iter()
-        .map(|(v, e)| json!({ "vid": hexs(v), "epoch": e }))
+        .map(|report| FriendGrantResponse {
+            user: hexs(&report.user),
+            grant_bytes: report.grant_bytes,
+        })
+        .collect();
+    let vaults = vault_rows(d);
+    let peers = d
+        .peer_options()
+        .iter()
+        .map(|peer| PeerOptionResponse {
+            user: hexs(&peer.user),
+            display: peer.display.clone(),
+            node: hexs(&peer.node),
+            addrs: peer.addrs.clone(),
+        })
         .collect();
     let held: Vec<String> = d.held_replica_vids().iter().map(|v| hexs(v)).collect();
     let (sets, shares) = d.share_health_counts();
+    let recovery_sets: Vec<RecoverySetResponse> = d
+        .recovery_sets()
+        .iter()
+        .map(|set| {
+            let scope = match set.scope {
+                RecoveryScope::Root => RecoveryScopeResponse::Root,
+                RecoveryScope::Vault(vid) => RecoveryScopeResponse::Vault { vid: hexs(&vid) },
+            };
+            RecoverySetResponse {
+                rsid: set.rsid,
+                scope,
+                threshold: set.threshold,
+                issued: set.issued,
+                trustees: set
+                    .trustees
+                    .iter()
+                    .map(|(user, delivered)| TrusteeDeliveryResponse {
+                        user: hexs(user),
+                        delivered: *delivered,
+                    })
+                    .collect(),
+                warnings: set
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("{warning:?}"))
+                    .collect(),
+            }
+        })
+        .collect();
     // W4 (§10.2): per owned recovery set, the attested-live count, target, and drift
     // recommendation (healthy / extend / resplit) the maintenance loop keeps current.
-    let recovery: Vec<Value> = d
+    let recovery: Vec<RecoveryHealthResponse> = d
         .recovery_health()
         .iter()
-        .map(|r| {
-            json!({
-                "rsid": r.rsid,
-                "live": r.live,
-                "target": r.target,
-                "recommendation": r.recommendation,
-                "needed": r.needed,
-            })
+        .map(|r| RecoveryHealthResponse {
+            rsid: r.rsid,
+            live: r.live,
+            target: r.target,
+            recommendation: r.recommendation.to_owned(),
+            needed: r.needed,
         })
         .collect();
     // W3 (§8, §7.3): per owned recovery set, which trustees hold a minted ShareGrant
     // and the announce-ref freshness (vid + epoch) the maintenance loop keeps current.
-    let grants: Vec<Value> = d
+    let grants: Vec<MintedGrantResponse> = d
         .recovery_grants()
         .iter()
-        .map(|g| {
-            json!({
-                "rsid": g.rsid,
-                "subject": hexs(&g.subject),
-                "trustees": g.trustees.iter()
-                    .map(|(u, delivered)| json!({ "user": hexs(u), "delivered": delivered }))
-                    .collect::<Vec<_>>(),
-                "refs": g.refs.iter()
-                    .map(|(vid, epoch)| json!({ "vid": hexs(vid), "epoch": epoch }))
-                    .collect::<Vec<_>>(),
-            })
+        .map(|g| MintedGrantResponse {
+            rsid: g.rsid,
+            subject: hexs(&g.subject),
+            trustees: g
+                .trustees
+                .iter()
+                .map(|(u, delivered)| TrusteeDeliveryResponse {
+                    user: hexs(u),
+                    delivered: *delivered,
+                })
+                .collect(),
+            refs: g
+                .refs
+                .iter()
+                .map(|(vid, epoch)| AnnounceRefResponse {
+                    vid: hexs(vid),
+                    epoch: *epoch,
+                })
+                .collect(),
         })
         .collect();
     // W3 trustee side: subject users whose grants this daemon holds for others.
@@ -233,69 +514,259 @@ fn status_snapshot(d: &Daemon) -> Value {
     // W4 (§6 MUST): warn when the usable relay set spans fewer than 2 distinct
     // networks - a single relay is a single point of failure and metadata choke.
     let relay_networks = d.relay_network_count();
-    json!({
-        "node_id": hexs(&d.node_id()),
-        "addr": d.dialable_addr_strings(),
-        "relay_url": relay_url,
-        "friends": { "count": friends.len(), "list": friends },
-        "vaults": { "published": vaults, "held_replicas": held },
-        "share_health": { "recovery_sets_owned": sets, "shares_held": shares, "recovery": recovery },
-        "recovery_grants": { "minted": grants, "held": held_grants },
-        // W2 (§8.5): live recovery ceremonies + the anti-silent-takeover alarm.
-        "ceremonies": ceremony_rows(d),
-        // W5 (§9.3 step 4): open trustee re-splits after an unfriend, with the live
-        // reachability of the remaining friends who get the new share / destroy step.
-        "resplits": d.resplit_statuses().iter().map(resplit_json).collect::<Vec<_>>(),
-        // §9.3.4: re-splits detected on unfriend but awaiting the user's prompt to start.
-        "pending_resplits": d.pending_resplit_statuses().iter().map(pending_resplit_json).collect::<Vec<_>>(),
-        "reachability": if relay_url.is_some() { "relay" } else { "direct" },
-        "relay_networks": relay_networks,
-        "relay_diversity_warning": relay_networks < 2,
-    })
+    StatusSnapshot {
+        node_id: hexs(&d.node_id()),
+        user_id: hexs(&d.user_id()),
+        identity_storage: d.identity_storage_label().to_string(),
+        sync_errors: d
+            .live_peer_errors()
+            .iter()
+            .map(|(node, error)| json!({"node":hexs(node),"error":error}))
+            .collect(),
+        addr: d.dialable_addr_strings(),
+        relay_url: relay_url.clone(),
+        friends: FriendsResponse {
+            count: friends.len(),
+            list: friends,
+            grants: friend_grants,
+        },
+        peers,
+        vaults: VaultsResponse {
+            published: vaults,
+            held_replicas: held,
+        },
+        share_health: ShareHealthResponse {
+            recovery_sets_owned: sets,
+            shares_held: shares,
+            sets: recovery_sets,
+            recovery,
+        },
+        recovery_grants: RecoveryGrantsResponse {
+            minted: grants,
+            held: held_grants,
+        },
+        ceremonies: ceremony_rows(d),
+        resplits: d.resplit_statuses().iter().map(resplit_json).collect(),
+        pending_resplits: d
+            .pending_resplit_statuses()
+            .iter()
+            .map(pending_resplit_json)
+            .collect(),
+        reachability: if relay_url.is_some() {
+            "relay"
+        } else {
+            "direct"
+        },
+        relay_networks,
+        relay_diversity_warning: relay_networks < 2,
+        por_latency_anomaly_count: d.por_latency_anomaly_count(),
+    }
 }
 
 /// One re-split's §9.3 step-4 prompt surface as JSON: phase, new-set liveness gate,
 /// old-set destroy progress, and each remaining friend's online/queued status.
-fn resplit_json(rs: &ResplitStatus) -> Value {
-    json!({
-        "old_rsid": rs.old_rsid,
-        "new_rsid": rs.new_rsid,
-        "ex_trustee": hexs(&rs.ex_trustee),
-        "phase": rs.phase,
-        // New set going live is the destroy gate (>= M + slack attested).
-        "new_attested": rs.new_attested,
-        "new_total": rs.new_total,
-        "new_set_live": rs.new_live,
-        "old_destroyed": rs.old_destroyed,
-        "old_total": rs.old_total,
-        "remaining": rs.remaining.iter().map(|f| json!({
-            "node": hexs(&f.node),
-            "role": f.role,
-            "online": f.online,
-            "done": f.done,
-            "status": if f.done { "done" } else if f.online { "online" } else { "will_queue" },
-        })).collect::<Vec<_>>(),
-    })
+fn resplit_json(rs: &ResplitStatus) -> ResplitResponse {
+    ResplitResponse {
+        old_rsid: rs.old_rsid,
+        new_rsid: rs.new_rsid,
+        ex_trustee: hexs(&rs.ex_trustee),
+        phase: rs.phase.to_owned(),
+        new_attested: rs.new_attested,
+        new_total: rs.new_total,
+        new_set_live: rs.new_live,
+        old_destroyed: rs.old_destroyed,
+        old_total: rs.old_total,
+        remaining: rs
+            .remaining
+            .iter()
+            .map(|f| ResplitFriendResponse {
+                node: hexs(&f.node),
+                role: f.role.to_owned(),
+                online: f.online,
+                done: f.done,
+                status: if f.done {
+                    "done"
+                } else if f.online {
+                    "online"
+                } else {
+                    "will_queue"
+                },
+            })
+            .collect(),
+    }
 }
 
 /// One PENDING re-split's §9.3.4 prompt surface as JSON: the ex-trustee and the suggested
 /// new trustee set with each member's live reachability, so the GUI can render the prompt
 /// and pre-fill `POST /api/recovery/{rsid}/resplit-start`.
-fn pending_resplit_json(p: &PendingResplitStatus) -> Value {
-    json!({
-        "old_rsid": p.old_rsid,
-        "ex_trustee": hexs(&p.ex_trustee),
-        "suggested": p.suggested.iter().map(|t| json!({
-            "user": hexs(&t.user),
-            "node": t.node.map(|n| hexs(&n)),
-            "online": t.online,
-        })).collect::<Vec<_>>(),
-    })
+fn pending_resplit_json(p: &PendingResplitStatus) -> PendingResplitResponse {
+    PendingResplitResponse {
+        old_rsid: p.old_rsid,
+        ex_trustee: hexs(&p.ex_trustee),
+        suggested: p
+            .suggested
+            .iter()
+            .map(|t| PendingTrusteeResponse {
+                user: hexs(&t.user),
+                node: t.node.map(|n| hexs(&n)),
+                online: t.online,
+            })
+            .collect(),
+    }
 }
 
 /// `GET /api/status`.
-pub async fn status(State(st): State<AppState>) -> Json<Value> {
+pub async fn status(State(st): State<AppState>) -> Json<StatusSnapshot> {
     Json(status_snapshot(&st.daemon))
+}
+
+const METRIC_COUNT_LIMIT: usize = 1_000_000;
+
+#[derive(Serialize)]
+struct MetricLimits {
+    count_ceiling: usize,
+}
+#[derive(Serialize)]
+struct StorageMetrics {
+    owned_vaults: u64,
+    held_replica_vaults: u64,
+    refetch_needed: u64,
+}
+#[derive(Serialize)]
+struct ReplicaMetrics {
+    peer_capacity_count: u64,
+    held_count: u64,
+    assignments: u64,
+    granted_capacity_bytes: u64,
+}
+#[derive(Serialize)]
+struct MaintenanceMetrics {
+    running: bool,
+    recovery_sets_checked: u64,
+    relay_networks: u64,
+    last_completed_at: u64,
+    last_failure_at: u64,
+    last_failure_count: u64,
+    consecutive_failed_rounds: u64,
+}
+#[derive(Serialize)]
+struct GarbageCollectionMetrics {
+    last_succeeded: bool,
+    live_set_capacity: usize,
+}
+#[derive(Serialize)]
+struct CeremonyMetrics {
+    active_or_retained: u64,
+    active_tracked: u64,
+    capacity_ceiling: u64,
+    per_subject_capacity: u64,
+    fanout_capacity: u64,
+    tombstones: u64,
+    tombstone_capacity: u64,
+    subject_rate_keys: u64,
+    sponsor_rate_keys: u64,
+    at_capacity: bool,
+    tombstones_at_capacity: bool,
+}
+#[derive(Serialize)]
+struct MigrationMetrics {
+    required: bool,
+    state_schema_ready: bool,
+    legacy_migration_is_explicit: bool,
+}
+#[derive(Serialize)]
+struct RecoveryMetrics {
+    owned_sets: u64,
+    held_shares: u64,
+    open_resplits: u64,
+    pending_resplits: u64,
+}
+#[derive(Serialize)]
+pub struct MetricsSnapshot {
+    schema: u8,
+    limits: MetricLimits,
+    storage: StorageMetrics,
+    replicas: ReplicaMetrics,
+    maintenance: MaintenanceMetrics,
+    garbage_collection: GarbageCollectionMetrics,
+    ceremonies: CeremonyMetrics,
+    migrations: MigrationMetrics,
+    recovery: RecoveryMetrics,
+}
+
+fn bounded_count(value: usize) -> u64 {
+    value.min(METRIC_COUNT_LIMIT) as u64
+}
+
+/// `GET /api/metrics`: authenticated, identity-free operational health and capacity.
+pub async fn metrics(State(st): State<AppState>) -> Json<MetricsSnapshot> {
+    let published = st.daemon.published_vaults().len();
+    let held_replicas = st.daemon.held_replica_vids().len();
+    let friends = st.daemon.friend_ids().len();
+    let (recovery_sets, held_shares) = st.daemon.share_health_counts();
+    let recovery = st.daemon.recovery_health();
+    let ceremonies = ceremony_rows(&st.daemon);
+    let resplits = st.daemon.resplit_statuses();
+    let pending_resplits = st.daemon.pending_resplit_statuses();
+    let capacity = st.daemon.operational_capacity();
+    let history = st.daemon.operational_history();
+    Json(MetricsSnapshot {
+        schema: 1,
+        limits: MetricLimits {
+            count_ceiling: METRIC_COUNT_LIMIT,
+        },
+        storage: StorageMetrics {
+            owned_vaults: bounded_count(published),
+            held_replica_vaults: bounded_count(held_replicas),
+            refetch_needed: bounded_count(capacity.storage_refetch_needed),
+        },
+        replicas: ReplicaMetrics {
+            peer_capacity_count: bounded_count(friends),
+            held_count: bounded_count(held_replicas),
+            assignments: bounded_count(capacity.replica_assignments),
+            granted_capacity_bytes: capacity.replica_grant_bytes,
+        },
+        maintenance: MaintenanceMetrics {
+            running: true,
+            recovery_sets_checked: bounded_count(recovery.len()),
+            relay_networks: bounded_count(st.daemon.relay_network_count()),
+            last_completed_at: history.last_maintenance_at,
+            last_failure_at: history.last_failure_at,
+            last_failure_count: bounded_count(history.last_failure_count),
+            consecutive_failed_rounds: history
+                .consecutive_failed_rounds
+                .min(METRIC_COUNT_LIMIT as u64),
+        },
+        garbage_collection: GarbageCollectionMetrics {
+            last_succeeded: history.last_gc_succeeded,
+            live_set_capacity: 1_000_000,
+        },
+        ceremonies: CeremonyMetrics {
+            active_or_retained: bounded_count(ceremonies.len()),
+            active_tracked: bounded_count(capacity.ceremony_active),
+            capacity_ceiling: bounded_count(capacity.ceremony_capacity),
+            per_subject_capacity: bounded_count(capacity.ceremony_per_subject_capacity),
+            fanout_capacity: bounded_count(capacity.ceremony_fanout_capacity),
+            tombstones: bounded_count(capacity.ceremony_tombstones),
+            tombstone_capacity: bounded_count(capacity.ceremony_tombstone_capacity),
+            subject_rate_keys: bounded_count(capacity.ceremony_subject_rate_keys),
+            sponsor_rate_keys: bounded_count(capacity.ceremony_sponsor_rate_keys),
+            at_capacity: capacity.ceremony_active >= capacity.ceremony_capacity,
+            tombstones_at_capacity: capacity.ceremony_tombstones
+                >= capacity.ceremony_tombstone_capacity,
+        },
+        migrations: MigrationMetrics {
+            required: false,
+            state_schema_ready: true,
+            legacy_migration_is_explicit: true,
+        },
+        recovery: RecoveryMetrics {
+            owned_sets: bounded_count(recovery_sets),
+            held_shares: bounded_count(held_shares),
+            open_resplits: bounded_count(resplits.len()),
+            pending_resplits: bounded_count(pending_resplits.len()),
+        },
+    })
 }
 
 // ---- vaults ------------------------------------------------------------
@@ -324,13 +795,7 @@ pub async fn publish_vault(
 
 /// `GET /api/vaults`.
 pub async fn list_vaults(State(st): State<AppState>) -> Json<Value> {
-    let vaults: Vec<Value> = st
-        .daemon
-        .published_vaults()
-        .iter()
-        .map(|(v, e)| json!({ "vid": hexs(v), "epoch": e }))
-        .collect();
-    Json(json!({ "published": vaults }))
+    Json(json!({ "published": vault_rows(&st.daemon) }))
 }
 
 // ---- friends -----------------------------------------------------------
@@ -407,10 +872,10 @@ pub async fn unfriend(
 pub async fn resplit_status(
     Path(rsid): Path<u64>,
     State(st): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ResplitResponse>, ApiError> {
     match st.daemon.resplit_status(rsid) {
         Some(rs) => Ok(Json(resplit_json(&rs))),
-        None => Err(ApiError(
+        None => Err(ApiError::client(
             StatusCode::NOT_FOUND,
             format!("no open re-split for recovery set {rsid}"),
         )),
@@ -433,7 +898,7 @@ pub async fn recovery_paper(
     let html = st
         .daemon
         .paper_cards(rsid)
-        .map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        .map_err(|e| ApiError::client(StatusCode::NOT_FOUND, format!("{e:#}")))?;
     Ok((
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -461,7 +926,7 @@ pub async fn resplit_start(
     Path(rsid): Path<u64>,
     State(st): State<AppState>,
     body: Option<Json<ResplitStartReq>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ResplitResponse>, ApiError> {
     let override_set = match body.and_then(|Json(b)| b.trustees) {
         Some(hexes) => {
             let mut users = Vec::with_capacity(hexes.len());
@@ -480,7 +945,7 @@ pub async fn resplit_start(
             .iter()
             .any(|p| p.old_rsid == rsid);
     if !tracked {
-        return Err(ApiError(
+        return Err(ApiError::client(
             StatusCode::NOT_FOUND,
             format!("no pending or open re-split for recovery set {rsid}"),
         ));
@@ -499,6 +964,74 @@ pub async fn resplit_start(
 pub struct PeerReq {
     node: String,
     addrs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SyncReq {
+    peer: PeerReq,
+    out_dir: String,
+}
+
+#[derive(Deserialize)]
+pub struct RestartRestoreReq {
+    out_dir: String,
+}
+
+/// Restore retained vaults after claimant activation. The durable public handoff
+/// limits results to the maximum signed-grant epoch for each vault.
+pub async fn restart_restore(
+    State(st): State<AppState>,
+    Json(req): Json<RestartRestoreReq>,
+) -> Result<Json<Value>, ApiError> {
+    let path = st.state_dir.join("recovery-restart-handoff.json");
+    let bytes = std::fs::read(&path).map_err(|_| {
+        ApiError::client(
+            StatusCode::NOT_FOUND,
+            "no claimant restart handoff is available",
+        )
+    })?;
+    let seal = std::fs::read(st.state_dir.join("recovery-restart-handoff.seal"))
+        .map_err(|_| bad("authenticated recovery handoff is missing"))?;
+    st.daemon
+        .verify_recovery_handoff(&bytes, &seal)
+        .map_err(|_| bad("claimant restart handoff was replaced or modified"))?;
+    let (trustees, refs) = crate::claimant::restart_metadata(&bytes, st.daemon.user_id())
+        .map_err(|_| bad("claimant restart handoff authentication failed"))?;
+    let maximum_refs = carapaced::max_epoch_refs(&refs).len();
+    let report = st
+        .daemon
+        .recover_retained_at_with_relays(&trustees, &refs, std::path::Path::new(&req.out_dir))
+        .await?;
+    let restored = &report.restored;
+    Ok(Json(json!({
+        "restored": restored.iter().map(|vault| json!({
+            "vid": hexs(&vault.vid),
+            "epoch": vault.epoch,
+            "out_dir": vault.out_dir.display().to_string(),
+        })).collect::<Vec<_>>(),
+        "complete": report.errors.is_empty(),
+        "errors": report.errors.iter().map(|(vid,error)|json!({"vid":hexs(vid),"error":error})).collect::<Vec<_>>(),
+        "maximum_epoch_refs": maximum_refs,
+    })))
+}
+
+/// `POST /api/sync`: pull owned-vault documents and blobs from another authorized device.
+pub async fn sync_owned(
+    State(st): State<AppState>,
+    Json(req): Json<SyncReq>,
+) -> Result<Json<Value>, ApiError> {
+    let node = parse_hex32(&req.peer.node)?;
+    let restored = st
+        .daemon
+        .sync_from_at(node, &req.peer.addrs, std::path::Path::new(&req.out_dir))
+        .await?;
+    Ok(Json(json!({
+        "restored": restored.iter().map(|v| json!({
+            "vid": hexs(&v.vid),
+            "epoch": v.epoch,
+            "out_dir": v.out_dir.display().to_string(),
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -766,10 +1299,41 @@ pub async fn ceremony_open(
         unix_now(),
     )?;
     let reached = st.daemon.ceremony_fanout(&open).await.unwrap_or(0);
+    let package = st.daemon.claimant_package(&open)?;
+    let trustee_hints = package.trustees;
+    let announce_refs = package.announce_refs;
+    let roster: Vec<String> = trustee_hints
+        .iter()
+        .map(|trustee| hexs(&trustee.user))
+        .collect();
+    let trustees: Vec<Value> = trustee_hints
+        .iter()
+        .map(|trustee| {
+            json!({
+                "node": hexs(&trustee.node),
+                "addrs": trustee.addrs,
+                "relay_url": trustee.relay_url,
+            })
+        })
+        .collect();
+    let sponsor_package = json!({
+        "type": "carapace.sponsor-ceremony",
+        "version": 1,
+        "sponsor_sig": hexs(&package.sponsor_sig),
+        "open_hex": hexs(&open.encode_frame()),
+        "roster": roster,
+        "trustees": trustees,
+        "announce_refs": announce_refs.iter().map(|reference| json!({
+            "vid": hexs(&reference.vid),
+            "epoch": reference.epoch,
+            "digest": hexs(&reference.digest),
+        })).collect::<Vec<_>>(),
+    });
     Ok(Json(json!({
         "ceremony_id": hexs(&id),
         "open_hex": hexs(&open.encode_frame()),
         "fanout_reached": reached,
+        "sponsor_package": sponsor_package.to_string(),
     })))
 }
 
@@ -815,26 +1379,23 @@ pub async fn ceremony_abort(
 
 /// The recovery-ceremony status rows (§8.5 step 2/6) for the status surface: each
 /// ceremony this device has seen, its phase, approvals, and the alarm flags.
-fn ceremony_rows(d: &Daemon) -> Vec<Value> {
+fn ceremony_rows(d: &Daemon) -> Vec<CeremonyResponse> {
     d.ceremony_statuses()
         .iter()
-        .map(|c| {
-            json!({
-                "ceremony_id": hexs(&c.ceremony_id),
-                "subject": hexs(&c.subject),
-                "sponsor": hexs(&c.sponsor),
-                "claimant_display": c.claimant_display,
-                "reason": c.reason,
-                "phase": c.phase,
-                "approvals": c.approvals,
-                "threshold": c.threshold,
-                "is_self_subject": c.is_self_subject,
-                "takeover": c.takeover,
-                "trustee": c.trustee,
-                "approved": c.approved,
-                // The anti-silent-takeover banner: a live ceremony against OUR account.
-                "alarm": c.is_self_subject && !c.takeover,
-            })
+        .map(|c| CeremonyResponse {
+            ceremony_id: hexs(&c.ceremony_id),
+            subject: hexs(&c.subject),
+            sponsor: hexs(&c.sponsor),
+            claimant_display: c.claimant_display.clone(),
+            reason: c.reason.clone(),
+            phase: c.phase.to_owned(),
+            approvals: c.approvals,
+            threshold: c.threshold,
+            is_self_subject: c.is_self_subject,
+            takeover: c.takeover,
+            trustee: c.trustee,
+            approved: c.approved,
+            alarm: c.is_self_subject && !c.takeover,
         })
         .collect()
 }
@@ -846,22 +1407,25 @@ pub async fn ceremony_status(State(st): State<AppState>) -> Json<Value> {
 
 // ---- events (WebSocket) ------------------------------------------------
 
-#[derive(Deserialize)]
-pub struct TokenQuery {
-    token: Option<String>,
-}
-
-/// `GET /api/events` (WebSocket). Browsers cannot set an `Authorization` header on a
-/// WS handshake, so the token is passed as the `token` query parameter and validated
-/// in CONSTANT TIME before the upgrade. A missing/wrong token => 401, no upgrade.
+/// `GET /api/events` (WebSocket). The browser sends the short-lived, HTTP-only session
+/// cookie that the loopback shell sets. This keeps the bearer value out of URLs and logs.
 pub async fn events(
     ws: WebSocketUpgrade,
-    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
     State(st): State<AppState>,
 ) -> Response {
-    let presented = q.token.unwrap_or_default();
-    if !auth::ct_eq_str(&presented, &st.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid token").into_response();
+    let presented = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == "carapace_session").then_some(value)
+            })
+        })
+        .unwrap_or_default();
+    if !auth::ct_eq_str(presented, &st.token) {
+        return error_response(StatusCode::UNAUTHORIZED, "missing or invalid token");
     }
     ws.on_upgrade(move |socket| push_status(socket, st))
 }
@@ -870,11 +1434,147 @@ pub async fn events(
 /// closes. A periodic full snapshot is the v1 live-status feed (§ design doc).
 async fn push_status(mut socket: WebSocket, st: AppState) {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    loop {
-        let snap = status_snapshot(&st.daemon).to_string();
+    while let Ok(snap) = serde_json::to_string(&status_snapshot(&st.daemon)) {
         if socket.send(Message::Text(snap.into())).await.is_err() {
             break;
         }
         ticker.tick().await;
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gui_status_contract_fixture_matches_typed_server_shape() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../gui/tests/fixtures/status-contract.json"
+        ))
+        .unwrap();
+        let expected = serde_json::to_value(StatusSnapshot {
+            node_id: String::new(),
+            user_id: String::new(),
+            identity_storage: String::new(),
+            sync_errors: Vec::new(),
+            addr: Vec::new(),
+            relay_url: None,
+            friends: FriendsResponse {
+                count: 0,
+                list: Vec::new(),
+                grants: Vec::new(),
+            },
+            peers: Vec::new(),
+            vaults: VaultsResponse {
+                published: Vec::new(),
+                held_replicas: Vec::new(),
+            },
+            share_health: ShareHealthResponse {
+                recovery_sets_owned: 0,
+                shares_held: 0,
+                sets: Vec::new(),
+                recovery: Vec::new(),
+            },
+            recovery_grants: RecoveryGrantsResponse {
+                minted: Vec::new(),
+                held: Vec::new(),
+            },
+            ceremonies: Vec::new(),
+            resplits: Vec::new(),
+            pending_resplits: Vec::new(),
+            reachability: "direct",
+            relay_networks: 0,
+            relay_diversity_warning: true,
+            por_latency_anomaly_count: 0,
+        })
+        .unwrap();
+        assert_eq!(fixture, expected);
+    }
+
+    #[test]
+    fn internal_error_detail_is_not_the_client_message() {
+        let error = ApiError::from(anyhow::anyhow!(
+            "secret path /private/state/root.key could not be read"
+        ));
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.client_message, "internal server error");
+        assert!(error
+            .internal
+            .as_deref()
+            .is_some_and(|detail| detail.contains("/private/state/root.key")));
+        assert!(!error.client_message.contains("root.key"));
+    }
+
+    #[test]
+    fn expected_client_error_has_no_internal_detail() {
+        let error = bad("invalid recovery set");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.client_message, "invalid recovery set");
+        assert!(error.internal.is_none());
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DirectoryQuery {
+    path: Option<String>,
+}
+
+/// Browse local folders through the same authenticated boundary as publishing.
+pub async fn directories(Query(query): Query<DirectoryQuery>) -> Result<Json<Value>, ApiError> {
+    let dir = query
+        .path
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(Into::into)
+        })
+        .ok_or_else(|| bad("Choose a folder path"))?;
+    tokio::task::spawn_blocking(move || {
+        let dir = std::fs::canonicalize(dir)?;
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                children.push(json!({"name":entry.file_name().to_string_lossy(), "path":entry.path().to_string_lossy()}));
+            }
+        }
+        children.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok::<_, anyhow::Error>(Json(json!({"path":dir.to_string_lossy(),"parent":dir.parent().map(|p|p.to_string_lossy()),"directories":children})))
+    }).await.map_err(|e| bad(e.to_string()))?.map_err(Into::into)
+}
+
+fn vault_rows(d: &Daemon) -> Vec<PublishedVaultResponse> {
+    d.live_vault_statuses()
+        .into_iter()
+        .map(|v| PublishedVaultResponse {
+            vid: hexs(&v.vid),
+            epoch: v.epoch,
+            name: v.name,
+            dir: v.dir.to_string_lossy().into_owned(),
+            watching: v.watching,
+            syncing: v.syncing,
+            last_error: v.last_error,
+            last_success: v.last_success,
+            recovery_backup: v.recovery_backup.map(|p| p.to_string_lossy().into_owned()),
+        })
+        .collect()
+}
+
+pub async fn device_card(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({"card_hex":hexs(&st.daemon.own_device_card().encode_frame())}))
+}
+#[derive(Deserialize)]
+pub struct DeviceReq {
+    card_hex: String,
+}
+pub async fn enroll_device(
+    State(st): State<AppState>,
+    Json(req): Json<DeviceReq>,
+) -> Result<Json<Value>, ApiError> {
+    let bytes = hex::decode(&req.card_hex).map_err(|_| bad("Invalid device card"))?;
+    let card =
+        carapace_wire::ContactCard::decode_frame(&bytes).map_err(|_| bad("Invalid device card"))?;
+    st.daemon.enroll_own_device(card).await?;
+    Ok(Json(json!({"enrolled":true})))
 }

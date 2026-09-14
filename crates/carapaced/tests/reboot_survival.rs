@@ -1,10 +1,6 @@
-//! Design §6 reboot-survival + at-rest sealing acceptance tests.
-//!
-//! A daemon is started against a FIXED state dir (`State::from_seeds_in`), mutated
-//! across the persisted categories, dropped, then RE-STARTED from the same dir. The
-//! durable state must survive: the published vault (epochs + re-derived manifest), the
-//! sealed owner split-state, the default-deny fetch gate's owned-chunk set, and the F3
-//! own-card version floor (strictly increasing across the restart).
+//! §6 reboot-survival + at-rest sealing tests: a daemon is started against a fixed state dir,
+//! mutated, dropped, and re-started. The published vault, sealed owner split-state, fetch-gate
+//! owned-chunk set, and F3 own-card version floor must all survive.
 
 use anyhow::Result;
 use carapaced::{Daemon, MaintenanceConfig, RecoveryScope, State};
@@ -43,10 +39,9 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
 
         let (jsons, _warn) = d.recovery_split(7, RecoveryScope::Root, 2, 3, false)?;
         assert_eq!(d.split_state_count(), 1);
-        // Pull a distinctive BIP39-style share word out of the JSON to later assert it
-        // never appears in plaintext in state.redb (the split-state is SEALed under
-        // K_root). Exclude the JSON's own structural/label words so the needle is real
-        // share material, not schema text that legitimately appears in a card.
+        // Pull a distinctive BIP39 share word to later assert it never appears in plaintext
+        // in state.redb (the split-state is SEALed). Exclude structural/label words so the
+        // needle is real share material, not schema text.
         let stop = [
             "carapace",
             "device",
@@ -78,8 +73,7 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
         d.shutdown().await;
         (vid, v1, word)
     };
-    // Give the router's accept tasks a moment to finish so every `Arc<Database>` clone
-    // drops and redb releases the single-open lock before we re-open the same file.
+    // Let the router's accept tasks finish so redb releases the single-open lock before reopen.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // ---- at-rest sealing (§5.1): no share plaintext in state.redb ----
@@ -110,11 +104,9 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
         d2.own_card_version()
     );
 
-    // The published blobs are genuinely PRESENT in the reopened FsStore — asserted
-    // directly, blob by blob. The no-op republish below proves the manifest
-    // re-derived, but on its own it cannot prove chunk survival: the no-op guard
-    // compares manifest FILE entries only, so it would pass identically with every
-    // chunk blob lost.
+    // Assert the published blobs are present in the reopened FsStore, blob by blob: the no-op
+    // republish below proves the manifest re-derived but compares file entries only, so it
+    // would pass identically with every chunk lost.
     let (digest, chunks) = d2
         .vault_blob_ids(&vid)
         .expect("vault_blobs re-derived from the FsStore envelope after reboot");
@@ -129,9 +121,8 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
         );
     }
 
-    // epochs + vault_blobs survived: re-publishing the identical tree is a no-op that
-    // returns the SAME epoch (the no-op guard compares the re-derived manifest's files,
-    // proving the manifest was rebuilt from the FsStore envelope + K_manifest).
+    // epochs + vault_blobs survived: re-publishing the identical tree is a no-op returning the
+    // same epoch (the guard compares the re-derived manifest's files).
     let epoch2 = d2.publish_vault(src.path(), vid).await?;
     assert_eq!(
         epoch2, 1,
@@ -142,11 +133,9 @@ async fn reboot_preserves_vault_split_and_card_version() -> Result<()> {
     Ok(())
 }
 
-/// The BINARY boot path (`carapace_api::serve` shape): the daemon lives in an `Arc`
-/// with the background maintenance loop running — whose rounds persist state — and
-/// is shut down via `&self` while other `Arc` clones may still exist. A published
-/// vault must survive that full lifecycle plus a reboot. The other tests here call
-/// `Daemon` directly and never start maintenance, so this path was untested.
+/// The binary boot path: the daemon lives in an `Arc` with maintenance running (whose rounds
+/// persist state) and is shut down via `&self` while other `Arc` clones exist. A published
+/// vault must survive that lifecycle plus a reboot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_boot_path_maintenance_rounds_preserve_vault() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -192,12 +181,10 @@ async fn binary_boot_path_maintenance_rounds_preserve_vault() -> Result<()> {
     Ok(())
 }
 
-/// §3.5: a vault whose manifest cannot be re-derived at startup (FsStore damage —
-/// here the whole blobs/ dir deleted between boots) must KEEP its persisted
-/// blob-source record as the durable needs-refetch set, across further reboots,
-/// until a republish repairs it. The original bug: the failed re-derive dropped the
-/// source from RAM and the next persist rewrote the VAULT_BLOBS row without it, so
-/// the vault silently vanished from every later boot with zero warnings.
+/// §3.5: a vault whose manifest cannot be re-derived at startup (here blobs/ deleted between
+/// boots) must KEEP its persisted blob-source record as needs-refetch across further reboots
+/// until a republish repairs it. The bug: the failed re-derive dropped the source and the next
+/// persist rewrote the VAULT_BLOBS row without it, silently vanishing the vault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rederive_failure_keeps_blob_source_until_republished() -> Result<()> {
     let state_dir = tempfile::tempdir()?;
@@ -216,13 +203,11 @@ async fn rederive_failure_keeps_blob_source_until_republished() -> Result<()> {
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Damage: the served blob store is gone (models the loss a pre-durability
-    // binary left behind, a botched restore, or future GC gone wrong).
+    // Damage: the served blob store is gone (a botched restore, or future GC gone wrong).
     std::fs::remove_dir_all(state_dir.path().join("blobs"))?;
 
-    // Boot 2: re-derive fails; the vault is not servable — but its blob source
-    // must be retained as needs-refetch. This boot's own startup persists are the
-    // clobber vector the bug rode in on.
+    // Boot 2: re-derive fails; the vault is not servable but its blob source must be retained
+    // as needs-refetch. This boot's own startup persists are the clobber vector.
     {
         let d = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
         assert!(
@@ -238,8 +223,8 @@ async fn rederive_failure_keeps_blob_source_until_republished() -> Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Boot 3: the record SURVIVED boot 2's persists (the regression). Republish
-    // from the working tree repairs: new epoch, listed again, record cleared.
+    // Boot 3: the record survived boot 2's persists. Republish repairs: new epoch, listed
+    // again, record cleared.
     {
         let d = Daemon::start(State::from_seeds_in(state_dir.path(), node_seed, k_root)).await?;
         assert_eq!(
@@ -267,22 +252,16 @@ async fn rederive_failure_keeps_blob_source_until_republished() -> Result<()> {
     Ok(())
 }
 
-/// The REAL binary key path: `State::load_or_generate` reads/writes `node.key` +
-/// `root.key` on disk, so a genuine process reboot re-derives `k_root` from the file
-/// rather than a fixed in-memory seed. Every other reboot test here uses
-/// `from_seeds_in` (a fixed `k_root` that trivially matches on boot 2), so none of them
-/// exercise the axis that would break if the key files did not round-trip: a mismatched
-/// boot-2 `k_root` yields a different `K_manifest`, `open_envelope` fails, and the vault
-/// is silently routed to needs-refetch (empty `published_vaults`). This asserts the
-/// derive chain survives a real load-or-generate cycle, for BOTH the plaintext-seed and
-/// the `CARAPACE_PASSPHRASE`-sealed (Argon2id) key files.
+/// The real binary key path: `State::load_or_generate` reads/writes the key files on disk, so
+/// a genuine reboot re-derives `k_root` from the file. The other reboot tests use
+/// `from_seeds_in` (a fixed `k_root`), so none exercise a key-file round-trip: a mismatched
+/// boot-2 `k_root` would fail `open_envelope` and route the vault to needs-refetch. Covers both
+/// plaintext-seed and `CARAPACE_PASSPHRASE`-sealed (Argon2id) key files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn load_or_generate_key_path_survives_reboot() -> Result<()> {
-    // No passphrase: plaintext seed files.
     reboot_via_load_or_generate(None).await?;
-    // With passphrase: Argon2id-sealed key files. The env var is process-global, so
-    // set it only for this segment and clear it immediately after. No other test in
-    // this binary reads it (they all use `from_seeds_in`, which ignores it).
+    // Argon2id-sealed key files. The env var is process-global: set only for this segment and
+    // clear immediately after (no other test in this binary reads it).
     std::env::set_var("CARAPACE_PASSPHRASE", "correct horse battery staple");
     let sealed = reboot_via_load_or_generate(Some("root.key")).await;
     std::env::remove_var("CARAPACE_PASSPHRASE");
@@ -290,17 +269,15 @@ async fn load_or_generate_key_path_survives_reboot() -> Result<()> {
     Ok(())
 }
 
-/// Boot a daemon from a real on-disk identity (`State::load_or_generate`), publish a
-/// vault, shut down, then reboot from the SAME dir via `load_or_generate` again and
-/// assert the vault is still listed (its manifest re-derived, so `k_root` round-tripped).
-/// When `sealed_key` is `Some(name)`, also assert that key file is at-rest sealed on
-/// disk (magic-prefixed, not the raw seed) so the passphrase branch is really exercised.
+/// Boot from a real on-disk identity, publish, shut down, reboot from the same dir via
+/// `load_or_generate`, and assert the vault is still listed (manifest re-derived, so `k_root`
+/// round-tripped). `sealed_key` also asserts that key file is at-rest sealed on disk.
 async fn reboot_via_load_or_generate(sealed_key: Option<&str>) -> Result<()> {
     let state_dir = tempfile::tempdir()?;
     let (src, _expected) = make_tree();
 
     let (vid, node_id, digest, chunks) = {
-        let d = Daemon::start(State::load_or_generate(state_dir.path())?).await?;
+        let d = Daemon::start(State::load_or_generate_insecure(state_dir.path())?).await?;
         let (vid, _nonce) = d.new_vid();
         assert_eq!(d.publish_vault(src.path(), vid).await?, 1);
         assert_eq!(
@@ -325,9 +302,9 @@ async fn reboot_via_load_or_generate(sealed_key: Option<&str>) -> Result<()> {
     // Let redb release its single-open lock before re-opening the same file.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Reboot from the SAME dir: re-reads the key files. If `k_root` did not round-trip,
-    // `rederive_manifest` would fail and this vault would be absent from published_vaults.
-    let d2 = Daemon::start(State::load_or_generate(state_dir.path())?).await?;
+    // Reboot from the same dir (re-reads the key files); a `k_root` that did not round-trip
+    // would fail `rederive_manifest` and drop the vault from published_vaults.
+    let d2 = Daemon::start(State::load_or_generate_insecure(state_dir.path())?).await?;
     assert_eq!(
         d2.node_id(),
         node_id,
@@ -364,6 +341,35 @@ async fn fresh_dir_boots_and_creates_state_db() -> Result<()> {
     assert!(
         state_dir.path().join("state.redb").exists(),
         "a fresh boot must create state.redb"
+    );
+    Ok(())
+}
+
+/// A missing database beside durable artifacts must fail before networking starts and must
+/// not create a replacement empty database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_state_database_fails_closed() -> Result<()> {
+    let state_dir = tempfile::tempdir()?;
+    let state = || State::from_seeds_in(state_dir.path(), [0x61; 32], [0x62; 32]);
+
+    let first = Daemon::start(state()).await?;
+    first.shutdown().await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let db_path = state_dir.path().join("state.redb");
+    std::fs::remove_file(&db_path)?;
+    let err = Daemon::start(state())
+        .await
+        .err()
+        .expect("missing durable state must fail");
+    assert!(
+        err.to_string().contains("durable artifacts exist"),
+        "unexpected startup error: {err:#}"
+    );
+    assert!(
+        !db_path.exists(),
+        "failed startup must not create an empty replacement database"
     );
     Ok(())
 }

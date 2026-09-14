@@ -14,8 +14,11 @@ import type {
 	ReplicaMembers,
 	SplitResult,
 	StatusSnapshot,
+	SyncResult,
 	Ticket,
+	TrusteeSplitResult,
 	RecoveryScope,
+	RecoveryCeremony,
 	ResplitStatus,
 	UnfriendResult
 } from './types';
@@ -120,8 +123,14 @@ const post = <T>(path: string, body?: unknown) =>
 	request<T>(path, { method: 'POST', body: body !== undefined ? JSON.stringify(body) : undefined });
 
 export const api = {
+	exportAccount: (passphrase:string) => post<{package_hex:string;user_id:string;card_hex:string}>('/api/account/export',{passphrase}),
+	importAccount: (data:{package_hex:string;passphrase:string;destination:string}) => post<{user_id:string;state_dir:string;card_hex:string;source_card_hex:string;restart_required:boolean}>('/api/account/import',data),
+	enrollDevice: (card_hex:string) => post<{enrolled:boolean}>('/api/devices',{card_hex}),
+	directories: (path?:string) => get<{path:string;parent:string|null;directories:{name:string;path:string}[]}>(`/api/directories${path ? `?path=${encodeURIComponent(path)}` : ''}`),
 	health: () => get<{ ok: boolean }>('/api/health'),
 	status: () => get<StatusSnapshot>('/api/status'),
+	syncOwned: (peer: { node: string; addrs: string[] }, out_dir: string) =>
+		post<SyncResult>('/api/sync', { peer, out_dir }),
 
 	listVaults: () => get<{ published: PublishedVault[] }>('/api/vaults'),
 	publishVault: (dir: string, vid?: string) =>
@@ -146,6 +155,7 @@ export const api = {
 	unfriend: (user_pubkey: string) =>
 		post<UnfriendResult>(`/api/friends/${user_pubkey}/unfriend`),
 	resplitStatus: (rsid: number) => get<ResplitStatus>(`/api/recovery/${rsid}/resplit-status`),
+	ceremonyStatus: () => get<{ ceremonies: RecoveryCeremony[] }>('/api/recovery/ceremony'),
 	// W15 (§8, §10.2): printable paper cards for one owned recovery set. Returns raw HTML
 	// (share WORDS - a bearer secret) the caller opens in a print view, never JSON.
 	paperCards: (rsid: number) => requestText(`/api/recovery/${rsid}/paper`),
@@ -160,6 +170,20 @@ export const api = {
 		n: number,
 		allow_over_cap?: boolean
 	) => post<SplitResult>('/api/recovery/split', { rsid, scope, m, n, allow_over_cap }),
+	recoverySplitToTrustees: (
+		rsid: number,
+		scope: RecoveryScope,
+		m: number,
+		trustees: string[],
+		allow_over_cap?: boolean
+	) =>
+		post<TrusteeSplitResult>('/api/recovery/split', {
+			rsid,
+			scope,
+			m,
+			trustees,
+			allow_over_cap
+		}),
 	recoveryResplit: (
 		rsid: number,
 		scope: RecoveryScope,
@@ -167,8 +191,24 @@ export const api = {
 		n: number,
 		allow_over_cap?: boolean
 	) => post<SplitResult>('/api/recovery/resplit', { rsid, scope, m, n, allow_over_cap }),
+	recoveryResplitToTrustees: (
+		rsid: number,
+		scope: RecoveryScope,
+		m: number,
+		trustees: string[],
+		allow_over_cap?: boolean
+	) =>
+		post<TrusteeSplitResult>('/api/recovery/resplit', {
+			rsid,
+			scope,
+			m,
+			trustees,
+			allow_over_cap
+		}),
 	recoveryExtend: (rsid: number, count: number, allow_over_cap?: boolean) =>
 		post<ExtendResult>('/api/recovery/extend', { rsid, count, allow_over_cap }),
+	restartRestore: (out_dir: string) =>
+		post<SyncResult & { maximum_epoch_refs: number }>('/api/recovery/restart-restore', { out_dir }),
 
 	ceremonyOpen: (req: {
 		subject: string;

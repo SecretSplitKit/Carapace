@@ -1,18 +1,7 @@
-//! §9.3 unfriend / re-split inbound-handler acceptance (W5), exercised over real
-//! `carapace/1` control streams between live daemons - NOT by calling the pure state
-//! functions directly. This is where the authorization lives (`serve_friendship_end`,
-//! `serve_delete_request`, `serve_share_destroy`), so it is where the tests must bind.
-//!
-//! Covered:
-//!  1. Positive: `Daemon::unfriend` drives the FriendshipEnd + DeleteRequest over the
-//!     wire and the peer actually tears down ITS side (drops the friendship, deletes the
-//!     replica it held for us).
-//!  2. Negative: a current friend cannot (a) force us to unfriend by sending a
-//!     FriendshipEnd that names a THIRD PARTY, nor (b) destroy a share we hold for an
-//!     UNRELATED owner by sending a ShareDestroy naming that owner's subject/rsid.
-//!
-//! Every test is BOUNDED: dials are capped by the daemon's connect timeout; no cadence
-//! is ever waited on; daemons are torn down at the end.
+//! §9.3 unfriend / re-split inbound-handler acceptance (W5) over real `carapace/1` control
+//! streams (where the authorization lives). Positive: `unfriend` makes the peer tear down its
+//! side. Negative: a friend cannot force us to unfriend a third party via a FriendshipEnd, nor
+//! destroy a share we hold for an unrelated owner via a ShareDestroy. Bounded.
 
 use anyhow::Result;
 use carapace_wire::{FriendshipEnd, ShareDestroy, Signed};
@@ -46,9 +35,8 @@ async fn befriend(dialer: &Daemon, issuer: &Daemon) -> Result<()> {
     Ok(())
 }
 
-/// §9.3 steps 1-2 over the wire: `unfriend` must make the EX-FRIEND tear down its own
-/// side - drop the friendship (FriendshipEnd) and delete the replica it stored for us
-/// (DeleteRequest) - not merely mutate the initiator's local state.
+/// §9.3 steps 1-2 over the wire: `unfriend` must make the EX-FRIEND drop the friendship
+/// (FriendshipEnd) and delete the replica it held (DeleteRequest), not just mutate local state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unfriend_tears_down_the_peer_over_the_wire() -> Result<()> {
     let a = Daemon::start(seeds(0x01, 0xA0)).await?;
@@ -91,9 +79,8 @@ async fn unfriend_tears_down_the_peer_over_the_wire() -> Result<()> {
     Ok(())
 }
 
-/// The authorization negatives that the two W5 blockers were about. A current friend B
-/// of the victim V must not be able to (a) forge V into unfriending B by naming a third
-/// party in a FriendshipEnd, nor (b) destroy the share V holds for an unrelated owner A.
+/// Authorization negatives: a friend B of victim V cannot (a) forge V into unfriending B by
+/// naming a third party in a FriendshipEnd, nor (b) destroy the share V holds for owner A.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn forged_friendship_end_and_share_destroy_are_rejected() -> Result<()> {
     let a = Daemon::start(seeds(0x01, 0xA1)).await?; // owner of the split secret
@@ -105,8 +92,7 @@ async fn forged_friendship_end_and_share_destroy_are_rejected() -> Result<()> {
     for t in [&b, &c, &v] {
         befriend(&a, t).await?;
     }
-    // B is an established friend of V: exactly the insider whose node V will resolve as
-    // an owner (owner B), and who is authorized on V's control stream.
+    // B is an established friend of V: the insider V resolves as owner B, authorized on V's stream.
     befriend(&b, &v).await?;
     assert!(v.is_friend(&b.user_id()));
 
@@ -156,8 +142,8 @@ async fn forged_friendship_end_and_share_destroy_are_rejected() -> Result<()> {
     );
 
     // --- (b2) ShareDestroy naming B as subject but A's rsid must be rejected ---
-    // Here owner_user_of_node(B) == subject(B) passes, but the rsid belongs to A, so the
-    // rsid->subject binding must refuse it.
+    // owner_user_of_node(B) == subject(B) passes, but the rsid belongs to A, so the
+    // rsid->subject binding refuses it.
     let mut ds_wrong_rsid = ShareDestroy {
         subject: b.user_id(),
         rsid: RSID,
@@ -178,10 +164,9 @@ async fn forged_friendship_end_and_share_destroy_are_rejected() -> Result<()> {
     Ok(())
 }
 
-/// §9.3.4 W5 (gap 1): unfriending a TRUSTEE does not auto-start the re-split. It records a
-/// PENDING one (surfaced with the suggested new set, the ex-trustee excluded) and delivers
-/// NO new grants until the user starts it via `start_pending_resplit`. This is the §9.3.4
-/// prompt flow: the user, not the daemon, decides to re-split.
+/// §9.3.4 W5: unfriending a TRUSTEE does not auto-start the re-split; it records a PENDING one
+/// (suggested new set, ex-trustee excluded) and delivers no new grants until the user starts
+/// it via `start_pending_resplit`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn unfriending_a_trustee_leaves_a_pending_resplit_until_started() -> Result<()> {
     let a = Daemon::start(seeds(0x01, 0xA2)).await?; // owner of the split secret
@@ -263,13 +248,10 @@ async fn unfriending_a_trustee_leaves_a_pending_resplit_until_started() -> Resul
     Ok(())
 }
 
-/// §9.3.1 W5 (gap 2): a daemon that RECEIVES a FriendshipEnd from a peer it placed data on
-/// must send ITS OWN DeleteRequest(s) for what it placed - deferred to the maintenance loop
-/// (the control handler has no endpoint to dial out). Here B placed a replica on A; when B
-/// receives A's FriendshipEnd, B tears down and, after a maintenance round, asks A to delete
-/// B's replica. A keeps its side of the friendship so it still honors the request and the
-/// deletion is observable end to end. A DeleteRequest never triggers a FriendshipEnd, so
-/// this cannot loop.
+/// §9.3.1 W5: a daemon that RECEIVES a FriendshipEnd must send its own DeleteRequest(s) for
+/// what it placed, deferred to the maintenance loop. B placed a replica on A; on receiving A's
+/// FriendshipEnd, B tears down and (after a round) asks A to delete it. A keeps its side of the
+/// friendship so it still honors the request, making the deletion observable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receiving_friendship_end_sends_reciprocal_delete_requests() -> Result<()> {
     let a = Daemon::start(seeds(0x01, 0xA3)).await?;
@@ -286,10 +268,8 @@ async fn receiving_friendship_end_sends_reciprocal_delete_requests() -> Result<(
     assert_eq!(placed, vec![a.node_id()], "A accepted B's replica");
     assert!(a.holds_replica(&vid), "A stores B's replica before the end");
 
-    // A sends B a validly signed FriendshipEnd naming B, but keeps its OWN friendship with
-    // B (so it still authorizes B's reciprocal DeleteRequest - we can then observe A delete
-    // B's data). This isolates the RECEIVE-path reciprocal-send; in a full mutual unfriend A
-    // would already have dropped B's data in its own teardown.
+    // A sends B a signed FriendshipEnd naming B but keeps its OWN friendship with B (so it
+    // still authorizes B's reciprocal DeleteRequest), isolating the RECEIVE-path reciprocal-send.
     let mut end = FriendshipEnd {
         user: b.user_id(),
         ts: 1_700_000_000,

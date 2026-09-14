@@ -1,21 +1,12 @@
-//! Audit #4 regression (design §3.5 / §11 default-deny after reboot).
-//!
-//! A device reaches gate state through a §11 merge (`publish_merged`): a receiver with its
-//! own concurrent edit pulls a peer's concurrent edit, reconciles, and RE-PUBLISHES the
-//! merged vault - inserting `owned_chunks` (incl. the merged manifest-envelope digest),
-//! `announces`, `grants`, and `vault_blobs`. The pre-fix `publish_merged` returned WITHOUT
-//! committing, so after a reboot the device default-denied its OWN merged blobs (owned_chunks
-//! empty) and rolled back its own announce.
-//!
-//! The merge is the LAST persisted op before the reboot (any later `persist_locked` - e.g. a
-//! disclose - would re-commit the whole state and mask the missing commit), so the reload
-//! exercises `publish_merged`'s own persistence. After reboot the fetch gate must decide from
-//! the reloaded state:
-//!
-//! - an owner device (same `k_root`) is SERVED the merge-unique envelope chunk (owned_chunks
-//!   survived - the #4 catch);
-//! - an unauthenticated stranger is REFUSED it (F1 default-deny);
-//! - a disclosed audience friend is SERVED a disclosed chunk (the audience arm survived).
+#![cfg(unix)]
+
+//! §3.5/§11 default-deny after reboot: a device reaches gate state through a §11 merge
+//! (`publish_merged` inserts owned_chunks incl. the merged envelope digest, announces, grants,
+//! vault_blobs). The pre-fix `publish_merged` returned WITHOUT committing, so a reboot
+//! default-denied the device's OWN merged blobs. The merge is the LAST persisted op before the
+//! reboot (a later persist would mask the missing commit). After reboot the fetch gate must
+//! serve an owner device the merge-unique chunk, refuse an unauthenticated stranger, and serve
+//! a disclosed audience friend a disclosed chunk.
 
 use anyhow::{Context, Result};
 use carapaced::{Daemon, State};
@@ -62,9 +53,8 @@ async fn default_deny_survives_reboot_after_merge() -> Result<()> {
         assert_eq!(a.publish_vault(src_a.path(), vid).await?, 1);
         assert_eq!(b.publish_vault(src_b.path(), vid).await?, 1);
 
-        // Friendship + disclosure of B's OWN published chunk to F, BEFORE the merge. This
-        // persists (whole-state), so it must precede the merge - otherwise its commit would
-        // mask publish_merged's missing one. The disclosed chunk is B's notes.txt chunk,
+        // Friendship + disclosure BEFORE the merge (its whole-state persist would otherwise
+        // mask publish_merged's missing commit). The disclosed chunk is B's notes.txt chunk,
         // owned via publish_vault and retained across the merge (owned_chunks is additive).
         befriend(&b, &f).await?;
         let grant = b.disclose_files(vid, &["notes.txt"], &[f.user_id()])?;
@@ -73,9 +63,8 @@ async fn default_deny_survives_reboot_after_merge() -> Result<()> {
             .first()
             .context("disclosure grant covers a chunk")?;
 
-        // A single directed pull: B sees A's concurrent edit, merges, and runs
-        // `publish_merged` - the LAST persisted op before the reboot. It inserts the merged
-        // manifest-envelope digest into owned_chunks.
+        // A single directed pull: B merges A's concurrent edit and runs `publish_merged` (the
+        // LAST persisted op before the reboot), inserting the merged envelope digest into owned_chunks.
         let out = tempfile::tempdir()?;
         let recon = b.sync_from(a.addr()?, out.path()).await?;
         assert!(
@@ -102,8 +91,7 @@ async fn default_deny_survives_reboot_after_merge() -> Result<()> {
     // ---- reboot B from the SAME dir: gate state must be reloaded from disk ----
     let b2 = Daemon::start(State::from_seeds_in(b_dir.path(), b_seed, K_ROOT)).await?;
 
-    // Robust non-network signal for #4: the merge-unique owned chunk survived. Pre-fix, the
-    // merged owned_chunks/announce were never committed, so this is absent after reload.
+    // The merge-unique owned chunk survived (pre-fix it was never committed, absent after reload).
     assert!(
         b2.owns_chunk(&merged_digest),
         "audit #4: publish_merged's owned_chunks (merged envelope digest) must survive the reboot"
@@ -132,9 +120,8 @@ async fn default_deny_survives_reboot_after_merge() -> Result<()> {
         "an unauthenticated stranger is refused (F1 default-deny)"
     );
 
-    // (3) disclosed audience friend: authenticate (classifies F as a friend), then fetch the
-    // disclosed chunk. Served only because BOTH owned_chunks and the disclosure audience
-    // survived the reboot.
+    // (3) disclosed audience friend: authenticate, then fetch the disclosed chunk. Served only
+    // because BOTH owned_chunks and the disclosure audience survived the reboot.
     f.pull_doc_counts(b2_addr.clone())
         .await
         .context("friend authenticates to rebooted B")?;

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! W7 anti-entropy store-and-forward (§6): "reach any one friend re-syncs the rest."
 //!
 //! A and C are NOT friends and never dial each other; both friend B. A's signed

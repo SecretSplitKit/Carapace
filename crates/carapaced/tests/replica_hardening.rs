@@ -1,12 +1,8 @@
-//! Phase-3 hardening acceptance for the replica-store receive path:
-//!
-//! - S4: owner-side placement only invites established friends that are not on the
-//!   owner deny-list; a stranger or a denied friend is skipped.
-//! - W1: a friend's per-friend agreed storage grant is enforced as its replica
-//!   quota (a placement over that friend's grant is declined and the store does
-//!   not grow), two friends with different agreed grants are enforced
-//!   independently, and a peer over its push rate limit is throttled - while an
-//!   honest within-grant placement still succeeds.
+//! Phase-3 hardening for the replica-store receive path:
+//! - S4: placement invites only established friends not on the owner deny-list.
+//! - W1: a friend's agreed storage grant is enforced as its replica quota (over-grant declined,
+//!   per-friend grants enforced independently, rate limit throttles), while an honest
+//!   within-grant placement succeeds.
 
 use anyhow::Result;
 use carapaced::{Daemon, ReplicaLimits, State};
@@ -139,11 +135,9 @@ async fn w1_quota_and_rate_limit_cut_off_pushes() -> Result<()> {
     Ok(())
 }
 
-// W1 per-friend: one storage node grants two friends different limits and
-// enforces them independently by WHO is placing. `store` grants `small` only 10
-// bytes but `big` the 1 GiB default; a real placement is refused from `small`
-// yet accepted from `big`, proving the quota is sourced per-friend (looked up by
-// the placing friend's user pubkey), not from a single global default.
+// W1 per-friend: `store` grants `small` 10 bytes but `big` the default; the same-size
+// placement is refused from `small` yet accepted from `big`, proving the quota is per-friend
+// (by placing user pubkey), not a single global default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w1_per_friend_grants_enforced_independently() -> Result<()> {
     let store = Daemon::start(seeds(0x03, 0xA2)).await?; // the storage node

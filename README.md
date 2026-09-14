@@ -28,7 +28,7 @@ See `carapace-protocol.md` for the normative spec.
 
 ## Building
 
-Requires a stable Rust toolchain (edition 2021).
+Requires Rust 1.95.0, Node.js 24.18.0, and npm 11.16.0.
 
 Carapace depends on `chela-engine`, `chela-bip39`, and `chela-share` via path
 dependencies (`../../../chela/...` from `crates/carapace-recovery`), so the
@@ -46,7 +46,9 @@ mkdir some-parent-dir && cd some-parent-dir
 git clone https://github.com/SecretSplitKit/Carapace.git Carapace
 git clone https://github.com/SecretSplitKit/Chela.git chela
 cd Carapace
-cargo build --release
+git -C ../chela checkout "$(cat chela-revision.txt)"
+cd gui && npm ci && npm run build && cd ..
+cargo build --release --locked
 ```
 
 ### Verify
@@ -57,7 +59,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## Running the daemon
+## Running on a desktop or laptop
+
+Launch `carapaced` with no arguments to use the platform data directory and open
+the interface in your default browser. Production identities use protected local
+key storage. Saved folders resume watching when the daemon restarts.
+
+The default data directory is `%LOCALAPPDATA%\Carapace` on Windows,
+`~/Library/Application Support/Carapace` on macOS, and
+`${XDG_DATA_HOME:-~/.local/share}/carapace` on Linux. The automatic launch uses
+loopback API port `43821`. Use `carapaced --help` for command options.
+
+For scripts, use an explicit state directory; add `--open` to open the browser:
 
 ```sh
 carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>]
@@ -65,7 +78,37 @@ carapaced run --state-dir <PATH> [--publish <DIR> --vid <64-hex>]
 
 `--state-dir` holds the daemon's persisted identity/state and is required.
 On start it binds the endpoint, serves the blob store and control protocol,
-and prints this device's node id and dialable address. With `--publish
+and prints this device's node id, API URL, and dialable address. With `--publish
 <DIR>`, it ingests and publishes that directory as a vault (generating a new
-vault id, or reusing one passed via `--vid`). It then idles, serving peers,
-until Ctrl-C.
+vault id, or reusing one passed via `--vid`). The daemon watches saved folders and syncs enrolled devices until Ctrl-C.
+The HTTP control API stays on loopback; the peer endpoint listens on the local
+network. Use `--bind` to select a specific address. The explicit development-only
+`--insecure-plaintext-keys` mode remains loopback-only.
+
+
+## Protecting your account
+
+Add friends with invite tickets, choose a folder, and select friends to hold its
+encrypted replicas. Under Recovery, choose trustees and the recovery threshold.
+The overview distinguishes delivered and verified shares; a newly created split
+alone is not proof of recovery. Replica membership alone does not prove that every
+current file is available. Rehearse a restore before depending on Carapace.
+
+Use **Account and devices** to transfer an account to another computer. Create an
+encrypted package, send its passphrase separately, import into a new state folder,
+and return the new device card to the original computer. Restart using the new
+state folder. This does not switch the running account automatically.
+
+For recovery after losing devices, start `carapaced claimant --state-dir <PATH>`
+and open the printed local URL. Give its public request to a trustee, confirm the
+account identifier independently, and follow the approval and restart steps.
+Keep the claimant state folder so an interrupted attempt can resume. Connections
+across separate networks need reachable peers or configured relays.
+
+See [key storage](docs/key-storage.md), [claimant recovery](docs/claimant-recovery-boundary.md),
+and [supported platforms](docs/supported-platforms.md) for operational details.
+
+The current restore limits are 4 GiB per file, 64 GiB per folder operation, and
+100,000 file entries. Publication checks these limits too. Folders with names
+that collide under supported case/Unicode rules or contain unsupported paths
+are rejected explicitly; Carapace does not silently rename them.

@@ -1,14 +1,7 @@
-//! W4 background maintenance loop (§10.1): a maintenance round detects a dropped
-//! replica and triggers repair onto a spare.
-//!
-//! Two shapes, both BOUNDED (§11 lesson: never wait a real cadence):
-//! - `maintenance_round_detects_loss_and_repairs` drives `Daemon::maintenance_round`
-//!   directly with an injected fast clock, so the PoR schedule + fail-streak logic is
-//!   deterministic (no wall-clock waiting).
-//! - `maintenance_loop_repairs_and_tears_down` runs the REAL spawned loop
-//!   (`run_maintenance`) with a tiny tick + PoR interval, polls under a hard timeout
-//!   until the repair lands, then tears the loop down and reclaims the daemon — proving
-//!   the loop actually ticks and shuts down cleanly.
+//! W4 background maintenance loop (§10.1): a round detects a dropped replica and repairs onto
+//! a spare. Bounded: one test drives `maintenance_round` with an injected clock; the other runs
+//! the REAL spawned loop with a tiny tick, polls under a hard timeout until the repair lands,
+//! then tears the loop down and reclaims the daemon (proving clean tick + shutdown).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,9 +53,8 @@ async fn maintenance_round_detects_loss_and_repairs() -> Result<()> {
     a.inject_lost_member_for_test(vid, b.node_id());
     assert!(a.replica_members(&vid).contains(&b.node_id()));
 
-    // Drive maintenance rounds with a fast clock: B is reachable (a friend) but serves
-    // no chunk, so each round scores a retention failure; after the fail limit it is
-    // confirmed lost and repaired onto C (the only non-member friend candidate).
+    // Drive rounds with a fast clock: B is reachable but serves no chunk, so each round scores
+    // a retention failure; past the fail limit it is confirmed lost and repaired onto C.
     let mut now = 1_000_000u64;
     let mut repaired = false;
     for _ in 0..(DEFAULT_POR_FAIL_LIMIT as u64 + 2) {

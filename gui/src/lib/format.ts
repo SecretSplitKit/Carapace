@@ -1,3 +1,5 @@
+import { reportError } from './errors';
+
 /** Truncate a hex id/hash to `head…tail` for display; the full value stays in `title`/copy. */
 export function truncateHex(hex: string, head = 8, tail = 6): string {
 	if (hex.length <= head + tail + 1) return hex;
@@ -9,6 +11,7 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 		await navigator.clipboard.writeText(text);
 		return true;
 	} catch {
+		reportError('Could not copy to the clipboard. Select and copy the value manually.');
 		return false;
 	}
 }

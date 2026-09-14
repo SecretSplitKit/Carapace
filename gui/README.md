@@ -1,42 +1,60 @@
-# sv
+# Carapace GUI
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+This Svelte application is the loopback control interface for the Carapace daemon. The
+production build is embedded in `crates/carapace-api/static`. It is not a separate remote
+web service.
 
-## Creating a project
+## Requirements
 
-If you're seeing this, you've probably already done this step. Congrats!
+- Use the Node and npm versions in the repository configuration.
+- Run the daemon on the same computer as the browser.
+- Keep the API token private. The daemon creates it with restricted access in its state
+  directory.
+
+## Development
+
+Install the locked dependencies and run the type checks:
 
 ```sh
-# create a new project
-npx sv create my-app
+npm ci
+npm run check
+npm test
+npx playwright install chromium
+npm run test:browser
 ```
 
-To recreate this project with the same configuration:
+The source and rendered-component tests check API authentication, accessible alerts,
+clipboard success and failure, and deliberate WebSocket retry and shutdown. The Playwright
+suite runs desktop and mobile Chromium. It checks keyboard focus, axe accessibility rules,
+destructive confirmations, claimant activation, clipboard feedback, and viewport overflow.
+CI installs the Chromium build that the exact Playwright dependency selects.
 
-```sh
-# recreate this project
-npx sv@0.16.3 create --template minimal --types ts --no-install gui
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+Start the development server only for local interface work:
 
 ```sh
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
 
-## Building
+The GUI expects the authenticated Carapace API. Do not expose the development server or
+the daemon API to another computer.
 
-To create a production version of your app:
+## Production build
+
+Build the embedded files:
 
 ```sh
 npm run build
 ```
 
-You can preview the production build with `npm run preview`.
+The build writes to `../crates/carapace-api/static`. Commit the source and generated files
+together. CI rebuilds the GUI and fails if the generated output differs.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+## Security model
+
+The daemon is authoritative for vault, friendship, storage-grant, replica, and recovery
+state. Browser storage holds presentation preferences only. Recovery scope, threshold,
+issued-share count, trustee delivery, warnings, alarms, and storage grants come from the
+authenticated status response.
+
+Never put shares, root keys, passphrases, decrypted grants, or API tokens in logs, error
+reports, browser storage, or screenshots.

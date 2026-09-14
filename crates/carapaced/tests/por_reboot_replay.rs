@@ -1,15 +1,8 @@
-//! Audit #1 + #6 regression: the PoR round counter (the challenge-unpredictability
-//! nonce, §10.1) must be advanced + persisted at ISSUE time and must survive a reboot,
-//! so a restarted daemon resumes at the NEXT round and never re-issues an already-observed
-//! (hence predictable) challenge to the same replica.
-//!
-//! - #6: `por_audit_round` advances + commits the round BEFORE probing the replica, so
-//!   even a round that turns out unreachable advances the counter (the pre-fix code left
-//!   the round untouched on an unreachable probe, so a crash after a revealed challenge
-//!   re-issued it).
-//! - #1: `run_maintenance` stamps its interval with `AuditTracker::restamp`, which KEEPS
-//!   the per-(replica,vid) round map (the pre-fix `AuditTracker::new` wiped it, resetting
-//!   every replica to round 0 at boot).
+//! PoR round-counter reboot regression: the round counter (§10.1 challenge nonce) advances and
+//! persists at ISSUE time, so a restarted daemon resumes at the next round and never re-issues a
+//! predictable challenge. `por_audit_round` commits the advance before probing (an unreachable
+//! round still advances); `run_maintenance` restamps cadence while keeping the per-(replica,vid)
+//! round map.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,10 +44,8 @@ async fn por_round_never_replays_across_reboot() -> Result<()> {
         let (vid, _n) = a.new_vid();
         a.publish_vault(src.path(), vid).await?;
 
-        // Each round is due (the tracker starts unscheduled / the schedule elapses), and
-        // each ADVANCES the round counter at issue time even though the probe fails
-        // unreachable - this is the #6 property. With the pre-fix code the counter would
-        // stay 0 across all three unreachable rounds.
+        // Each round is due and ADVANCES the round counter at issue time even though the probe
+        // fails unreachable (pre-fix, the counter stayed 0 across all three).
         let mut now = 1_000_000u64;
         for i in 0..3u64 {
             let round = a
@@ -94,11 +85,9 @@ async fn por_round_never_replays_across_reboot() -> Result<()> {
         "the PoR round counter survived the reboot (never rewound to a spent round)"
     );
 
-    // #1: starting the maintenance loop stamps the cadence via `restamp`, which must KEEP
-    // the round map. The pre-fix `s.por = AuditTracker::new(..)` wiped it back to 0.
+    // Starting the maintenance loop restamps the cadence, which must KEEP the round map.
     let cfg = MaintenanceConfig {
-        // A long tick + interval so the background loop does not run a real audit round
-        // (and there are no placed replica members for it to audit anyway) before we read.
+        // A long tick + interval so the loop does not run a real audit round before we read.
         tick: Duration::from_secs(3600),
         por_interval: Duration::from_secs(6 * 3600),
     };

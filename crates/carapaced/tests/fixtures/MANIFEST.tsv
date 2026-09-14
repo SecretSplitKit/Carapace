@@ -1,0 +1,2 @@
+file	encoded_sha256	decoded_sha256	classification
+legacy-rich-v1.redb.gz.b64	85c31ff15380046201ca9a254080fad57eb1d4c2df841af28011977c803b12f3	bdd54a5e2959a14914002fe7e298cdb0976702dff9dbed3bb5e16b34835420f8	synthetic-test-state-no-production-secrets

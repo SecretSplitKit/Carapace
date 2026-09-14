@@ -1,33 +1,21 @@
-//! Durable runtime-state persistence (design §3.2-§3.5).
-//!
-//! `state.redb` is the source of truth on disk. In-RAM `Shared` stays the hot read
-//! path; every mutation boundary funnels the WHOLE `Shared` + `DocStore` back to disk
-//! in one redb transaction via [`persist_all`], then commits. The state is KB-MB, so
-//! re-persisting all of it per mutation is cheap and CORRECT by construction: a field
-//! cannot be silently forgotten because [`persist_all`] destructures `Shared` with no
-//! `..` glob, and adding a `Shared` field fails to compile until it is categorized
-//! (SEAL / PLAIN / EPH / DERIVE per design §3.3).
-//!
-//! ponytail: whole-state re-persist per mutation. Optimize to per-table incremental
-//! writes only if profiling shows the funnel is hot (KB-MB state makes it a non-issue
-//! for a personal-scale daemon).
-//!
-//! Secret categories (Shamir shares, Chela split polynomials, share grants) are AEAD
-//! -sealed under `HKDF(K_root,"carapace/v1/state-seal")` (`carapace_crypto::state_seal`)
-//! BEFORE the bytes touch redb. Everything else is signed/public metadata stored plain.
+//! Durable runtime-state persistence. `state.redb` is the on-disk source of truth;
+//! every mutation funnels the whole `Shared` + `DocStore` back in one redb txn via
+//! [`persist_all`]. State is KB-MB, so re-persisting all of it per mutation is cheap;
+//! `persist_all` destructures `Shared` with no `..` glob, so a new field fails to
+//! compile until categorized (SEAL / PLAIN / EPH / DERIVE). Secret categories are
+//! AEAD-sealed under `HKDF(K_root,"carapace/v1/state-seal")` before touching redb.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-// Types + serialization helpers reached through the crate root (child modules see the
-// parent's private items and its `use` imports).
 use super::{
-    AlarmRecord, EndpointAddr, EndpointId, GrantedTrustee, OpenResplit, OwnerGrants,
-    PendingResplit, Placement, RecoveryScope, RecoverySet, ResplitPeer, Shared, TrackedCeremony,
-    VaultBlobs,
+    signer_qualifies, AlarmRecord, CeremonyTerminal, CeremonyTombstone, EndpointAddr, EndpointId,
+    GrantedTrustee, OpenResplit, OwnerGrants, PendingResplit, Placement, RecoveryScope,
+    RecoverySet, ResplitPeer, Shared, TrackedCeremony, VaultBlobs, MAX_CEREMONY_TOMBSTONES,
+    MAX_RECOVERY_OPENS_PER_WINDOW, MAX_RECOVERY_RATE_KEYS,
 };
 use carapace_crypto::state_seal;
 use carapace_disclose::DisclosureTable;
@@ -41,17 +29,35 @@ use carapace_wire::{
     AnnounceRef, CeremonyAbort, ContactCard, Friendship, ShareGrant, VaultAnnounce,
 };
 
-/// The single redb table: category name -> serialized (and, for SEAL categories,
-/// state-sealed) blob. One row per persisted category; re-persist-all overwrites
-/// every row each mutation.
+/// The single redb table: category name -> serialized (SEAL categories additionally
+/// state-sealed) blob. One row per category.
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
 
-// -------------------------------------------------------------------------
-// Length-prefixed binary codec (fuzz-safe reader with explicit bounds checks).
-// -------------------------------------------------------------------------
+/// Current redb schema version. This is independent of the sealed-row AAD format version.
+const CURRENT_SCHEMA_VERSION: u32 = 2;
+const MIN_SCHEMA_VERSION: u32 = 1;
 
-/// A little append-only encoder. Fixed-width fields are written raw; variable-width
-/// fields (`bytes`) are length-prefixed with a big-endian `u32`.
+/// Upgrade class for the currently supported state schemas.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationPolicy {
+    Current,
+    /// Only the four-byte schema marker changes after every category validates.
+    AdditiveMarker,
+}
+
+#[cfg(test)]
+fn migration_policy(stored: Option<u32>) -> MigrationPolicy {
+    match stored {
+        Some(CURRENT_SCHEMA_VERSION) => MigrationPolicy::Current,
+        None | Some(MIN_SCHEMA_VERSION) => MigrationPolicy::AdditiveMarker,
+        Some(_) => unreachable!("read_schema_version rejects unsupported versions"),
+    }
+}
+
+// Length-prefixed binary codec: variable-width `bytes` fields carry a big-endian u32
+// length prefix; the reader bounds-checks every read.
+
 pub(crate) struct W {
     buf: Vec<u8>,
 }
@@ -69,16 +75,13 @@ impl W {
     pub(crate) fn u64(&mut self, x: u64) {
         self.buf.extend_from_slice(&x.to_be_bytes());
     }
-    /// A `usize` count/length, capped into a `u32` (state is KB-MB; no legitimate
-    /// count exceeds `u32`).
     pub(crate) fn len(&mut self, x: usize) {
         self.u32(u32::try_from(x).expect("persist count fits u32"));
     }
-    /// Raw fixed-width bytes, no length prefix (the reader must know the width).
+    /// Raw fixed-width bytes, no length prefix (reader must know the width).
     pub(crate) fn fixed(&mut self, b: &[u8]) {
         self.buf.extend_from_slice(b);
     }
-    /// Length-prefixed variable bytes.
     pub(crate) fn bytes(&mut self, b: &[u8]) {
         self.len(b.len());
         self.buf.extend_from_slice(b);
@@ -91,8 +94,7 @@ impl W {
     }
 }
 
-/// A bounds-checked decoder. Every read is guarded; malformed/truncated input is a
-/// loud error, never a panic or a partial read.
+/// A bounds-checked decoder: malformed/truncated input is a loud error, never a panic.
 pub(crate) struct R<'a> {
     b: &'a [u8],
     pos: usize,
@@ -102,14 +104,14 @@ impl<'a> R<'a> {
     pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
-    /// A safe pre-allocation size for `n` upcoming elements: capped by the bytes still
-    /// unconsumed (audit #11). Every element consumes at least one byte, so a legitimate
-    /// count can never exceed the remaining length; a hostile length prefix
-    /// (e.g. `0xFFFFFFFF` on an unauthenticated PLAIN row) is clamped to the real input
-    /// size instead of triggering a multi-GB eager `with_capacity` OOM before the loop
-    /// errors on truncation.
+    /// Safe pre-alloc size for `n` upcoming elements, capped by unconsumed bytes: every
+    /// element eats >=1 byte, so this clamps a hostile length prefix to real input size
+    /// instead of a multi-GB eager `with_capacity` OOM before the loop errors.
     fn cap(&self, n: usize) -> usize {
         n.min(self.b.len().saturating_sub(self.pos))
+    }
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.pos)
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).context("persist length overflow")?;
@@ -133,7 +135,6 @@ impl<'a> R<'a> {
             self.take(8)?.try_into().expect("8 bytes"),
         ))
     }
-    /// A length/count field, returned as `usize`.
     pub(crate) fn len(&mut self) -> Result<usize> {
         Ok(self.u32()? as usize)
     }
@@ -146,7 +147,6 @@ impl<'a> R<'a> {
     pub(crate) fn arr64(&mut self) -> Result<[u8; 64]> {
         Ok(self.take(64)?.try_into().expect("64 bytes"))
     }
-    /// Length-prefixed variable bytes.
     pub(crate) fn bytes(&mut self) -> Result<&'a [u8]> {
         let n = self.len()?;
         self.take(n)
@@ -154,31 +154,60 @@ impl<'a> R<'a> {
     pub(crate) fn bool(&mut self) -> Result<bool> {
         Ok(self.u8()? != 0)
     }
-    /// True once every byte has been consumed (a trailing-garbage guard for callers
-    /// that expect an exact-fit blob).
-    #[cfg(test)]
+    /// True once every byte has been consumed (trailing-garbage guard).
     pub(crate) fn done(&self) -> bool {
         self.pos == self.b.len()
     }
 }
 
-// -------------------------------------------------------------------------
-// Database open (0600).
-// -------------------------------------------------------------------------
-
 /// Open (creating if absent) `state.redb` at `path`, restricting it to `0600` on unix.
-/// On a non-unix host the same caveat as `state.rs::write_secret` applies (set
-/// `CARAPACE_PASSPHRASE` so secrets are additionally sealed under `K_root`).
 pub(crate) fn open_db(path: &Path) -> Result<Database> {
+    #[cfg(unix)]
+    let db = {
+        use rustix::fs::{openat, Mode, OFlags, CWD};
+
+        let descriptor = openat(
+            CWD,
+            path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("open private state db {path:?}"))?;
+        Database::builder()
+            .create_file(std::fs::File::from(descriptor))
+            .with_context(|| format!("open state db {path:?}"))?
+    };
+    #[cfg(not(unix))]
     let db = Database::create(path).with_context(|| format!("open state db {path:?}"))?;
-    // Create-then-chmod leaves a brief default-perm window (mirrors the identity-file
-    // caveat in state.rs); acceptable for the demo posture.
     restrict_perms(path)?;
     Ok(db)
 }
 
-/// Whether `state.redb` already exists (design §3.5 tripwire: blobs/keys present but no
-/// state.redb => a wiped/mismatched state dir, fail/warn loudly rather than start fresh).
+/// Open an existing state database without creating it or changing its permissions.
+pub(crate) fn open_existing_db(path: &Path) -> Result<Database> {
+    ensure!(path.is_file(), "state database {path:?} does not exist");
+    #[cfg(unix)]
+    {
+        use rustix::fs::{openat, Mode, OFlags, CWD};
+        let descriptor = openat(
+            CWD,
+            path,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("open existing private state db {path:?}"))?;
+        Database::builder()
+            .create_file(std::fs::File::from(descriptor))
+            .with_context(|| format!("open existing state db {path:?}"))
+    }
+    #[cfg(not(unix))]
+    Database::open(path).with_context(|| format!("open existing state db {path:?}"))
+}
+
+/// Whether `state.redb` already exists (startup tripwire: blobs/keys present but no
+/// state.redb => a wiped/mismatched state dir, fail loudly rather than start fresh).
 pub(crate) fn db_exists(path: &Path) -> bool {
     path.exists()
 }
@@ -195,10 +224,6 @@ fn restrict_perms(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// -------------------------------------------------------------------------
-// Raw category read/write (used by persist_all / load_all).
-// -------------------------------------------------------------------------
-
 /// Read one category blob from a read transaction; `None` if the row is absent.
 pub(crate) fn read_row(db: &Database, key: &str) -> Result<Option<Vec<u8>>> {
     let txn = db.begin_read().context("begin read txn")?;
@@ -214,10 +239,7 @@ pub(crate) fn read_row(db: &Database, key: &str) -> Result<Option<Vec<u8>>> {
         .map(|v| v.value().to_vec()))
 }
 
-// -------------------------------------------------------------------------
-// Category row keys (design §3.3). One redb row per category.
-// -------------------------------------------------------------------------
-
+// Category row keys: one redb row per category.
 mod cat {
     // PLAIN (signed/public/metadata; no secret).
     pub const CARDS: &str = "cards";
@@ -243,6 +265,10 @@ mod cat {
     pub const CEREMONIES: &str = "ceremonies";
     pub const CEREMONY_ALARMS: &str = "ceremony_alarms";
     pub const ABORTED_CEREMONIES: &str = "aborted_ceremonies";
+    pub const CEREMONY_SUBJECT_RATE: &str = "ceremony_subject_rate";
+    pub const CEREMONY_SPONSOR_RATE: &str = "ceremony_sponsor_rate";
+    pub const CEREMONY_TOMBSTONES: &str = "ceremony_tombstones";
+    pub const CEREMONY_RELEASED: &str = "ceremony_released";
     pub const PENDING_RESPLITS: &str = "pending_resplits";
     pub const PENDING_DELETE_SENDS: &str = "pending_delete_sends";
     pub const UNFRIENDED_NODES: &str = "unfriended_nodes";
@@ -250,6 +276,7 @@ mod cat {
     pub const DOC_CARDS: &str = "doc_cards";
     pub const DOC_ANNOUNCES: &str = "doc_announces";
     pub const CARD_VERSION: &str = "card_version"; // F3 monotonic own-card version floor
+    pub const SCHEMA_VERSION: &str = "schema_version";
 
     // SEAL (AEAD-sealed under HKDF(K_root,"carapace/v1/state-seal") before touching redb).
     pub const HELD_SHARES: &str = "held_shares";
@@ -257,16 +284,58 @@ mod cat {
     pub const GRANTED: &str = "granted";
     pub const SPLIT_STATES: &str = "split_states";
     pub const RESPLITS: &str = "resplits";
+    pub const IDENTITY: &str = "identity";
 }
 
-/// The redb table name used as the `state_seal` aad `table` component for every SEAL
-/// row (the per-row `key` is the category name), binding a sealed blob to its exact
-/// slot so a cross-category relocation fails to open (design §3.4).
+/// Every row a schema-2 database must contain, even when its logical collection is empty.
+const REQUIRED_SCHEMA2_CATEGORIES: &[&str] = &[
+    cat::CARDS,
+    cat::ANNOUNCES,
+    cat::GRANTS,
+    cat::EPOCHS,
+    cat::FRIENDSHIPS,
+    cat::FRIENDS,
+    cat::FRIEND_GRANTS,
+    cat::WORKING_DIRS,
+    cat::OWNED_CHUNKS,
+    cat::MEMBERS,
+    cat::REPLICA_TARGET,
+    cat::HELD,
+    cat::REPLICA_CHUNKS,
+    cat::REPLICA_OWNER,
+    cat::REPLICA_MEMBERS,
+    cat::REPLICA_ANNOUNCE,
+    cat::REPLICA_DENY,
+    cat::HELD_SHARE_SUBJECTS,
+    cat::DISCLOSURE,
+    cat::POR,
+    cat::CEREMONIES,
+    cat::CEREMONY_ALARMS,
+    cat::ABORTED_CEREMONIES,
+    cat::CEREMONY_SUBJECT_RATE,
+    cat::CEREMONY_SPONSOR_RATE,
+    cat::CEREMONY_TOMBSTONES,
+    cat::CEREMONY_RELEASED,
+    cat::PENDING_RESPLITS,
+    cat::PENDING_DELETE_SENDS,
+    cat::UNFRIENDED_NODES,
+    cat::VAULT_BLOBS,
+    cat::DOC_CARDS,
+    cat::DOC_ANNOUNCES,
+    cat::CARD_VERSION,
+    cat::HELD_SHARES,
+    cat::HELD_GRANTS,
+    cat::GRANTED,
+    cat::SPLIT_STATES,
+    cat::RESPLITS,
+    cat::IDENTITY,
+];
+
+/// The `state_seal` aad `table` component for every SEAL row (per-row `key` is the
+/// category name): binds a sealed blob to its slot so a cross-category move fails to open.
 const SEAL_TABLE: &[u8] = b"state";
 
-// -------------------------------------------------------------------------
 // Leaf encoders/decoders shared across categories.
-// -------------------------------------------------------------------------
 
 fn enc_set32(w: &mut W, set: &HashSet<[u8; 32]>) {
     w.len(set.len());
@@ -356,8 +425,6 @@ fn dec_frame_list<M: Message>(r: &mut R) -> Result<Vec<M>> {
     Ok(out)
 }
 
-/// A `HashMap<[u8;32], M>` where `M` is a framed message (the key is stored explicitly
-/// even when it equals the message signer, so load never has to re-derive it).
 fn enc_map32_frame<M: Message>(w: &mut W, m: &HashMap<[u8; 32], M>) {
     w.len(m.len());
     for (k, v) in m {
@@ -442,8 +509,7 @@ fn dec_scope(r: &mut R) -> Result<RecoveryScope> {
     }
 }
 
-/// One owner-held trustee record (embeds a secret `Share` via its canonical JSON).
-/// Only ever written inside a SEAL row.
+/// One owner-held trustee record (embeds a secret `Share`; only written in a SEAL row).
 fn enc_granted_trustee(w: &mut W, t: &GrantedTrustee) {
     w.fixed(&t.user);
     w.fixed(&t.node);
@@ -487,22 +553,18 @@ fn dec_resplit_peer(r: &mut R) -> Result<ResplitPeer> {
     Ok(ResplitPeer { node, grant })
 }
 
-// -------------------------------------------------------------------------
-// The funnel (design §3.2.1): persist the WHOLE Shared + DocStore in one txn.
-// -------------------------------------------------------------------------
+// The funnel: persist the whole Shared + DocStore in one txn.
 
 /// Persist every durable category of `Shared` + `docs` into `txn`, sealing secret
-/// categories under `k_root` first. The caller commits `txn` (design §3.2.3:
-/// commit BEFORE any externally visible effect) and crashes on commit failure.
-///
-/// EXHAUSTIVE + COMPILE-ENFORCED (design §3.2.1): `Shared` is destructured with NO
-/// `..` glob, so every field is either persisted or explicitly discarded here. Adding
-/// a `Shared` field fails to compile until it is categorized.
+/// categories under `k_root` first. Caller commits `txn` BEFORE any externally visible
+/// effect and crashes on commit failure. `Shared` is destructured with no `..` glob, so
+/// every field is persisted or explicitly discarded and a new field fails to compile.
 pub(crate) fn persist_all(
     txn: &redb::WriteTransaction,
     s: &Shared,
     docs: &DocStore,
     k_root: &[u8; 32],
+    identity: &StateIdentity,
 ) -> Result<()> {
     let Shared {
         // --- SEAL ---
@@ -535,15 +597,19 @@ pub(crate) fn persist_all(
         ceremonies,
         ceremony_alarms,
         aborted_ceremonies,
+        ceremony_subject_rate,
+        ceremony_sponsor_rate,
+        ceremony_tombstones,
+        ceremony_released,
         pending_resplits,
         pending_delete_sends,
         unfriended_nodes,
         // --- DERIVE ---
         vault_blobs,
         needs_refetch,
-        // --- PLAIN-rebuild: reconstructed from `granted` at load (§3.3) ---
+        // --- PLAIN-rebuild: reconstructed from `granted` at load ---
         share_sets,
-        // --- EPH: rebuilt on reconnect / never persisted (§3.3) ---
+        // --- EPH: rebuilt on reconnect / never persisted ---
         tickets,
         peer_addrs,
         peer_last_seen,
@@ -551,12 +617,12 @@ pub(crate) fn persist_all(
         relay_health,
         vault_keys,
         blob_auth,
+        root_split_pending,
         test_now,
     } = s;
 
-    // EPH: address/liveness caches, rate limiter, per-session auth, test clock,
-    // outstanding invite tickets (die on reboot -> TicketUnknown, acceptable), and
-    // vault chunk keys (NEVER persist: an accidental write-through is a key dump).
+    // EPH: caches, rate limiter, per-session auth, test clock, invite tickets, and vault
+    // chunk keys (NEVER persist: a write-through is a key dump).
     let _ = (
         tickets,
         peer_addrs,
@@ -565,14 +631,19 @@ pub(crate) fn persist_all(
         relay_health,
         vault_keys,
         blob_auth,
+        root_split_pending,
         test_now,
     );
-    // PLAIN-rebuild: `share_sets` (AttestTracker) is reconstructed from `granted` at
-    // load (rebuild_share_sets); its only lost state is recent attestation timestamps,
-    // self-healed by the next §10.2 challenge round.
+    // PLAIN-rebuild: `share_sets` reconstructed from `granted` at load.
     let _ = share_sets;
 
     let mut t = txn.open_table(STATE).context("open state table (write)")?;
+
+    put(
+        &mut t,
+        cat::SCHEMA_VERSION,
+        CURRENT_SCHEMA_VERSION.to_be_bytes().to_vec(),
+    )?;
 
     // ---- PLAIN document lists ----
     put_frame_list(&mut t, cat::CARDS, cards.iter().cloned())?;
@@ -649,6 +720,32 @@ pub(crate) fn persist_all(
     )?;
     put(
         &mut t,
+        cat::CEREMONY_SUBJECT_RATE,
+        enc_rate_history(ceremony_subject_rate),
+    )?;
+    put(
+        &mut t,
+        cat::CEREMONY_SPONSOR_RATE,
+        enc_rate_history(ceremony_sponsor_rate),
+    )?;
+    put(
+        &mut t,
+        cat::CEREMONY_TOMBSTONES,
+        enc_ceremony_tombstones(ceremony_tombstones),
+    )?;
+    put(
+        &mut t,
+        cat::CEREMONY_RELEASED,
+        enc(|w| {
+            w.len(ceremony_released.len());
+            for (id, new_node) in ceremony_released {
+                w.fixed(id);
+                w.fixed(new_node);
+            }
+        }),
+    )?;
+    put(
+        &mut t,
         cat::PENDING_RESPLITS,
         enc_pending_resplits(pending_resplits),
     )?;
@@ -663,17 +760,16 @@ pub(crate) fn persist_all(
         enc(|w| enc_set32(w, unfriended_nodes)),
     )?;
 
-    // ---- DERIVE: vault_blobs -> only {vid -> digest, chunk_ids} (never the manifest),
-    // UNIONed with the needs-refetch sources (vaults whose manifest failed to
-    // re-derive at startup) so a failed re-derive never erases a vault's
-    // blob-source record from disk. `vault_blobs` wins on a vid in both.
+    // DERIVE: vault_blobs -> only {vid -> digest, chunk_ids} (never the manifest),
+    // unioned with needs-refetch sources so a failed re-derive never erases a vault's
+    // blob-source record. `vault_blobs` wins on a vid in both.
     put(
         &mut t,
         cat::VAULT_BLOBS,
         enc_vault_blobs(vault_blobs, needs_refetch),
     )?;
 
-    // ---- F3: monotonic own-card version floor = max own card.version ----
+    // F3: monotonic own-card version floor = max own card.version.
     let card_version = cards.iter().map(|c| c.version).max().unwrap_or(0);
     put(
         &mut t,
@@ -681,11 +777,11 @@ pub(crate) fn persist_all(
         card_version.to_be_bytes().to_vec(),
     )?;
 
-    // ---- DocStore (§6 rollback high-water marks) ----
+    // DocStore rollback high-water marks.
     put_frame_list(&mut t, cat::DOC_CARDS, docs.cards().cloned())?;
     put_frame_list(&mut t, cat::DOC_ANNOUNCES, docs.announces().cloned())?;
 
-    // ---- SEAL rows (sealed before touching redb) ----
+    // SEAL rows (sealed before touching redb).
     put_sealed(
         &mut t,
         cat::HELD_SHARES,
@@ -706,35 +802,46 @@ pub(crate) fn persist_all(
         enc_split_states(split_states),
     )?;
     put_sealed(&mut t, cat::RESPLITS, k_root, enc_resplits(resplits))?;
+    put_sealed(
+        &mut t,
+        cat::IDENTITY,
+        k_root,
+        enc(|w| {
+            w.fixed(&identity.user);
+            w.fixed(&identity.node);
+        }),
+    )?;
 
     Ok(())
 }
 
-/// Persist the whole state in one txn and commit it, fail-loud (design §3.2.5): a
-/// commit failure CRASHES rather than continuing with RAM ahead of disk. The caller
-/// holds the `shared` (and, for the `_with` path, `docs`) lock across this call so the
-/// RAM mutation and the durable write share one critical section, and calls it BEFORE
-/// any externally visible effect (§3.2.3-4).
-pub(crate) fn commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u8; 32]) {
-    if let Err(e) = try_commit_all(db, s, docs, k_root) {
-        // §3.2.5: the daemon DIES on a commit failure - never continue with RAM ahead of
-        // disk. `abort()` (not a panic): a panic here fires while the caller holds the
-        // `shared` write lock, poisoning it and wedging the daemon half-alive on every
-        // later `.expect("shared lock")`. `abort()` takes the whole process down at once,
-        // no unwinding, no poisoned lock.
-        eprintln!(
-            "carapace: FATAL redb state commit failed ({e:#}); aborting the daemon \
-             (design §3.2.5: never continue with RAM ahead of disk)."
-        );
+/// Persist the whole state in one txn and commit, fail-loud: a commit failure CRASHES
+/// rather than continuing with RAM ahead of disk. Caller holds the `shared` (and, on the
+/// `_with` path, `docs`) lock across this call and calls it before any visible effect.
+pub(crate) fn commit_all(
+    db: &Database,
+    s: &Shared,
+    docs: &DocStore,
+    k_root: &[u8; 32],
+    identity: &StateIdentity,
+) {
+    if try_commit_all(db, s, docs, k_root, identity).is_err() {
+        // abort(), not panic: a panic here fires under the caller's `shared` write lock,
+        // poisoning it and wedging the daemon half-alive; abort takes the process down clean.
+        super::ops::log("persistence.commit_failed", None);
         std::process::abort();
     }
 }
 
-/// One durable state commit: open a write txn, persist the whole state, and commit.
-/// Any failure is returned so [`commit_all`] can abort the process loudly.
-fn try_commit_all(db: &Database, s: &Shared, docs: &DocStore, k_root: &[u8; 32]) -> Result<()> {
+pub(crate) fn try_commit_all(
+    db: &Database,
+    s: &Shared,
+    docs: &DocStore,
+    k_root: &[u8; 32],
+    identity: &StateIdentity,
+) -> Result<()> {
     let txn = db.begin_write().context("begin redb write txn")?;
-    persist_all(&txn, s, docs, k_root)?;
+    persist_all(&txn, s, docs, k_root, identity)?;
     txn.commit().context("commit redb state txn")?;
     Ok(())
 }
@@ -795,10 +902,7 @@ fn put_sealed(
     k_root: &[u8; 32],
     plaintext: Vec<u8>,
 ) -> Result<()> {
-    // The category plaintext (share JSON, polynomial bytes, share-grant bodies) is
-    // secret-equivalent. Wrap the caller's buffer (moved in, no copy) so it is WIPED after
-    // sealing rather than left in freed heap - the seal-side edge of audit #10. Covers
-    // every SEAL category, since all of them route through here.
+    // Secret-equivalent plaintext: wrap so it is wiped after sealing, not left in freed heap.
     let plaintext = Zeroizing::new(plaintext);
     let sealed = state_seal::seal(k_root, SEAL_TABLE, key.as_bytes(), &plaintext)
         .map_err(|e| anyhow!("seal {key}: {e}"))?;
@@ -849,26 +953,9 @@ fn enc_ceremonies(m: &HashMap<[u8; 16], TrackedCeremony>) -> Vec<u8> {
     })
 }
 
-/// C1: a party we have standing to trust - an owner whose share we hold
-/// (`held_grants` subject), an established friend, or ourselves (`docs.card`). Shared by
-/// the abort and alarm bounds: an unauthenticated dispatch from a stranger must never be
-/// able to write a durable row (durable disk-fill DoS otherwise).
-fn signer_qualifies(
-    signer: &[u8; 32],
-    held_grants: &HashMap<[u8; 32], ShareGrant>,
-    friends: &HashMap<[u8; 32], ContactCard>,
-    docs: &DocStore,
-) -> bool {
-    held_grants.contains_key(signer) || friends.contains_key(signer) || docs.card(signer).is_some()
-}
-
-/// C1: persist only alarms whose SPONSOR (the `RecoveryOpen` signer) is a qualifying
-/// party (see [`signer_qualifies`]). A stranger can self-sign a `RecoveryOpen` for any
-/// subject and dial us unauthenticated (`serve_recovery_open`); without this bound each
-/// such open would append an attacker-chosen ~1MiB alarm to disk unbounded. A stranger's
-/// alarm stays RAM-only (still visible to `/api/status` for the session, just not
-/// durable). The subject is deliberately NOT a qualifier: it is public, so an attacker
-/// would just set `subject = our pubkey` to bypass the bound.
+/// Persist only alarms whose sponsor (the `RecoveryOpen` signer) qualifies: a stranger's
+/// alarm stays RAM-only so an unauthenticated open cannot append to disk unbounded. The
+/// subject is deliberately not a qualifier (it is public: an attacker would set it to us).
 fn enc_alarms(
     m: &HashMap<[u8; 16], AlarmRecord>,
     held_grants: &HashMap<[u8; 32], ShareGrant>,
@@ -894,8 +981,7 @@ fn enc_alarms(
     })
 }
 
-/// C1: persist only aborts whose signer is a qualifying party (see [`signer_qualifies`]).
-/// A stranger's abort stays RAM-only so an unauthenticated dispatch cannot fill disk.
+/// Persist only aborts whose signer qualifies; a stranger's abort stays RAM-only.
 fn enc_aborted(
     m: &HashMap<[u8; 16], Vec<CeremonyAbort>>,
     held_grants: &HashMap<[u8; 32], ShareGrant>,
@@ -929,6 +1015,38 @@ fn enc_aborted(
     })
 }
 
+fn enc_rate_history(history: &HashMap<[u8; 32], Vec<u64>>) -> Vec<u8> {
+    enc(|w| {
+        w.len(history.len());
+        for (key, events) in history {
+            w.fixed(key);
+            w.len(events.len());
+            for event in events {
+                w.u64(*event);
+            }
+        }
+    })
+}
+
+fn enc_ceremony_tombstones(tombstones: &HashMap<[u8; 16], CeremonyTombstone>) -> Vec<u8> {
+    enc(|w| {
+        w.len(tombstones.len());
+        for (id, tombstone) in tombstones {
+            w.fixed(id);
+            w.fixed(&tombstone.subject);
+            w.fixed(&tombstone.sponsor);
+            w.u64(tombstone.terminal_at);
+            w.u8(match tombstone.terminal {
+                CeremonyTerminal::Completed => 1,
+                CeremonyTerminal::Aborted => 2,
+                CeremonyTerminal::Expired => 3,
+                CeremonyTerminal::Rejected => 4,
+                CeremonyTerminal::Failed => 5,
+            });
+        }
+    })
+}
+
 fn enc_pending_resplits(m: &HashMap<u64, PendingResplit>) -> Vec<u8> {
     enc(|w| {
         w.len(m.len());
@@ -947,8 +1065,7 @@ fn enc_pending_delete_sends(v: &[(Vec<EndpointAddr>, Placement)]) -> Vec<u8> {
     enc(|w| {
         w.len(v.len());
         for (addrs, placement) in v {
-            // Persist node ids only; direct addresses are hints, rebuilt via relay
-            // fallback on reconnect (§6 "addresses are hints, not identities").
+            // Node ids only; direct addresses are hints, rebuilt via relay on reconnect.
             w.len(addrs.len());
             for a in addrs {
                 w.fixed(a.id.as_bytes());
@@ -966,8 +1083,7 @@ fn enc_vault_blobs(
     m: &HashMap<[u8; 32], VaultBlobs>,
     needs_refetch: &HashMap<[u8; 32], BlobSource>,
 ) -> Vec<u8> {
-    // Retained-but-underivable sources ride in the same row; a vid present in
-    // `m` (re-derived or republished) supersedes its needs-refetch entry.
+    // Retained-but-underivable sources ride in the same row; a vid in `m` supersedes them.
     let extra: Vec<_> = needs_refetch
         .iter()
         .filter(|(vid, _)| !m.contains_key(*vid))
@@ -997,7 +1113,7 @@ fn enc_held_shares(m: &HashMap<u64, (Share, ShareMonitor)>) -> Vec<u8> {
     enc(|w| {
         w.len(m.len());
         for (rsid, (share, _monitor)) in m {
-            // ShareMonitor is EPH (CRC self-validation cadence, rebuilt on load).
+            // ShareMonitor is EPH (rebuilt on load).
             w.u64(*rsid);
             w.bytes(share_to_json(share).as_bytes());
         }
@@ -1075,9 +1191,7 @@ fn enc_resplits(m: &HashMap<u64, OpenResplit>) -> Vec<u8> {
     })
 }
 
-// -------------------------------------------------------------------------
-// Startup load (design §3.5).
-// -------------------------------------------------------------------------
+// Startup load.
 
 /// A DERIVE vault-blob source row: `(vid, manifest digest, chunk ids)`. The decrypted
 /// `Manifest` is re-derived from the FsStore envelope at startup (never persisted).
@@ -1089,27 +1203,104 @@ pub(crate) type BlobSource = ([u8; 32], Vec<[u8; 32]>);
 
 /// Everything reloaded from `state.redb` at startup.
 pub(crate) struct Loaded {
-    /// `Shared` with every persisted category filled and EPH fields left at their
-    /// defaults (the daemon rebuilds `rate`/`relay_health`/… on start). `vault_blobs`
-    /// is EMPTY here: its decrypted manifests are re-derived asynchronously from
-    /// `vault_blob_sources` against FsStore + `K_manifest`.
+    /// `Shared` with every persisted category filled and EPH fields defaulted.
+    /// `vault_blobs` is EMPTY: its manifests are re-derived async from `vault_blob_sources`.
     pub shared: Shared,
-    /// The rollback high-water-mark store (§6).
     pub docs: DocStore,
-    /// DERIVE (A1): `{vid -> (digest, chunk_ids)}` to re-derive `vault_blobs` manifests
-    /// from FsStore at startup. The decoded `Manifest` is NEVER persisted in clear.
+    /// DERIVE `{vid -> (digest, chunk_ids)}` to re-derive `vault_blobs` manifests from
+    /// FsStore at startup. The decoded `Manifest` is never persisted in clear.
     pub vault_blob_sources: Vec<VaultBlobSource>,
     /// F3: persisted monotonic own-card version floor. The fresh own card is minted at
-    /// `max(unix_now(), card_version + 1)` so its version strictly increases across a
-    /// restart even under rapid relay flapping.
+    /// `max(unix_now(), card_version + 1)` so its version strictly increases across restart.
     pub card_version: u64,
 }
 
-/// Load and decode all persisted state (design §3.5). SEAL rows are opened under
-/// `k_root`; a sealed row that fails to open ABORTS startup (fail loud, never
-/// skip-and-continue — that silently loses a share). GC/router must not start until
-/// after this returns and reconciliation completes.
-pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StateIdentity {
+    pub user: [u8; 32],
+    pub node: [u8; 32],
+}
+
+/// Load and decode all persisted state. SEAL rows are opened under `k_root`; a sealed
+/// row that fails to open ABORTS startup (fail loud, never skip-and-continue — that
+/// silently loses a share).
+pub(crate) fn load_all(
+    db: &Database,
+    k_root: &[u8; 32],
+    expected_identity: &StateIdentity,
+) -> Result<Loaded> {
+    load_all_inner(db, k_root, expected_identity, false)
+}
+
+/// Validate and decode all state without stamping a legacy schema row.
+pub(crate) fn load_all_read_only(
+    db: &Database,
+    k_root: &[u8; 32],
+    expected_identity: &StateIdentity,
+) -> Result<Loaded> {
+    load_all_inner(db, k_root, expected_identity, true)
+}
+
+/// Validate legacy state and atomically rewrite it as a complete identity-bound schema 2.
+pub(crate) fn migrate_legacy(
+    db: &Database,
+    k_root: &[u8; 32],
+    expected_identity: &StateIdentity,
+) -> Result<()> {
+    let stored = read_schema_version(db)?;
+    ensure!(
+        stored != Some(CURRENT_SCHEMA_VERSION),
+        "state database is already schema {CURRENT_SCHEMA_VERSION}"
+    );
+    let mut loaded = load_all_inner(db, k_root, expected_identity, true)?;
+    for (vid, digest, chunk_ids) in &loaded.vault_blob_sources {
+        loaded
+            .shared
+            .needs_refetch
+            .entry(*vid)
+            .or_insert_with(|| (*digest, chunk_ids.clone()));
+    }
+    let txn = db
+        .begin_write()
+        .context("begin explicit legacy migration")?;
+    persist_all(
+        &txn,
+        &loaded.shared,
+        &loaded.docs,
+        k_root,
+        expected_identity,
+    )?;
+    txn.commit().context("commit explicit legacy migration")?;
+    load_all_inner(db, k_root, expected_identity, false)?;
+    Ok(())
+}
+
+fn load_all_inner(
+    db: &Database,
+    k_root: &[u8; 32],
+    expected_identity: &StateIdentity,
+    allow_legacy: bool,
+) -> Result<Loaded> {
+    let stored_schema = read_schema_version(db)?;
+    let has_state = database_has_known_state(db)?;
+    match stored_schema {
+        Some(CURRENT_SCHEMA_VERSION) => validate_required_schema2_categories(db)?,
+        Some(version) if !allow_legacy => bail!(
+            "state schema {version} requires explicit confirmed legacy migration before startup"
+        ),
+        None if has_state && !allow_legacy => {
+            bail!("unversioned state requires explicit confirmed legacy migration before startup")
+        }
+        None if !has_state => {
+            return Ok(Loaded {
+                shared: Shared::default(),
+                docs: DocStore::new(),
+                vault_blob_sources: Vec::new(),
+                card_version: 0,
+            })
+        }
+        _ => {}
+    }
     let mut s = Shared::default();
 
     // ---- PLAIN document lists ----
@@ -1185,6 +1376,18 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
     if let Some(b) = read_row(db, cat::ABORTED_CEREMONIES)? {
         s.aborted_ceremonies = dec_aborted(&mut R::new(&b))?;
     }
+    if let Some(b) = read_row(db, cat::CEREMONY_SUBJECT_RATE)? {
+        s.ceremony_subject_rate = dec_rate_history(&mut R::new(&b))?;
+    }
+    if let Some(b) = read_row(db, cat::CEREMONY_SPONSOR_RATE)? {
+        s.ceremony_sponsor_rate = dec_rate_history(&mut R::new(&b))?;
+    }
+    if let Some(b) = read_row(db, cat::CEREMONY_TOMBSTONES)? {
+        s.ceremony_tombstones = dec_ceremony_tombstones(&mut R::new(&b))?;
+    }
+    if let Some(b) = read_row(db, cat::CEREMONY_RELEASED)? {
+        s.ceremony_released = dec_released_ceremonies(&mut R::new(&b))?;
+    }
     if let Some(b) = read_row(db, cat::PENDING_RESPLITS)? {
         s.pending_resplits = dec_pending_resplits(&mut R::new(&b))?;
     }
@@ -1211,8 +1414,20 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
     if let Some(b) = read_sealed(db, cat::RESPLITS, k_root)? {
         s.resplits = dec_resplits(&mut R::new(&b))?;
     }
+    if let Some(b) = read_sealed(db, cat::IDENTITY, k_root)? {
+        let mut reader = R::new(&b);
+        let stored = StateIdentity {
+            user: reader.arr32()?,
+            node: reader.arr32()?,
+        };
+        ensure!(reader.done(), "state identity row has trailing bytes");
+        ensure!(
+            stored == *expected_identity,
+            "state database belongs to a different user or node identity"
+        );
+    }
 
-    // ---- PLAIN-rebuild: share_sets from granted (§3.3) ----
+    // ---- PLAIN-rebuild: share_sets from granted ----
     s.share_sets = rebuild_share_sets(&s.granted);
 
     // ---- DERIVE: vault_blob sources (manifests re-derived by the caller) ----
@@ -1221,7 +1436,6 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
         None => Vec::new(),
     };
 
-    // ---- F3 own-card version floor ----
     let card_version = match read_row(db, cat::CARD_VERSION)? {
         Some(b) => u64::from_be_bytes(
             b.as_slice()
@@ -1231,7 +1445,7 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
         None => 0,
     };
 
-    // ---- DocStore (§6 high-water marks) ----
+    // ---- DocStore high-water marks ----
     let mut docs = DocStore::new();
     if let Some(b) = read_row(db, cat::DOC_CARDS)? {
         for c in dec_frame_list::<ContactCard>(&mut R::new(&b))? {
@@ -1246,23 +1460,88 @@ pub(crate) fn load_all(db: &Database, k_root: &[u8; 32]) -> Result<Loaded> {
         }
     }
 
-    Ok(Loaded {
+    let loaded = Loaded {
         shared: s,
         docs,
         vault_blob_sources,
         card_version,
-    })
+    };
+
+    // The supported migration is additive: after every row opens, atomically replace only
+    // the four-byte schema marker. It does not transform or re-seal a category. Therefore a
+    // staged database, capacity-sized copy, and migration backup cannot protect more data
+    // than redb's transaction already protects. A failed commit leaves the old marker and
+    // every old row intact, so startup retries the same validation. Any future policy that
+    // transforms rows must use a staged, verified backup and explicit free-space preflight.
+    Ok(loaded)
+}
+
+fn database_has_known_state(db: &Database) -> Result<bool> {
+    if read_row(db, cat::SCHEMA_VERSION)?.is_some() {
+        return Ok(true);
+    }
+    for key in REQUIRED_SCHEMA2_CATEGORIES {
+        if read_row(db, key)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_required_schema2_categories(db: &Database) -> Result<()> {
+    for key in REQUIRED_SCHEMA2_CATEGORIES {
+        ensure!(
+            read_row(db, key)?.is_some(),
+            "schema {CURRENT_SCHEMA_VERSION} state is missing required category {key:?}; restore a complete backup"
+        );
+    }
+    Ok(())
+}
+
+fn read_schema_version(db: &Database) -> Result<Option<u32>> {
+    let Some(bytes) = read_row(db, cat::SCHEMA_VERSION)? else {
+        return Ok(None);
+    };
+    let version = u32::from_be_bytes(
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("state schema version row is not 4 bytes"))?,
+    );
+    ensure!(
+        (MIN_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION).contains(&version),
+        "unsupported state schema version {version}; supported range is {MIN_SCHEMA_VERSION}..={CURRENT_SCHEMA_VERSION}"
+    );
+    Ok(Some(version))
+}
+
+#[cfg(test)]
+fn stamp_schema_version_with_interruption(db: &Database, commit: bool) -> Result<()> {
+    let txn = db
+        .begin_write()
+        .context("begin interrupted schema transaction")?;
+    {
+        let mut table = txn.open_table(STATE)?;
+        put(
+            &mut table,
+            cat::SCHEMA_VERSION,
+            CURRENT_SCHEMA_VERSION.to_be_bytes().to_vec(),
+        )?;
+    }
+    if commit {
+        txn.commit()?;
+    }
+    Ok(())
 }
 
 /// Open a SEAL row under `k_root`. Absent -> `None`; present-but-unopenable -> loud
-/// error (design §3.4/§3.5: never skip a share that will not decrypt).
+/// error (never skip a share that will not decrypt).
 fn read_sealed(db: &Database, key: &str, k_root: &[u8; 32]) -> Result<Option<Zeroizing<Vec<u8>>>> {
     match read_row(db, key)? {
         None => Ok(None),
         Some(sealed) => {
-            // Return the `Zeroizing` buffer state_seal::open produced (do NOT `to_vec()` it
-            // into a plain Vec that drops unwiped): the decoder borrows it and it is wiped
-            // when the caller's binding drops - the read-side edge of audit #10.
+            // Keep the `Zeroizing` buffer open produced (no `to_vec()`): the decoder
+            // borrows it and it is wiped when the caller's binding drops.
             let opened =
                 state_seal::open(k_root, SEAL_TABLE, key.as_bytes(), &sealed).map_err(|e| {
                     anyhow!(
@@ -1399,6 +1678,92 @@ fn dec_aborted(r: &mut R) -> Result<HashMap<[u8; 16], Vec<CeremonyAbort>>> {
     Ok(m)
 }
 
+fn dec_rate_history(r: &mut R) -> Result<HashMap<[u8; 32], Vec<u64>>> {
+    let n = r.len()?;
+    ensure!(
+        n <= MAX_RECOVERY_RATE_KEYS,
+        "recovery rate history exceeds bound"
+    );
+    let mut history = HashMap::with_capacity(r.cap(n));
+    for _ in 0..n {
+        let key = r.arr32()?;
+        let count = r.len()?;
+        ensure!(
+            count <= MAX_RECOVERY_OPENS_PER_WINDOW,
+            "recovery rate events exceed bound"
+        );
+        let mut events = Vec::with_capacity(r.cap(count));
+        for _ in 0..count {
+            events.push(r.u64()?);
+        }
+        history.insert(key, events);
+    }
+    Ok(history)
+}
+
+fn dec_ceremony_tombstones(r: &mut R) -> Result<HashMap<[u8; 16], CeremonyTombstone>> {
+    let n = r.len()?;
+    ensure!(
+        n <= MAX_CEREMONY_TOMBSTONES,
+        "ceremony tombstones exceed bound"
+    );
+    let mut tombstones = HashMap::with_capacity(r.cap(n));
+    for _ in 0..n {
+        let id = r.arr16()?;
+        let subject = r.arr32()?;
+        let sponsor = r.arr32()?;
+        let terminal_at = r.u64()?;
+        let terminal = match r.u8()? {
+            1 => CeremonyTerminal::Completed,
+            2 => CeremonyTerminal::Aborted,
+            3 => CeremonyTerminal::Expired,
+            4 => CeremonyTerminal::Rejected,
+            5 => CeremonyTerminal::Failed,
+            value => return Err(anyhow!("invalid ceremony terminal value {value}")),
+        };
+        tombstones.insert(
+            id,
+            CeremonyTombstone {
+                subject,
+                sponsor,
+                terminal_at,
+                terminal,
+            },
+        );
+    }
+    Ok(tombstones)
+}
+
+fn dec_released_ceremonies(r: &mut R) -> Result<HashMap<[u8; 16], [u8; 32]>> {
+    let count = r.len()?;
+    ensure!(
+        count <= super::MAX_CEREMONY_RECORDS,
+        "released ceremonies exceed bound"
+    );
+    let old_len = count
+        .checked_mul(16)
+        .context("released ceremony length overflow")?;
+    let new_len = count
+        .checked_mul(48)
+        .context("released ceremony length overflow")?;
+    ensure!(
+        r.remaining() == old_len || r.remaining() == new_len,
+        "released ceremony row has an invalid length"
+    );
+    let has_node_binding = r.remaining() == new_len;
+    let mut released = HashMap::with_capacity(r.cap(count));
+    for _ in 0..count {
+        let id = r.arr16()?;
+        let new_node = if has_node_binding {
+            r.arr32()?
+        } else {
+            [0; 32]
+        };
+        released.insert(id, new_node);
+    }
+    Ok(released)
+}
+
 fn dec_pending_resplits(r: &mut R) -> Result<HashMap<u64, PendingResplit>> {
     let n = r.len()?;
     let mut m = HashMap::with_capacity(r.cap(n));
@@ -1429,7 +1794,6 @@ fn dec_pending_delete_sends(r: &mut R) -> Result<Vec<(Vec<EndpointAddr>, Placeme
         let mut addrs = Vec::with_capacity(r.cap(acount));
         for _ in 0..acount {
             let node = r.arr32()?;
-            // Reconstruct a bare-id EndpointAddr; direct addrs resolve via relay/hole-punch.
             if let Ok(id) = EndpointId::from_bytes(&node) {
                 addrs.push(EndpointAddr::new(id));
             }
@@ -1473,7 +1837,7 @@ fn dec_held_shares(r: &mut R) -> Result<HashMap<u64, (Share, ShareMonitor)>> {
     for _ in 0..n {
         let rsid = r.u64()?;
         let share = share_from_json(&dec_str(r)?).map_err(|e| anyhow!("decode held share: {e}"))?;
-        // ShareMonitor is EPH: a fresh default monitor (re-runs its CRC self-check cadence).
+        // ShareMonitor is EPH: fresh default monitor.
         m.insert(rsid, (share, ShareMonitor::new()));
     }
     Ok(m)
@@ -1592,6 +1956,28 @@ fn dec_resplits(r: &mut R) -> Result<HashMap<u64, OpenResplit>> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn state_database_is_private_from_creation_and_refuses_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.redb");
+        let database = open_db(&path).unwrap();
+        drop(database);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let target = directory.path().join("target.redb");
+        std::fs::write(&target, b"not a database").unwrap();
+        let linked = directory.path().join("linked.redb");
+        symlink(&target, &linked).unwrap();
+        assert!(open_db(&linked).is_err());
+        assert!(open_existing_db(&linked).is_err());
+    }
+
     #[test]
     fn codec_roundtrips_mixed_fields() {
         let mut w = W::new();
@@ -1640,8 +2026,7 @@ mod tests {
     }
 
     // Full funnel roundtrip across PLAIN + SEAL + DERIVE categories, plus fail-loud on a
-    // wrong K_root. Exercises the compile-enforced `persist_all` destructure against real
-    // shares/split-state (the hard SEAL path) and the share_sets rebuild-from-granted.
+    // wrong K_root.
     #[test]
     fn persist_load_roundtrips_all_categories() {
         use carapace_wire::Signed;
@@ -1652,6 +2037,10 @@ mod tests {
         let node_pub = node.verifying_key().to_bytes();
         let user_pub = user.verifying_key().to_bytes();
         let k_root = [3u8; 32];
+        let identity = StateIdentity {
+            user: user_pub,
+            node: node_pub,
+        };
 
         let (shares, state, _) = carapace_recovery::split_root(&k_root, 2, Some(3), false).unwrap();
 
@@ -1674,6 +2063,37 @@ mod tests {
         s.friend_grants.insert(user_pub, 1024);
         s.held_share_subjects.insert(1, user_pub);
         s.unfriended_nodes.insert([6u8; 32]);
+        s.ceremony_subject_rate.insert(user_pub, vec![100, 200]);
+        s.ceremony_sponsor_rate.insert(node_pub, vec![200]);
+        s.ceremony_tombstones.insert(
+            [0x51; 16],
+            CeremonyTombstone {
+                subject: user_pub,
+                sponsor: node_pub,
+                terminal_at: 300,
+                terminal: CeremonyTerminal::Aborted,
+            },
+        );
+        s.ceremony_released.insert([0x52; 16], [0x53; 32]);
+        let open = carapace_recovery::open_recovery(
+            &user,
+            [0x53; 16],
+            user_pub,
+            1,
+            "fixture claimant".into(),
+            [0x54; 32],
+            node_pub,
+            "fixture recovery".into(),
+            400,
+        );
+        s.ceremonies.insert(
+            open.ceremony_id,
+            TrackedCeremony {
+                state: CeremonyState::open(&open, vec![user_pub], 1, 72 * 3600, 400).unwrap(),
+                approved: false,
+                takeover: false,
+            },
+        );
         s.working_dirs
             .insert([1u8; 32], PathBuf::from("/tmp/vault"));
         s.pending_delete_sends.push((
@@ -1738,7 +2158,7 @@ mod tests {
         let db = open_db(&path).unwrap();
         {
             let txn = db.begin_write().unwrap();
-            persist_all(&txn, &s, &docs, &k_root).unwrap();
+            persist_all(&txn, &s, &docs, &k_root, &identity).unwrap();
             txn.commit().unwrap();
         }
 
@@ -1750,7 +2170,7 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
 
-        let loaded = load_all(&db, &k_root).unwrap();
+        let loaded = load_all(&db, &k_root, &identity).unwrap();
 
         assert_eq!(loaded.card_version, 12_345);
         assert_eq!(loaded.shared.cards.len(), 1);
@@ -1767,6 +2187,18 @@ mod tests {
         assert_eq!(loaded.shared.friend_grants.get(&user_pub), Some(&1024));
         assert_eq!(loaded.shared.held_share_subjects.get(&1), Some(&user_pub));
         assert!(loaded.shared.unfriended_nodes.contains(&[6u8; 32]));
+        assert_eq!(
+            loaded.shared.ceremony_subject_rate[&user_pub],
+            vec![100, 200]
+        );
+        assert_eq!(loaded.shared.ceremony_sponsor_rate[&node_pub], vec![200]);
+        let tombstone = loaded.shared.ceremony_tombstones[&[0x51; 16]];
+        assert_eq!(tombstone.terminal, CeremonyTerminal::Aborted);
+        assert_eq!(tombstone.terminal_at, 300);
+        assert_eq!(
+            loaded.shared.ceremony_released.get(&[0x52; 16]),
+            Some(&[0x53; 32])
+        );
         assert_eq!(
             loaded.shared.working_dirs.get(&[1u8; 32]).unwrap(),
             &PathBuf::from("/tmp/vault")
@@ -1802,7 +2234,361 @@ mod tests {
         // DocStore high-water mark.
         assert!(loaded.docs.card(&user_pub).is_some());
 
+        assert_eq!(
+            read_schema_version(&db).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+
+        let fixture_output = std::env::var_os("CARAPACE_FIXTURE_OUTPUT_DIR").map(PathBuf::from);
+        if let Some(output) = &fixture_output {
+            std::fs::create_dir_all(output).unwrap();
+            std::fs::copy(&path, output.join("rich-schema-2.redb")).unwrap();
+            for name in [
+                "active-ceremony-rates-tombstones.redb",
+                "split-held-shares.redb",
+                "replica-gc-state.redb",
+            ] {
+                std::fs::copy(&path, output.join(name)).unwrap();
+            }
+            let empty_path = output.join("empty-schema-2.redb");
+            let empty_db = open_db(&empty_path).unwrap();
+            let txn = empty_db.begin_write().unwrap();
+            persist_all(
+                &txn,
+                &Shared::default(),
+                &DocStore::new(),
+                &k_root,
+                &identity,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+
         // Fail loud: a wrong K_root cannot open the sealed rows.
-        assert!(load_all(&db, &[0u8; 32]).is_err());
+        assert!(load_all(&db, &[0u8; 32], &identity).is_err());
+
+        // Schema 1 -> 2 is metadata-only. An interrupted read does not stamp or rewrite
+        // anything, every sealed category remains byte-identical and readable, and a later
+        // full-state commit performs the upgrade. Repeating from a downgraded schema-1 marker
+        // is safe and reaches schema 2 again without changing the independent seal format.
+        let sealed_categories = [
+            cat::HELD_SHARES,
+            cat::HELD_GRANTS,
+            cat::GRANTED,
+            cat::SPLIT_STATES,
+            cat::RESPLITS,
+            cat::IDENTITY,
+        ];
+        for attempt in 0..2 {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                put(&mut table, cat::SCHEMA_VERSION, 1u32.to_be_bytes().to_vec()).unwrap();
+            }
+            txn.commit().unwrap();
+            let sealed_before: Vec<_> = sealed_categories
+                .iter()
+                .map(|key| read_row(&db, key).unwrap())
+                .collect();
+            let schema_one = load_all_read_only(&db, &k_root, &identity).unwrap();
+            assert!(schema_one.shared.held_shares.contains_key(&1));
+            assert!(schema_one.shared.split_states.contains_key(&1));
+            assert!(schema_one.shared.granted.contains_key(&5));
+            assert_eq!(read_schema_version(&db).unwrap(), Some(1));
+            if attempt == 0 {
+                if let Some(output) = &fixture_output {
+                    std::fs::copy(&path, output.join("legacy-schema-1.redb")).unwrap();
+                }
+            }
+            for (key, before) in sealed_categories.iter().zip(&sealed_before) {
+                assert_eq!(
+                    &read_row(&db, key).unwrap(),
+                    before,
+                    "attempt {attempt}: {key}"
+                );
+            }
+
+            let txn = db.begin_write().unwrap();
+            persist_all(
+                &txn,
+                &schema_one.shared,
+                &schema_one.docs,
+                &k_root,
+                &identity,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            assert_eq!(read_schema_version(&db).unwrap(), Some(2));
+            let upgraded = load_all(&db, &k_root, &identity).unwrap();
+            assert!(upgraded.shared.held_shares.contains_key(&1));
+            assert!(upgraded.shared.split_states.contains_key(&1));
+            assert!(upgraded.shared.granted.contains_key(&5));
+        }
+
+        // Legacy migration is explicit. Inspection opens every old row without mutation;
+        // normal startup refuses it; the migration transaction adds every schema-2 row and
+        // the sealed identity without changing the seal AAD format.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                table.remove(cat::SCHEMA_VERSION).unwrap();
+                table.remove(cat::IDENTITY).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert_eq!(read_schema_version(&db).unwrap(), None);
+        if let Some(output) = &fixture_output {
+            std::fs::copy(&path, output.join("legacy-unversioned.redb")).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let mut corrupt = bytes.clone();
+            let index = corrupt.len() / 2;
+            corrupt[index] ^= 0x80;
+            std::fs::write(output.join("corrupt.redb"), corrupt).unwrap();
+            std::fs::write(output.join("truncated.redb"), &bytes[..bytes.len() / 2]).unwrap();
+            return;
+        }
+        if let Ok(output) = std::env::var("CARAPACE_LEGACY_FIXTURE_OUTPUT") {
+            std::fs::copy(&path, output).unwrap();
+            return;
+        }
+        assert!(load_all(&db, &k_root, &identity).is_err());
+        let legacy = load_all_read_only(&db, &k_root, &identity).unwrap();
+        assert!(legacy.shared.held_shares.contains_key(&1));
+        assert!(legacy.shared.split_states.contains_key(&1));
+        assert_eq!(read_schema_version(&db).unwrap(), None);
+        migrate_legacy(&db, &k_root, &identity).unwrap();
+        assert_eq!(
+            read_schema_version(&db).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let wrong_node = StateIdentity {
+            user: identity.user,
+            node: [0xEE; 32],
+        };
+        let err = load_all(&db, &k_root, &wrong_node)
+            .err()
+            .expect("a database bound to another node must be refused");
+        assert!(err.to_string().contains("different user or node identity"));
+
+        // Unknown newer versions fail before any state is returned.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                put(
+                    &mut table,
+                    cat::SCHEMA_VERSION,
+                    (CURRENT_SCHEMA_VERSION + 1).to_be_bytes().to_vec(),
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let err = load_all(&db, &k_root, &identity)
+            .err()
+            .expect("a newer schema must be refused");
+        assert!(err.to_string().contains("unsupported state schema version"));
+    }
+
+    #[test]
+    fn malicious_lifecycle_rows_over_bounds_are_rejected_before_allocation() {
+        let mut keys = W::new();
+        keys.len(MAX_RECOVERY_RATE_KEYS + 1);
+        assert!(dec_rate_history(&mut R::new(&keys.into_vec())).is_err());
+
+        let mut events = W::new();
+        events.len(1);
+        events.fixed(&[0x11; 32]);
+        events.len(MAX_RECOVERY_OPENS_PER_WINDOW + 1);
+        assert!(dec_rate_history(&mut R::new(&events.into_vec())).is_err());
+
+        let mut tombstones = W::new();
+        tombstones.len(MAX_CEREMONY_TOMBSTONES + 1);
+        assert!(dec_ceremony_tombstones(&mut R::new(&tombstones.into_vec())).is_err());
+
+        let mut released = W::new();
+        released.len(crate::MAX_CEREMONY_RECORDS + 1);
+        assert!(dec_released_ceremonies(&mut R::new(&released.into_vec())).is_err());
+    }
+
+    #[test]
+    fn malicious_tombstone_terminal_tag_is_rejected() {
+        let mut bytes = W::new();
+        bytes.len(1);
+        bytes.fixed(&[0x21; 16]);
+        bytes.fixed(&[0x22; 32]);
+        bytes.fixed(&[0x23; 32]);
+        bytes.u64(10);
+        bytes.u8(0xFF);
+        assert!(dec_ceremony_tombstones(&mut R::new(&bytes.into_vec())).is_err());
+    }
+
+    #[test]
+    fn rejected_and_failed_tombstones_round_trip() {
+        let tombstones = HashMap::from([
+            (
+                [0x31; 16],
+                CeremonyTombstone {
+                    subject: [0x32; 32],
+                    sponsor: [0x33; 32],
+                    terminal_at: 40,
+                    terminal: CeremonyTerminal::Rejected,
+                },
+            ),
+            (
+                [0x41; 16],
+                CeremonyTombstone {
+                    subject: [0x42; 32],
+                    sponsor: [0x43; 32],
+                    terminal_at: 50,
+                    terminal: CeremonyTerminal::Failed,
+                },
+            ),
+        ]);
+        let encoded = enc_ceremony_tombstones(&tombstones);
+        let decoded = dec_ceremony_tombstones(&mut R::new(&encoded)).unwrap();
+        assert_eq!(decoded[&[0x31; 16]].terminal, CeremonyTerminal::Rejected);
+        assert_eq!(decoded[&[0x41; 16]].terminal, CeremonyTerminal::Failed);
+    }
+
+    #[test]
+    fn malicious_persisted_lifecycle_rows_fail_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open_db(&directory.path().join("state.redb")).unwrap();
+        let k_root = [0x31; 32];
+        let identity = StateIdentity {
+            user: [0x32; 32],
+            node: [0x33; 32],
+        };
+        let shared = Shared::default();
+        let docs = DocStore::new();
+        let txn = db.begin_write().unwrap();
+        persist_all(&txn, &shared, &docs, &k_root, &identity).unwrap();
+        txn.commit().unwrap();
+
+        let mut too_many_keys = W::new();
+        too_many_keys.len(MAX_RECOVERY_RATE_KEYS + 1);
+        let mut too_many_events = W::new();
+        too_many_events.len(1);
+        too_many_events.fixed(&[0x41; 32]);
+        too_many_events.len(MAX_RECOVERY_OPENS_PER_WINDOW + 1);
+        let mut too_many_tombstones = W::new();
+        too_many_tombstones.len(MAX_CEREMONY_TOMBSTONES + 1);
+        let mut too_many_released = W::new();
+        too_many_released.len(crate::MAX_CEREMONY_RECORDS + 1);
+
+        for (key, payload) in [
+            (cat::CEREMONY_SUBJECT_RATE, too_many_keys.into_vec()),
+            (cat::CEREMONY_SPONSOR_RATE, too_many_events.into_vec()),
+            (cat::CEREMONY_TOMBSTONES, too_many_tombstones.into_vec()),
+            (cat::CEREMONY_RELEASED, too_many_released.into_vec()),
+        ] {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                put(&mut table, key, payload).unwrap();
+            }
+            txn.commit().unwrap();
+            assert!(
+                load_all_read_only(&db, &k_root, &identity).is_err(),
+                "malicious row {key} must stop startup"
+            );
+
+            let txn = db.begin_write().unwrap();
+            persist_all(&txn, &shared, &docs, &k_root, &identity).unwrap();
+            txn.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn additive_migration_interruption_retry_and_downgrade_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open_db(&directory.path().join("state.redb")).unwrap();
+        let k_root = [0x71; 32];
+        let identity = StateIdentity {
+            user: [0x72; 32],
+            node: [0x73; 32],
+        };
+        let shared = Shared::default();
+        let docs = DocStore::new();
+        let txn = db.begin_write().unwrap();
+        persist_all(&txn, &shared, &docs, &k_root, &identity).unwrap();
+        txn.commit().unwrap();
+        let sealed_identity = read_row(&db, cat::IDENTITY).unwrap().unwrap();
+
+        let set_schema_one = || {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                put(&mut table, cat::SCHEMA_VERSION, 1u32.to_be_bytes().to_vec()).unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        set_schema_one();
+        assert_eq!(migration_policy(Some(1)), MigrationPolicy::AdditiveMarker);
+
+        stamp_schema_version_with_interruption(&db, false).unwrap();
+        assert_eq!(read_schema_version(&db).unwrap(), Some(1));
+        assert_eq!(
+            read_row(&db, cat::IDENTITY).unwrap().unwrap(),
+            sealed_identity
+        );
+
+        stamp_schema_version_with_interruption(&db, true).unwrap();
+        assert_eq!(read_schema_version(&db).unwrap(), Some(2));
+        assert_eq!(
+            read_row(&db, cat::IDENTITY).unwrap().unwrap(),
+            sealed_identity
+        );
+        load_all_read_only(&db, &k_root, &identity).unwrap();
+
+        set_schema_one();
+        assert!(load_all(&db, &k_root, &identity).is_err());
+        migrate_legacy(&db, &k_root, &identity).unwrap();
+        assert_eq!(read_schema_version(&db).unwrap(), Some(2));
+        load_all(&db, &k_root, &identity).unwrap();
+    }
+
+    #[test]
+    fn schema_two_refuses_every_missing_required_category() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open_db(&directory.path().join("state.redb")).unwrap();
+        let k_root = [0x81; 32];
+        let identity = StateIdentity {
+            user: [0x82; 32],
+            node: [0x83; 32],
+        };
+        let txn = db.begin_write().unwrap();
+        persist_all(
+            &txn,
+            &Shared::default(),
+            &DocStore::new(),
+            &k_root,
+            &identity,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        for key in REQUIRED_SCHEMA2_CATEGORIES {
+            let original = read_row(&db, key).unwrap().expect("required row");
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                table.remove(*key).unwrap();
+            }
+            txn.commit().unwrap();
+            let error = load_all(&db, &k_root, &identity)
+                .err()
+                .expect("missing required row must fail");
+            assert!(error.to_string().contains(key), "{key}: {error:#}");
+
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE).unwrap();
+                put(&mut table, key, original).unwrap();
+            }
+            txn.commit().unwrap();
+        }
     }
 }

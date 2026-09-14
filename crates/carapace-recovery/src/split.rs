@@ -15,8 +15,7 @@ use crate::{key_to_mnemonic, mnemonic_to_key, RecoveryError};
 /// it a recovering coalition would need at most ⅓ of outstanding shares.
 #[must_use]
 pub fn soft_cap(m: u8) -> usize {
-    // S3: saturating so a bogus m=0 (thresholds are >= 2 in practice) yields 0
-    // rather than underflowing/panicking; `3*M - 1` for every real threshold.
+    // S3: saturating so a bogus m=0 yields 0 rather than underflowing.
     usize::from(m).saturating_mul(3).saturating_sub(1)
 }
 
@@ -189,12 +188,8 @@ pub fn extend_split(
     Ok((shares, warnings))
 }
 
-// Adding a trustee / replacing a lost share (§8.1) is `extend_split` on the in-memory
-// `SplitState` (issue one more share at a fresh x on the same polynomial); the daemon owns
-// the state's at-rest sealing through the single redb state-row seal (design §3.4 "one
-// mechanism"). The former `add_trustee`/`replace_lost_share` wrappers (which sealed the
-// state a SECOND way, via the retired `state_seal` module) are gone - callers use
-// `extend_split` directly (see `Daemon::recovery_extend`).
+// Adding a trustee / replacing a lost share (§8.1) is `extend_split` directly: one more share at a
+// fresh x on the same polynomial. The daemon owns at-rest sealing via the single redb state-row seal.
 
 #[cfg(test)]
 mod tests {

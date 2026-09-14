@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="carapace-claimant-token" content="__CARAPACE_CLAIMANT_TOKEN__">
+  <title>Carapace identity recovery</title>
+  <link rel="stylesheet" href="/claimant.css">
+  <script type="module" src="/claimant.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Claimant mode</p>
+      <h1>Recover this Carapace identity</h1>
+      <p>This isolated server cannot open vaults or use normal daemon actions.</p>
+    </header>
+
+    <div id="notice" role="status" aria-live="polite"></div>
+    <div id="error" role="alert" hidden></div>
+
+    <section aria-labelledby="session-heading">
+      <h2 id="session-heading">1. Give the public session values to a sponsor</h2>
+      <p>Verify the sponsor through a separate trusted channel. This package contains public values only.</p>
+      <label>Public ceremony handoff package
+        <textarea id="handoff" readonly rows="5"></textarea>
+      </label>
+      <button type="button" data-copy="handoff">Copy handoff package</button>
+      <details>
+        <summary>Advanced manual values</summary>
+        <label>Ceremony encryption key <textarea id="ceremony-enc" readonly rows="2"></textarea></label>
+        <label>New device node <textarea id="new-node" readonly rows="2"></textarea></label>
+      </details>
+    </section>
+
+    <section aria-labelledby="complete-heading">
+      <h2 id="complete-heading">2. Import the signed open and trustee endpoints</h2>
+      <p>The signed open must contain the exact public values above. Add one trustee user per line.</p>
+      <form id="complete-form">
+        <label>Verified sponsor ceremony package
+          <textarea id="sponsor-package" required rows="8" spellcheck="false"></textarea>
+        </label>
+        <button id="preview-open" type="button">Import package and show subject</button>
+        <div id="subject-confirmation" hidden>
+          <p>Recovered subject identity: <code id="subject-id"></code></p>
+          <label><input id="confirm-subject" type="checkbox"> I confirmed this subject identity through a trusted channel.</label>
+        </div>
+        <details>
+          <summary>Advanced manual values</summary>
+          <label>Signed RecoveryOpen frame, hexadecimal
+            <textarea id="open-hex" required rows="5" spellcheck="false"></textarea>
+          </label>
+          <label>Trustee user roster, one 64-character hexadecimal value per line
+            <textarea id="roster" required rows="5" spellcheck="false"></textarea>
+          </label>
+          <label>Trustee endpoints, one per line as node|address,address
+            <textarea id="trustees" required rows="5" spellcheck="false"></textarea>
+          </label>
+        </details>
+        <button id="recover" type="submit" disabled>Collect approvals and activate</button>
+        <button id="cancel" type="button">Cancel and clear this attempt</button>
+      </form>
+      <p id="progress" aria-live="polite"></p>
+    </section>
+
+    <section id="restart" aria-labelledby="restart-heading" tabindex="-1" hidden>
+      <h2 id="restart-heading">3. Restart into normal daemon mode</h2>
+      <p>Activation is complete. Stop this claimant process. Start the normal daemon with the same state directory.</p>
+      <ol>
+        <li>Open the normal Carapace interface after restart.</li>
+        <li>Use owned-device sync when another owned device is available.</li>
+        <li>Fetch and restore vault ciphertext from retained replicas when no owned device is available.</li>
+        <li>Confirm restored vault contents before you change recovery trustees.</li>
+        <li>Create a new recovery split for this device and complete the guided re-split. Keep the old set until the new set is live.</li>
+      </ol>
+      <p>The claimant server does not perform these normal-daemon actions.</p>
+    </section>
+  </main>
+</body>
+</html>

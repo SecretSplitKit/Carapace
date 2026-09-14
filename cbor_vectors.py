@@ -10,8 +10,19 @@ Encoding profile (RFC 8949 §4.2.1 Core Deterministic, restricted):
     sorted bytewise-lexicographically on their encoded form
   - bool/null as simple values; floats PROHIBITED
 """
+import argparse
 import hashlib
+import re
+from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+parser = argparse.ArgumentParser(description="Generate or check Carapace CBOR vectors")
+parser.add_argument(
+    "--check",
+    action="store_true",
+    help="compare all generated vectors with the Rust golden source without writing files",
+)
+args = parser.parse_args()
 
 # ---------------- deterministic CBOR encoder (reference) ----------------
 
@@ -332,30 +343,32 @@ for name, body, e, note in docs:
     lines.append(hexwrap(e))
     lines.append("```")
     lines.append("")
-with open("appendix_b8_fragment.md", "w") as fh:
-    fh.write("\n".join(lines))
+if not args.check:
+    with open("appendix_b8_fragment.md", "w") as fh:
+        fh.write("\n".join(lines))
 
-print(f"\nPART 2: {len(part2)} frames + {len(docs)} documents generated, all signatures verified OK")
-print("fragment written to appendix_b8_fragment.md")
+    print(f"\nPART 2: {len(part2)} frames + {len(docs)} documents generated, all signatures verified OK")
+    print("fragment written to appendix_b8_fragment.md")
 
 # ---------------- output ----------------
 
-print("== test keys ==")
-for label, kp in [("USER_A", USER_A), ("USER_B", USER_B),
-                  ("NODE_A1", NODE_A1), ("NODE_B1", NODE_B1)]:
-    print(f"{label}: seed={kp.private_bytes_raw().hex()}")
-    print(f"{label}: pub ={kp.public_key().public_bytes_raw().hex()}")
-print(f"T0={T0}")
-print()
-for name, mt, body, f, note in vectors:
-    print(f"== {name} (type {mt}) ==  {note}")
-    print(f"frame ({len(f)} bytes):")
-    h = f.hex()
-    for i in range(0, len(h), 64):
-        print("  " + h[i:i+64])
+if not args.check:
+    print("== test keys ==")
+    for label, kp in [("USER_A", USER_A), ("USER_B", USER_B),
+                      ("NODE_A1", NODE_A1), ("NODE_B1", NODE_B1)]:
+        print(f"{label}: seed={kp.private_bytes_raw().hex()}")
+        print(f"{label}: pub ={kp.public_key().public_bytes_raw().hex()}")
+    print(f"T0={T0}")
     print()
-print("== InviteTicket URI ==")
-print(ticket_uri)
+    for name, mt, body, f, note in vectors:
+        print(f"== {name} (type {mt}) ==  {note}")
+        print(f"frame ({len(f)} bytes):")
+        h = f.hex()
+        for i in range(0, len(h), 64):
+            print("  " + h[i:i+64])
+        print()
+    print("== InviteTicket URI ==")
+    print(ticket_uri)
 
 # sanity: verify every signature verifies
 from cryptography.exceptions import InvalidSignature
@@ -367,4 +380,33 @@ for name, mt, body, f, note in vectors:
         signer = pubmap[body.get(22, body[0])].public_key()
         body_wo = {k2: v for k2, v in body.items() if k2 != 23}
         signer.verify(body[23], DOMAIN + enc([mt, body_wo]))
-print("\nall signatures verified OK")
+def check_vectors(generated_vectors, generated_docs):
+    """Compare all oracle values with the committed Rust golden source."""
+    rust_source = Path(__file__).resolve().parent / "crates/carapace-wire/tests/vectors.rs"
+    text = rust_source.read_text(encoding="utf-8")
+    rust_frames = re.findall(r'assert_frame\(\s*"([0-9a-f]+)"', text)
+    rust_documents = re.findall(
+        r'assert_eq!\(\s*"([0-9a-f]+)",\s*hex::encode\([^)]*\.to_bytes\(\)\)',
+        text,
+    )
+    generated = [(name, data.hex()) for name, _, _, data, _ in generated_vectors]
+    generated.extend((name, data.hex()) for name, _, data, _ in generated_docs)
+    rust = rust_frames + rust_documents
+    if len(rust) != len(generated):
+        raise SystemExit(
+            f"vector count mismatch: oracle generated {len(generated)}, Rust has {len(rust)}"
+        )
+    mismatches = [
+        f"{index + 1} {name}"
+        for index, ((name, actual), expected) in enumerate(zip(generated, rust))
+        if actual != expected
+    ]
+    if mismatches:
+        raise SystemExit("CBOR vector mismatch: " + ", ".join(mismatches))
+    print(f"checked {len(generated)} independent CBOR vectors against {rust_source}")
+
+
+if args.check:
+    check_vectors(vectors + part2, docs)
+else:
+    print("\nall signatures verified OK")

@@ -4,6 +4,7 @@
 //! and reconstructs byte-identical plaintext through `carapace-vault`. Plus a
 //! unit test for the monotonic-version rollback rule.
 
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -15,19 +16,100 @@ use carapace_net::{
     read_msg, write_msg, AllowList, CarapaceEndpoint, CarapaceRelay, DocStore, IrohBlobStore,
     Reject, SyncHandler,
 };
+#[cfg(unix)]
 use carapace_vault::{
     ingest_dir, new_vid, open_envelope, reconstruct, ChunkStore, MemoryStore, VaultKeys,
 };
-use carapace_wire::{ContactCard, Hello, ManifestEnvelope, Offers, Signed, VaultAnnounce};
+#[cfg(unix)]
+use carapace_wire::ManifestEnvelope;
+use carapace_wire::{ContactCard, Hello, Offers, Signed, VaultAnnounce};
 use ed25519_dalek::SigningKey;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::BlobsProtocol;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_bao_range_fetch_excludes_unrelated_blocks() -> Result<()> {
+    use iroh_blobs::provider::events::{
+        ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    };
+
+    let server_key = SigningKey::from_bytes(&[0x71; 32]);
+    let client_key = SigningKey::from_bytes(&[0x72; 32]);
+    let server_ep = CarapaceEndpoint::bind(&server_key).await?;
+    let server_store = IrohBlobStore::new();
+    let content: Vec<u8> = (0..3 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let hash = server_store.add(&content).await?;
+
+    let observation = Arc::new(std::sync::Mutex::new((false, 0u64)));
+    let observed = Arc::clone(&observation);
+    let mask = EventMask {
+        connected: ConnectMode::Intercept,
+        get: RequestMode::InterceptLog,
+        ..EventMask::DEFAULT
+    };
+    let (events, mut messages) = EventSender::channel(16, mask);
+    tokio::spawn(async move {
+        while let Some(message) = messages.recv().await {
+            match message {
+                ProviderMessage::ClientConnected(message) => {
+                    message.tx.send(Ok(())).await.ok();
+                }
+                ProviderMessage::GetRequestReceived(mut message) => {
+                    let is_partial = !message.request.ranges[0].is_all();
+                    observed.lock().unwrap().0 = is_partial;
+                    message.tx.send(Ok(())).await.ok();
+                    while let Ok(Some(update)) = message.rx.recv().await {
+                        if let RequestUpdate::Completed(done) = update {
+                            observed.lock().unwrap().1 = done.stats.payload_bytes_sent;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    let router = Router::builder(server_ep.endpoint().clone())
+        .accept(
+            iroh_blobs::ALPN,
+            BlobsProtocol::new(server_store.store(), Some(events)),
+        )
+        .spawn();
+    let client_ep = CarapaceEndpoint::bind(&client_key).await?;
+    let connection = client_ep
+        .connect(server_ep.direct_addr()?, iroh_blobs::ALPN)
+        .await?;
+    let scratch = IrohBlobStore::new();
+    let offset = (16 * 1024) - 3;
+    let length = 11;
+    let selected = scratch
+        .fetch_verified_range(&connection, hash, offset, length)
+        .await?;
+    assert_eq!(
+        selected,
+        content[offset as usize..(offset + length) as usize]
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (partial, payload) = *observation.lock().unwrap();
+    assert!(partial, "provider observed a partial Bao range request");
+    assert!(
+        payload > 0 && payload < content.len() as u64 / 4,
+        "range payload {payload} must be materially below the full blob"
+    );
+    router.shutdown().await?;
+    client_ep.close().await;
+    server_ep.close().await;
+    Ok(())
+}
+
+#[cfg(unix)]
 const K_ROOT: [u8; 32] = [0x33; 32];
 
 /// Populate a temp directory with a mix of files (including one large enough to
 /// be cut into multiple FastCDC chunks, a nested file, and an empty file).
+#[cfg(unix)]
 fn make_tree() -> (tempfile::TempDir, BTreeMap<String, Vec<u8>>) {
     let dir = tempfile::tempdir().unwrap();
     let mut expected = BTreeMap::new();
@@ -88,6 +170,7 @@ fn signed_announce(
     ann
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sync_fetch_and_reconstruct() -> Result<()> {
     let user = SigningKey::from_bytes(&[0x07; 32]);
@@ -262,6 +345,21 @@ fn rollback_rule_rejects_stale_and_equal_versions() {
     );
     let c2 = make_card(&user, 2);
     assert_eq!(store.offer_card(&c2), Ok(true));
+}
+
+#[test]
+fn valid_signer_equivocation_at_same_epoch_is_rejected_and_first_value_remains() {
+    let signer = SigningKey::from_bytes(&[0x45; 32]);
+    let vid = [0x46; 32];
+    let first = signed_announce(&signer, vid, 9, [0x47; 32], vec![]);
+    let conflicting = signed_announce(&signer, vid, 9, [0x48; 32], vec![]);
+    let mut store = DocStore::new();
+    assert_eq!(store.offer_announce(&first), Ok(true));
+    assert_eq!(
+        store.offer_announce(&conflicting),
+        Err(Reject::Rollback { seen: 9, got: 9 })
+    );
+    assert_eq!(store.announce_for_vid(&vid).unwrap().digest, [0x47; 32]);
 }
 
 // W9/§2: a peer advertising an unknown suite id is rejected, never negotiated

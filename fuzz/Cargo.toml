@@ -1,0 +1,56 @@
+[package]
+name = "carapace-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+carapace-wire = { path = "../crates/carapace-wire" }
+carapace-recovery = { path = "../crates/carapace-recovery" }
+carapace-vault = { path = "../crates/carapace-vault" }
+carapace-disclose = { path = "../crates/carapace-disclose" }
+carapace-restore = { path = "../crates/carapace-restore" }
+carapaced = { path = "../crates/carapaced" }
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_messages"
+path = "fuzz_targets/recovery_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifests_grants"
+path = "fuzz_targets/manifests_grants.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore_paths"
+path = "fuzz_targets/restore_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_database"
+path = "fuzz_targets/state_database.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

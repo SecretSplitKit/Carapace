@@ -1,20 +1,24 @@
 <script lang="ts">
 	import { api } from '$lib/api';
 	import { status } from '$lib/statusStore';
-	import { notes, noteRecoverySet } from '$lib/notes';
 	import { copyToClipboard } from '$lib/format';
 	import CopyHex from './CopyHex.svelte';
 
 	let mode = $state<'split' | 'resplit'>('split');
 	let rsid = $state(1);
+	let manualSetId = $state(false);
 	let scopeKind = $state<'root' | 'vault'>('root');
 	let scopeVid = $state('');
 	let m = $state(2);
 	let n = $state(3);
+	let deliveryMode = $state<'friends' | 'manual'>('friends');
+	let selectedTrustees = $state<string[]>([]);
 	let allowOverCap = $state(false);
 	let splitting = $state(false);
 	let splitShares = $state<string[] | null>(null);
 	let splitWarnings = $state<string[]>([]);
+	let deliveryResult = $state<{ delivered: string[]; undelivered: string[] } | null>(null);
+	let nextRsid = $derived(Math.max(0, ...($status?.share_health.sets.map((set) => set.rsid) ?? [])) + 1);
 
 	let extendRsid = $state(1);
 	let extendCount = $state(1);
@@ -24,21 +28,58 @@
 
 	let subject = $state('');
 	let claimantDisplay = $state('');
+	let claimantHandoff = $state('');
+	let handoffError = $state('');
 	let ceremonyEnc = $state('');
 	let newNode = $state('');
 	let reason = $state('');
 	let opening = $state(false);
-	let openResult = $state<{ ceremony_id: string; open_hex: string; fanout_reached: number } | null>(
+	let openResult = $state<{ ceremony_id: string; open_hex: string; fanout_reached: number; sponsor_package: string } | null>(
 		null
 	);
+
+	function importClaimantHandoff() {
+		handoffError = '';
+		try {
+			const value = JSON.parse(claimantHandoff) as Record<string, unknown>;
+			if (
+				value.type !== 'carapace.claimant-handoff' ||
+				value.version !== 1 ||
+				typeof value.ceremony_enc !== 'string' ||
+				typeof value.new_node !== 'string' ||
+				!/^[0-9a-f]{64}$/i.test(value.ceremony_enc) ||
+				!/^[0-9a-f]{64}$/i.test(value.new_node)
+			) {
+				throw new Error('Package type, version, or public values are invalid.');
+			}
+			ceremonyEnc = value.ceremony_enc;
+			newNode = value.new_node;
+		} catch (error) {
+			handoffError = error instanceof Error ? error.message : 'The handoff package is invalid.';
+		}
+	}
 
 	let approveId = $state('');
 	let approving = $state(false);
 	let approveResult = $state<{ approve_hex: string; broadcast_reached: number } | null>(null);
 
 	let abortId = $state('');
+	let abortConfirmed = $state(false);
 	let aborting = $state(false);
 	let abortHex = $state<string | null>(null);
+	let restartOutDir = $state('');
+	let restartRestoring = $state(false);
+	let restartResult = $state<{ restored: number; refs: number } | null>(null);
+
+	async function runRestartRestore() {
+		restartRestoring = true;
+		try {
+			const result = await api.restartRestore(restartOutDir.trim());
+			restartResult = { restored: result.restored.length, refs: result.maximum_epoch_refs };
+		} finally {
+			restartRestoring = false;
+		}
+	}
 
 	function phaseLabel(phase: string): string {
 		switch (phase) {
@@ -51,6 +92,10 @@
 			default:
 				return phase;
 		}
+	}
+
+	function friendLabel(user: string): string {
+		return $status?.peers.find((peer) => peer.user === user)?.display || `Friend ${user.slice(0, 10)}…`;
 	}
 
 	// §9.3.4 PROMPT: start a re-split the daemon detected on unfriend but hasn't begun.
@@ -95,13 +140,20 @@
 		splitting = true;
 		splitShares = null;
 		splitWarnings = [];
+		deliveryResult = null;
 		try {
 			const scope = scopeKind === 'root' ? ({ kind: 'root' } as const) : ({ kind: 'vault', vid: scopeVid.trim() } as const);
-			const fn = mode === 'split' ? api.recoverySplit : api.recoveryResplit;
-			const res = await fn(rsid, scope, m, n, allowOverCap);
-			splitShares = res.shares;
-			splitWarnings = res.warnings;
-			noteRecoverySet({ rsid, scope, m, n, createdAt: Date.now() });
+			if (deliveryMode === 'friends') {
+				const fn = mode === 'split' ? api.recoverySplitToTrustees : api.recoveryResplitToTrustees;
+				const res = await fn(mode === 'split' && !manualSetId ? nextRsid : rsid, scope, m, selectedTrustees, allowOverCap);
+				deliveryResult = { delivered: res.delivered, undelivered: res.undelivered };
+				splitWarnings = res.warnings;
+			} else {
+				const fn = mode === 'split' ? api.recoverySplit : api.recoveryResplit;
+				const res = await fn(mode === 'split' && !manualSetId ? nextRsid : rsid, scope, m, n, allowOverCap);
+				splitShares = res.shares;
+				splitWarnings = res.warnings;
+			}
 		} finally {
 			splitting = false;
 		}
@@ -113,8 +165,6 @@
 		try {
 			const res = await api.recoveryExtend(extendRsid, extendCount, extendOverCap);
 			extendShares = res.shares;
-			const existing = $notes.recoverySets[String(extendRsid)];
-			if (existing) noteRecoverySet({ ...existing, n: existing.n + extendCount });
 		} finally {
 			extending = false;
 		}
@@ -159,14 +209,25 @@
 	let sharesCopied = $state<Record<number, boolean>>({});
 	let openHexCopied = $state(false);
 	let approveHexCopied = $state(false);
+
+	function selectApproval(ceremonyId: string) {
+		approveId = ceremonyId;
+		document.getElementById('approve-id')?.focus();
+	}
+
+	function selectAbort(ceremonyId: string) {
+		abortId = ceremonyId;
+		abortConfirmed = false;
+		document.getElementById('abort-id')?.focus();
+	}
 </script>
 
 <section>
 	<h1>Recovery &amp; trustees</h1>
 	<p class="muted">
 		Split your key into pieces so a group of trustees can rebuild it if you lose access.
-		Each share below is a bearer secret: send one to each trustee yourself - the daemon
-		doesn't track who you gave it to.
+		The normal flow sends a signed recovery grant to each selected friend and tracks delivery.
+		The advanced manual flow shows bearer shares that you must protect and deliver yourself.
 	</p>
 
 	{#if $status}
@@ -176,6 +237,55 @@
 				{$status.share_health.recovery_sets_owned} recovery set(s) split ·
 				{$status.share_health.shares_held} share(s) held here in trust for others
 			</p>
+		</div>
+	{/if}
+
+	<details class="card" style="margin-top: 1rem">
+		<summary>Restore retained vaults after identity recovery</summary>
+		<p class="dependency">Discovery-dependent operation · it is safe to retry after a network failure</p>
+		<p class="muted">Use the public restart handoff saved by claimant activation. Carapace contacts the verified trustee hints and accepts only the maximum announced epoch for each vault.</p>
+		<form onsubmit={(event) => (event.preventDefault(), runRestartRestore())}>
+			<label for="restart-out" class="muted">Restore directory</label>
+			<input id="restart-out" bind:value={restartOutDir} />
+			<button class="primary" type="submit" disabled={restartRestoring || !restartOutDir.trim()}>{restartRestoring ? 'Restoring…' : 'Discover and restore retained vaults'}</button>
+		</form>
+		<div aria-live="polite">{#if restartRestoring}<p>Restore is in progress.</p>{:else if restartResult}<p class="healthy">Restored {restartResult.restored} vault(s) from {restartResult.refs} maximum-epoch reference(s).</p>{/if}</div>
+	</details>
+
+	{#if $status?.ceremonies?.length}
+		<h2 style="margin-top: 1.5rem">Active recovery ceremonies</h2>
+		<p class="muted" style="font-size: var(--step--1)">
+			Review the claimant and reason out of band before you approve a ceremony. Abort any ceremony
+			against your identity that you did not start.
+		</p>
+		<div class="list">
+			{#each $status.ceremonies as ceremony (ceremony.ceremony_id)}
+				<div class="card ceremony" class:alarm={ceremony.alarm}>
+					<div class="resplit-head">
+						<div>
+							<strong>{ceremony.claimant_display || 'Unnamed claimant'}</strong>
+							<div class="mono muted">{ceremony.ceremony_id}</div>
+						</div>
+						<span class="phase">{ceremony.phase}</span>
+					</div>
+					{#if ceremony.alarm}
+						<p class="alarm-text" role="alert">Recovery request for your identity. Abort it now if you did not start it.</p>
+					{/if}
+					<dl>
+						<div><dt>Reason</dt><dd>{ceremony.reason || 'No reason supplied'}</dd></div>
+						<div><dt>Approvals</dt><dd>{ceremony.approvals} / {ceremony.threshold}</dd></div>
+						<div><dt>Sponsor</dt><dd class="mono">{ceremony.sponsor}</dd></div>
+					</dl>
+			<div class="row">
+						{#if ceremony.trustee && !ceremony.approved}
+							<button class="primary" type="button" onclick={() => selectApproval(ceremony.ceremony_id)}>Review and approve</button>
+						{/if}
+						{#if ceremony.is_self_subject && !ceremony.takeover}
+							<button class="danger" type="button" onclick={() => selectAbort(ceremony.ceremony_id)}>Abort this ceremony</button>
+						{/if}
+					</div>
+				</div>
+			{/each}
 		</div>
 	{/if}
 
@@ -313,14 +423,16 @@
 		{/each}
 	{/if}
 
-	{#if Object.keys($notes.recoverySets).length > 0}
-		<h2 style="margin-top: 1.5rem">Recovery sets split from this browser</h2>
+	{#if $status?.share_health.sets.length}
+		<h2 style="margin-top: 1.5rem">Authoritative recovery sets</h2>
 		<div class="list">
-			{#each Object.values($notes.recoverySets) as rs (rs.rsid)}
+			{#each $status.share_health.sets as rs (rs.rsid)}
 				<div class="card set-row">
 					<span class="mono">rsid {rs.rsid}</span>
 					<span>{rs.scope.kind === 'root' ? 'your root key' : `vault ${rs.scope.vid.slice(0, 10)}…`}</span>
-					<span class="mono">{rs.m}-of-{rs.n}</span>
+					<span class="mono">{rs.threshold}-of-{rs.issued}</span>
+					<span>{rs.trustees.filter((trustee) => trustee.delivered).length}/{rs.trustees.length} trustee grants delivered</span>
+					{#if rs.warnings.length}<span class="alarm-text">{rs.warnings.join(', ')}</span>{/if}
 				</div>
 			{/each}
 		</div>
@@ -336,10 +448,15 @@
 				<input type="radio" bind:group={mode} value="resplit" /> Re-split (raise M or replace trustees)
 			</label>
 		</div>
-		<div class="row">
-			<label for="rsid">Recovery set id</label>
-			<input id="rsid" type="number" min="0" bind:value={rsid} style="width: 8rem" />
-		</div>
+		{#if mode === 'split'}
+			<p class="muted">Carapace will create recovery set {nextRsid}.</p>
+			<details><summary>Advanced recovery-set id</summary><label><input type="checkbox" bind:checked={manualSetId} /> Use a manual id</label>{#if manualSetId}<input aria-label="Manual recovery set id" type="number" min="0" bind:value={rsid} />{/if}</details>
+		{:else}
+			<label for="rsid">Recovery set to replace</label>
+			<select id="rsid" bind:value={rsid}>
+				{#each $status?.share_health.sets ?? [] as set (set.rsid)}<option value={set.rsid}>{set.scope.kind === 'root' ? 'Identity recovery' : 'Vault recovery'} · {set.threshold}-of-{set.issued}</option>{/each}
+			</select>
+		{/if}
 		<div class="row">
 			<label>
 				<input type="radio" bind:group={scopeKind} value="root" /> Your whole identity (root key)
@@ -348,24 +465,70 @@
 				<input type="radio" bind:group={scopeKind} value="vault" /> One vault
 			</label>
 			{#if scopeKind === 'vault'}
-				<input placeholder="vault id (hex)" bind:value={scopeVid} />
+				<select aria-label="Vault to protect" bind:value={scopeVid}>
+					<option value="" disabled>Select a vault</option>
+					{#each $status?.vaults.published ?? [] as vault (vault.vid)}<option value={vault.vid}>{vault.name}</option>{/each}
+				</select>
 			{/if}
-		</div>
-		<div class="row">
-			<label for="m">Trustees needed (M)</label>
-			<input id="m" type="number" min="1" bind:value={m} style="width: 5rem" />
-			<label for="n">Trustees total (N)</label>
-			<input id="n" type="number" min="1" bind:value={n} style="width: 5rem" />
+			</div>
+			<fieldset>
+				<legend>Share delivery</legend>
+				<label>
+					<input type="radio" bind:group={deliveryMode} value="friends" /> Deliver verified shares to friends
+				</label>
+				<label>
+					<input type="radio" bind:group={deliveryMode} value="manual" /> Advanced manual shares
+				</label>
+			</fieldset>
+			{#if deliveryMode === 'friends'}
+				<fieldset>
+					<legend>Select trustees ({selectedTrustees.length} selected)</legend>
+					{#if !$status?.friends.list.length}
+						<p class="muted">Add friends before you create recovery protection.</p>
+					{:else}
+						<div class="trustee-list">
+							{#each $status.friends.list as friend (friend)}
+								<label title={friend}>
+									<input type="checkbox" bind:group={selectedTrustees} value={friend} />
+									<span>{friendLabel(friend)}</span>
+								</label>
+							{/each}
+						</div>
+					{/if}
+				</fieldset>
+			{/if}
+			<div class="row">
+				<label for="m">Trustees needed (M)</label>
+				<input id="m" type="number" min="1" bind:value={m} style="width: 5rem" />
+				{#if deliveryMode === 'manual'}
+					<label for="n">Trustees total (N)</label>
+					<input id="n" type="number" min="1" bind:value={n} style="width: 5rem" />
+				{:else}
+					<span class="muted">of {selectedTrustees.length} selected</span>
+				{/if}
 		</div>
 		<div class="row">
 			<label><input type="checkbox" bind:checked={allowOverCap} /> allow exceeding the recommended trustee cap</label>
 		</div>
-		<button class="primary" type="submit" disabled={splitting}>
+			<button class="primary" type="submit" disabled={splitting || (deliveryMode === 'friends' && (selectedTrustees.length === 0 || m > selectedTrustees.length))}>
 			{splitting ? 'Splitting…' : mode === 'split' ? 'Split key' : 'Re-split key'}
 		</button>
-	</form>
+		</form>
 
-	{#if splitWarnings.length}
+		{#if deliveryResult}
+			<div class="card" class:at-risk={deliveryResult.undelivered.length > 0} style="margin-top: 1rem">
+				<h3>Verified share delivery</h3>
+				<p>{deliveryResult.delivered.length} trustee(s) confirmed that they stored a signed recovery grant.</p>
+				{#if deliveryResult.undelivered.length}
+					<p>Could not reach {deliveryResult.undelivered.length} trustee(s). Carapace will retry delivery during maintenance.</p>
+					<ul>{#each deliveryResult.undelivered as trustee (trustee)}<li class="mono">{trustee}</li>{/each}</ul>
+				{:else}
+					<p class="healthy">All selected trustees received their shares.</p>
+				{/if}
+			</div>
+		{/if}
+
+		{#if splitWarnings.length}
 		<div class="card at-risk" style="margin-top: 1rem">
 			{#each splitWarnings as w (w)}<p>{w}</p>{/each}
 		</div>
@@ -386,10 +549,11 @@
 	{/if}
 
 	<h2 style="margin-top: 2rem">Add a trustee (extend)</h2>
+	<p class="dependency">Peer-dependent operation · offline delivery stays queued and is safe to retry</p>
 	<form class="card" onsubmit={(e) => (e.preventDefault(), runExtend())}>
 		<div class="row">
-			<label for="ext-rsid">Recovery set id</label>
-			<input id="ext-rsid" type="number" min="0" bind:value={extendRsid} style="width: 8rem" />
+			<label for="ext-rsid">Recovery set</label>
+			<select id="ext-rsid" bind:value={extendRsid}>{#each $status?.share_health.sets ?? [] as set (set.rsid)}<option value={set.rsid}>{set.scope.kind === 'root' ? 'Identity recovery' : 'Vault recovery'} · {set.threshold}-of-{set.issued}</option>{/each}</select>
 			<label for="ext-count">New trustees to add</label>
 			<input id="ext-count" type="number" min="1" bind:value={extendCount} style="width: 6rem" />
 			<label><input type="checkbox" bind:checked={extendOverCap} /> allow exceeding cap</label>
@@ -418,23 +582,50 @@
 	<div class="grid">
 		<form class="card" onsubmit={(e) => (e.preventDefault(), runOpen())}>
 			<h3>Open (sponsor)</h3>
-			<label for="c-subject" class="muted">Subject user pubkey (hex) - you must hold their grant</label>
-			<input id="c-subject" bind:value={subject} />
+			<p class="muted" style="font-size: var(--step--1)">
+				Use the recovery request from the claimant. Confirm their identity and new device through
+				a separate trusted channel before you open the ceremony.
+			</p>
+			<label for="c-subject" class="muted">Person to recover</label>
+			<select id="c-subject" bind:value={subject}>
+				<option value="" disabled>choose a person whose grant you hold</option>
+				{#each $status?.recovery_grants.held ?? [] as heldSubject (heldSubject)}
+					<option value={heldSubject}>{friendLabel(heldSubject)}</option>
+				{/each}
+			</select>
+			{#if !$status?.recovery_grants.held.length}
+				<p class="muted" style="font-size: var(--step--1)">
+					This device does not hold a recovery grant. It cannot sponsor a ceremony.
+				</p>
+			{/if}
 			<label for="c-display" class="muted">Claimant display name</label>
 			<input id="c-display" bind:value={claimantDisplay} />
-			<label for="c-enc" class="muted">Claimant ceremony pubkey (hex X25519)</label>
-			<input id="c-enc" bind:value={ceremonyEnc} />
-			<label for="c-node" class="muted">Claimant new device node id (hex)</label>
-			<input id="c-node" bind:value={newNode} />
+			<label for="c-handoff" class="muted">Claimant public handoff package</label>
+			<textarea id="c-handoff" bind:value={claimantHandoff} rows="5"></textarea>
+			<button type="button" onclick={importClaimantHandoff}>Import handoff package</button>
+			{#if handoffError}<p role="alert" class="alarm-text">{handoffError}</p>{/if}
+			<details>
+				<summary>Advanced manual values</summary>
+				<label for="c-enc" class="muted">Claimant ceremony pubkey (hex X25519)</label>
+				<input id="c-enc" bind:value={ceremonyEnc} />
+				<label for="c-node" class="muted">Claimant new device node id (hex)</label>
+				<input id="c-node" bind:value={newNode} />
+			</details>
 			<label for="c-reason" class="muted">Reason</label>
 			<input id="c-reason" bind:value={reason} />
-			<button class="primary" type="submit" disabled={opening}>{opening ? 'Opening…' : 'Open ceremony'}</button>
+			<button
+				class="primary"
+				type="submit"
+				disabled={opening || !subject || !claimantDisplay.trim() || !ceremonyEnc.trim() || !newNode.trim() || !reason.trim()}
+			>
+				{opening ? 'Opening…' : 'Open ceremony'}
+			</button>
 			{#if openResult}
 				<p class="mono">id {openResult.ceremony_id.slice(0, 12)}… · fanned out to {openResult.fanout_reached} peer(s)</p>
-				<div class="label muted">Signed open - hand to the claimant</div>
+				<div class="label muted">Verified sponsor ceremony package - hand to the claimant</div>
 				<div class="share-row">
-					<code class="mono share-text">{openResult.open_hex}</code>
-					<button type="button" onclick={() => copy(openResult!.open_hex, (v) => (openHexCopied = v))}>
+					<code class="mono share-text">{openResult.sponsor_package}</code>
+					<button type="button" onclick={() => copy(openResult!.sponsor_package, (v) => (openHexCopied = v))}>
 						{openHexCopied ? 'Copied' : 'Copy'}
 					</button>
 				</div>
@@ -457,11 +648,15 @@
 			{/if}
 		</form>
 
-		<form class="card" onsubmit={(e) => (e.preventDefault(), runAbort())}>
+			<form class="card" onsubmit={(e) => (e.preventDefault(), runAbort())}>
 			<h3>Abort</h3>
 			<label for="abort-id" class="muted">Ceremony id (hex)</label>
-			<input id="abort-id" bind:value={abortId} />
-			<button type="submit" disabled={aborting}>{aborting ? 'Signing…' : 'Abort as subject'}</button>
+				<input id="abort-id" bind:value={abortId} />
+				<label class="confirm-action">
+					<input type="checkbox" bind:checked={abortConfirmed} />
+					I confirm that this ceremony must stop.
+				</label>
+				<button class="danger" type="submit" disabled={aborting || !abortId.trim() || !abortConfirmed}>{aborting ? 'Signing…' : 'Abort as subject'}</button>
 			{#if abortHex}
 				<p class="mono share-text">{abortHex}</p>
 				<p class="muted" style="font-size: var(--step--1)">Send this abort to your trustees.</p>
@@ -485,6 +680,31 @@
 		gap: 0.4rem;
 		font-size: var(--step--1);
 		color: var(--muted);
+	}
+
+	fieldset {
+		border: 1px solid var(--hairline);
+		border-radius: var(--radius);
+		margin: 0 0 0.75rem;
+		padding: 0.75rem;
+	}
+
+	fieldset > label,
+	.trustee-list label {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin: 0.35rem 0;
+	}
+
+	legend {
+		font-weight: 600;
+	}
+
+	.trustee-list {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+		gap: 0 1rem;
 	}
 
 	.list {
@@ -528,6 +748,70 @@
 	.grid input {
 		width: 100%;
 		margin-bottom: 0.5rem;
+	}
+
+	.grid select {
+		width: 100%;
+		margin-bottom: 0.5rem;
+	}
+
+	.ceremony.alarm {
+		border-color: var(--coral);
+	}
+
+	.alarm-text {
+		color: var(--coral);
+		font-weight: 600;
+	}
+
+	dl {
+		display: grid;
+		gap: 0.5rem;
+	}
+
+	dl div {
+		display: grid;
+		grid-template-columns: minmax(6rem, 0.25fr) 1fr;
+		gap: 0.75rem;
+	}
+
+	dt {
+		color: var(--muted);
+	}
+
+	dd {
+		margin: 0;
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+
+	button.danger {
+		border-color: var(--coral);
+		color: var(--coral);
+	}
+
+	.confirm-action {
+		display: flex !important;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.confirm-action input {
+		width: auto;
+		margin: 0;
+	}
+
+	@media (max-width: 640px) {
+		.share-row,
+		.set-row {
+			align-items: stretch;
+			flex-direction: column;
+		}
+
+		dl div {
+			grid-template-columns: 1fr;
+			gap: 0.1rem;
+		}
 	}
 
 	.resplit-head {

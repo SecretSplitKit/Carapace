@@ -1,0 +1,41 @@
+[advisories]
+yanked = "deny"
+# These unmaintained crates are indirect Iroh 1.0.2 dependencies. No safe
+# compatible update is available. Review these exceptions by 2026-11-02.
+ignore = [
+    "RUSTSEC-2023-0089", # atomic-polyfill through heapless
+    "RUSTSEC-2024-0436", # paste through netlink-packet-core
+    "RUSTSEC-2024-0370", # proc-macro-error through genawaiter
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unlicense",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+# Cargo reports path-only dependencies in the pinned Chela checkout as
+# wildcards. The lock file and chela-revision.txt pin these dependencies.
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

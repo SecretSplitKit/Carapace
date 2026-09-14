@@ -1,19 +1,11 @@
-//! Phase-1-close acceptance: friendship handshake, friendship-gated control
-//! stream (W5), replica placement, repair, and reconstruction from a surviving
-//! replica - all over in-process localhost iroh endpoints.
-//!
-//! Topology: owner `A` with a second delegated device `A2` (shared `k_root`);
-//! three independent friends `B`, `C`, `E`; and a stranger `D`.
-//!
-//! 1. A issues single-use tickets; B, C, and E each drive `befriend` to a
-//!    dual-signed `Friendship`, persisted on both sides.
-//! 2. A publishes a vault and places replicas on B and C (r = 2).
-//! 3. W5: the stranger D pulls A's control stream and receives no documents,
-//!    while a friend (B) does - proving the gate keys on the friend graph.
-//! 4. B is declared unreachable past grace; A repairs onto the spare friend E
-//!    and re-announces the new set {C, E}.
-//! 5. A2 (a delegated device of A) reconstructs the vault: documents from A,
-//!    ciphertext blobs from the surviving replica C. Bytes match A's source.
+#![cfg(unix)]
+
+//! Phase-1-close acceptance over in-process localhost iroh endpoints: friendship handshake,
+//! W5-gated control stream, replica placement, repair, and reconstruction from a surviving
+//! replica. Owner `A` + second delegated device `A2` (shared `k_root`); friends `B`, `C`, `E`;
+//! stranger `D`. A befriends B/C/E, publishes + places replicas on B and C, proves the W5 gate
+//! (D gets nothing, B does), repairs B (lost past grace) onto E, then A2 reconstructs the vault
+//! (docs from A, blobs from surviving replica C) byte-for-byte.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -146,11 +138,9 @@ async fn friend_gate_replica_placement_repair_and_recovery() -> Result<()> {
     }
 
     // ---- W8 regression: A2 must NOT re-serve the reconstructed ciphertext ----
-    // A2 fetched C's ciphertext to rebuild the vault. That must land in a throwaway
-    // store, never A2's router-served store; otherwise the replica fetch gate is void
-    // on any device that reconstructs. Learn one vault ChunkID via a disclosure to
-    // friend B (convergent, so the identical ChunkID A2 fetched), then confirm the
-    // stranger D is refused it off A2.
+    // A2's fetch of C's ciphertext must land in a throwaway store, not its router-served
+    // store, else the replica gate is void on any reconstructing device. Learn one ChunkID via
+    // a disclosure to B, then confirm stranger D is refused it off A2.
     let probe_grant = a.disclose_files(vid, &["readme.txt"], &[b.user_id()])?;
     let cid = *b
         .granted_chunk_ids(&probe_grant)?
@@ -167,17 +157,15 @@ async fn friend_gate_replica_placement_repair_and_recovery() -> Result<()> {
     Ok(())
 }
 
-/// §11 regression: a routine local edit must push the new epoch to the CURRENT
-/// enrolled replica set, not just re-announce. Owner A places a replica on friend C,
-/// then edits the tree and republishes (epoch bumps). The enrolled replica C must end
-/// up holding the NEW epoch's manifest + chunks, so a fresh delegated device can
-/// reconstruct the edited vault with its ciphertext served entirely off C.
+/// §11 regression: a routine local edit must push the new epoch to the CURRENT enrolled
+/// replica set, not just re-announce. A places a replica on C, edits + republishes (epoch
+/// bumps); C must hold the NEW epoch so a fresh delegated device reconstructs entirely off C.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn routine_edit_pushes_new_epoch_to_enrolled_replica() -> Result<()> {
     const ROOT_A: u8 = 0xA0;
     let a = Daemon::start(daemon_seeds(0x03, ROOT_A)).await?;
-    // A fresh delegated device of A that has never held this vault, so every blob it
-    // reconstructs must be fetched from the replica (nothing in its own store).
+    // A fresh delegated device of A that never held this vault, so every reconstructed blob
+    // must be fetched from the replica.
     let a2 = Daemon::start(daemon_seeds(0x04, ROOT_A)).await?;
     let c = Daemon::start(daemon_seeds(0x22, 0xC0)).await?;
 
@@ -195,17 +183,15 @@ async fn routine_edit_pushes_new_epoch_to_enrolled_replica() -> Result<()> {
     assert_eq!(placed, vec![c.node_id()], "C accepted the placement");
     assert!(c.holds_replica(&vid), "C stored the epoch-1 blobs");
 
-    // Routine local edit: add a new file, then republish. The epoch must bump AND the
-    // new manifest + chunk must be pushed to the enrolled replica C.
+    // Routine local edit: add a file, republish. The epoch bumps AND the new manifest + chunk
+    // must reach the enrolled replica C.
     let added = b"a routine edit that must reach the replica".to_vec();
     std::fs::write(src.path().join("added.txt"), &added)?;
     let epoch2 = a.publish_vault(src.path(), vid).await?;
     assert!(epoch2 > epoch1, "a real edit bumps the epoch");
 
-    // Reconstruct on the fresh delegated device: documents (the epoch-2 announce +
-    // grant) from A, but ALL ciphertext strictly from the replica C. If the epoch push
-    // failed, C lacks the epoch-2 manifest envelope + new chunk and this errors out /
-    // omits the vault.
+    // Reconstruct on the fresh device: docs from A, ALL ciphertext from replica C. A failed
+    // epoch push leaves C without the epoch-2 envelope + new chunk and this errors/omits the vault.
     let out = tempfile::tempdir()?;
     let reconstructed = a2
         .reconstruct_from_replica(a.addr()?, c.addr()?, out.path())

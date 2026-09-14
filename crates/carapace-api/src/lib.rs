@@ -6,19 +6,21 @@
 //! `Host` check (DNS-rebinding defense), and a loopback `Origin` check (CSRF
 //! defense). See [`auth`] for the guards and [`handlers`] for the endpoints.
 //!
-//! Public routes (no token): `GET /api/health`, the WebSocket `GET /api/events`
-//! (which validates the token from a query parameter instead, since browsers cannot
-//! set an `Authorization` header on a WS handshake), and the embedded static GUI.
+//! Public routes (no bearer header): `GET /api/health`, the WebSocket `GET /api/events`
+//! (which validates an HTTP-only, same-site session cookie), and the embedded static GUI.
 //!
 //! The GUI is embedded with `rust-embed` from `static/` (the SvelteKit build). The
 //! served `index.html` gets the session token injected as `window.__CARAPACE_TOKEN__`
 //! under a strict per-response CSP nonce; see [`handlers::static_asset`].
 
+mod account_transfer;
 mod auth;
+mod claimant;
 mod handlers;
+mod ops;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
@@ -36,6 +38,8 @@ pub struct AppState {
     pub daemon: Arc<Daemon>,
     /// The per-session bearer token (hex of 32 CSPRNG bytes).
     pub token: Arc<str>,
+    /// Local state directory for public restart-handoff metadata.
+    pub state_dir: Arc<PathBuf>,
 }
 
 /// A running control API. Dropping or [`ApiServer::shutdown`] stops it.
@@ -47,6 +51,29 @@ pub struct ApiServer {
     handle: tokio::task::JoinHandle<()>,
     /// The daemon's background maintenance loop (§10.1/§10.2), torn down with the API.
     _maintenance: MaintenanceHandle,
+    _live_sync: carapaced::LiveSyncHandle,
+}
+
+/// A running claimant-only API. It never owns a normal daemon.
+pub struct ClaimantApiServer {
+    /// The per-session bearer token, also written to `<state_dir>/claimant-api-token`.
+    pub token: String,
+    /// The actual bound loopback address.
+    pub local_addr: SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ClaimantApiServer {
+    /// The base URL for the claimant client.
+    #[must_use]
+    pub fn url(&self) -> String {
+        format!("http://{}", self.local_addr)
+    }
+
+    /// Stop the claimant server. A completed activation needs a normal daemon restart.
+    pub fn shutdown(self) {
+        self.handle.abort();
+    }
 }
 
 impl ApiServer {
@@ -62,12 +89,35 @@ impl ApiServer {
     }
 }
 
+impl Drop for ClaimantApiServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for ApiServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Assemble the router: token-gated `/api` action routes, the public health check
 /// and WebSocket events feed, and the embedded GUI fallback, all wrapped in the
 /// global Host/Origin guard.
 pub fn app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/status", get(handlers::status))
+        .route("/api/directories", get(handlers::directories))
+        .route("/api/account/export", post(account_transfer::export))
+        .route("/api/account/import", post(account_transfer::import))
+        .route("/api/devices/self", get(handlers::device_card))
+        .route("/api/devices", post(handlers::enroll_device))
+        .route("/api/metrics", get(handlers::metrics))
+        .route("/api/sync", post(handlers::sync_owned))
+        .route(
+            "/api/recovery/restart-restore",
+            post(handlers::restart_restore),
+        )
         .route(
             "/api/vaults",
             get(handlers::list_vaults).post(handlers::publish_vault),
@@ -128,6 +178,28 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Assemble the claimant-only router. Its type cannot route to normal daemon handlers.
+fn claimant_app(state: claimant::ClaimantState) -> Router {
+    let protected = Router::new()
+        .route("/api/claimant/status", get(claimant::status))
+        .route("/api/claimant/preview", post(claimant::preview))
+        .route("/api/claimant/complete", post(claimant::complete))
+        .route("/api/claimant/cancel", post(claimant::cancel))
+        .layer(middleware::from_fn_with_state(
+            state.token.clone(),
+            auth::require_token,
+        ));
+    let shell = Router::new()
+        .route("/", get(claimant::shell))
+        .route("/claimant.js", get(claimant::script))
+        .route("/claimant.css", get(claimant::stylesheet));
+    Router::new()
+        .merge(protected)
+        .merge(shell)
+        .layer(middleware::from_fn(auth::guard_host_origin))
+        .with_state(state)
+}
+
 /// Generate a 32-byte CSPRNG token, hex-encode it, and write it to
 /// `<state_dir>/api-token` with `0600` permissions on unix.
 fn mint_and_write_token(state_dir: &Path) -> Result<String> {
@@ -169,11 +241,33 @@ fn write_token_file(path: &Path, token: &str) -> Result<()> {
         .with_context(|| format!("write {path:?}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn write_token_file(path: &Path, token: &str) -> Result<()> {
-    // ponytail: no OS-ACL restriction here (needs a Windows-specific crate). The
-    // token still gates every request; tighten the file ACL on non-unix if the
-    // state dir is shared.
+    use std::io::Write;
+    use std::os::windows::fs::MetadataExt;
+    carapaced::State::secure_directory(path.parent().context("token file has no parent")?)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file() && metadata.file_attributes() & 0x400 == 0,
+                "token file is a reparse point or non-file"
+            );
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn write_token_file(path: &Path, token: &str) -> Result<()> {
     std::fs::write(path, token).with_context(|| format!("write {path:?}"))
 }
 
@@ -213,16 +307,19 @@ pub async fn serve(daemon: Arc<Daemon>, state_dir: &Path, port: u16) -> Result<A
     // the production entry point that already holds an `Arc<Daemon>`; the loop holds
     // only a `Weak` and is torn down when this `ApiServer` drops.
     let maintenance = Arc::clone(&daemon).run_maintenance(MaintenanceConfig::default());
+    let live_sync = Arc::clone(&daemon).run_live_sync(Default::default());
 
     let state = AppState {
         daemon,
         token: Arc::from(token.as_str()),
+        state_dir: Arc::new(state_dir.to_path_buf()),
     };
     let app = app(state);
 
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("carapace-api: server exited: {e}");
+            let _ = e;
+            ops::log("server.control_exit_error", None);
         }
     });
 
@@ -231,6 +328,52 @@ pub async fn serve(daemon: Arc<Daemon>, state_dir: &Path, port: u16) -> Result<A
         local_addr,
         handle,
         _maintenance: maintenance,
+        _live_sync: live_sync,
+    })
+}
+
+/// Start a separate loopback server for a key-less recovery claimant.
+///
+/// The target directory must not contain an identity or durable daemon state. The
+/// server writes separate discovery files so it cannot be mistaken for a running
+/// normal daemon. After successful activation, stop this server and start the normal
+/// daemon. No claimant endpoint returns `K_root`, the node seed, or plaintext shares.
+pub async fn serve_claimant(state_dir: &Path, port: u16) -> Result<ClaimantApiServer> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create claimant state directory {state_dir:?}"))?;
+    let token = {
+        let mut raw = [0u8; 32];
+        getrandom::getrandom(&mut raw)
+            .map_err(|error| anyhow::anyhow!("generate claimant API token: {error}"))?;
+        let token = hex::encode(raw);
+        write_token_file(&state_dir.join("claimant-api-token"), &token)?;
+        token
+    };
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    ensure!(
+        addr.ip().is_loopback(),
+        "refusing non-loopback claimant bind {addr}"
+    );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind claimant API on {addr}"))?;
+    let local_addr = listener.local_addr().context("read claimant API address")?;
+    let url_path = state_dir.join("claimant-api-url");
+    std::fs::write(&url_path, format!("http://{local_addr}"))
+        .with_context(|| format!("write {url_path:?}"))?;
+
+    let state = claimant::ClaimantState::new(state_dir.to_path_buf(), Arc::from(token.as_str()))?;
+    let app = claimant_app(state);
+    let handle = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            let _ = error;
+            ops::log("server.claimant_exit_error", None);
+        }
+    });
+    Ok(ClaimantApiServer {
+        token,
+        local_addr,
+        handle,
     })
 }
 
@@ -272,5 +415,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "rewritten token must be 0600");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::write_token_file;
+
+    #[test]
+    fn token_creation_enforces_private_acls_and_preserves_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        write_token_file(&path, "secret").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
+        carapaced::State::secure_directory(dir.path()).unwrap();
     }
 }
